@@ -14,9 +14,41 @@ The service covers auth, user profiles, mixes, comments, favorites, follows, mon
 ## Project Files
 
 - [`main.py`](./main.py) — current main backend entrypoint used by the app
+- [`app/core/config.py`](./app/core/config.py) — environment-driven settings and game/business constants
+- [`app/core/database.py`](./app/core/database.py) — SQLAlchemy engine, session and base
+- [`app/core/security.py`](./app/core/security.py) — JWT token creation and HTTP bearer security
+- [`app/models.py`](./app/models.py) — SQLAlchemy models
+- [`app/schemas.py`](./app/schemas.py) — Pydantic schemas / API contracts
 - [`seed_demo_content.py`](./seed_demo_content.py) — demo content seeder for users, mixes, comments, favorites
 - [`requirements.txt`](./requirements.txt) — Python dependencies
 - [`legacy/`](./legacy) — archived backend snapshots kept only for reference
+
+## Architecture
+
+The backend now follows a simpler modular structure:
+
+```text
+hookah-back/
+├── app/
+│   ├── core/
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   └── security.py
+│   ├── models.py
+│   └── schemas.py
+├── legacy/
+├── main.py
+├── requirements.txt
+└── seed_demo_content.py
+```
+
+Current responsibility split:
+
+- `main.py` — FastAPI app, startup hook, route handlers, business orchestration
+- `app/core/*` — infrastructure and shared configuration
+- `app/models.py` — database layer
+- `app/schemas.py` — transport / response contracts
+- `legacy/` — previous backend iterations kept out of the active runtime
 
 ## Features
 

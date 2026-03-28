@@ -1,541 +1,68 @@
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
-from typing import List, Optional
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float,
-    ForeignKey, Text, UniqueConstraint, DateTime, Date, Boolean
-)
-from sqlalchemy.orm import (
-    sessionmaker, declarative_base, relationship,
-    Session, joinedload
-)
-import hashlib, os
+import hashlib
+import os
 from datetime import datetime, timedelta
+from typing import List, Optional
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 from jose import jwt
-import uvicorn
+from sqlalchemy.orm import Session, joinedload
 
-# -------------------------------------------------------------------
-# DATABASE
-# -------------------------------------------------------------------
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:pass@localhost:5433/hookahmix"
+from app.core.config import (
+    ALGORITHM,
+    BOWL_HEAT_DURATION_SECONDS,
+    BOWL_HEAT_TARGET_SCORE,
+    DEFAULT_ADMIN_EMAILS,
+    DEFAULT_ADMIN_USERNAMES,
+    DEFAULT_UNLIMITED_MIX_EMAILS,
+    DEFAULT_UNLIMITED_MIX_USERNAMES,
+    MAX_BOWL_HEAT_ATTEMPTS,
+    MIX_SLOT_RULES,
+    RATING_LEVELS,
+    REWARD_RULES,
+    SECRET_KEY,
 )
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine, autoflush=False)
-Base = declarative_base()
-
-# -------------------------------------------------------------------
-# JWT
-# -------------------------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
-security = HTTPBearer(auto_error=False)
-
-REWARD_RULES = {
-    "daily_login": {
-        "title": "Ежедневный вход",
-        "points": 5,
-        "rating": 0,
-        "daily_limit": 1,
-    },
-    "mix_created": {
-        "title": "Новый микс",
-        "points": 20,
-        "rating": 5,
-        "daily_limit": 3,
-    },
-    "mix_favorited": {
-        "title": "Микс сохранили",
-        "points": 4,
-        "rating": 3,
-        "daily_limit": 30,
-    },
-    "comment_created": {
-        "title": "Комментарий отправлен",
-        "points": 3,
-        "rating": 0,
-        "daily_limit": 10,
-    },
-    "comment_received": {
-        "title": "Новый отзыв на микс",
-        "points": 2,
-        "rating": 2,
-        "daily_limit": 20,
-    },
-}
-
-RATING_LEVELS = [
-    (0, "Новичок"),
-    (100, "Миксер"),
-    (300, "Блендер"),
-    (700, "Мастер чаши"),
-    (1500, "Hookah Legend"),
-]
-
-MIX_SLOT_RULES = [
-    (0, 2),
-    (100, 4),
-    (300, 6),
-    (700, 8),
-    (1500, 10),
-]
-
-MAX_BOWL_HEAT_ATTEMPTS = 3
-BOWL_HEAT_TARGET_SCORE = 75
-BOWL_HEAT_DURATION_SECONDS = 20
-DEFAULT_ADMIN_EMAILS = {"dorf.foto@yandex.ru"}
-DEFAULT_ADMIN_USERNAMES = {"dorfden"}
-DEFAULT_UNLIMITED_MIX_EMAILS = {
-    "hookahplacemars@hooka3.app",
-    "musthave.originals.seed@example.com",
-    "neon.lounge.seed@example.com",
-}
-DEFAULT_UNLIMITED_MIX_USERNAMES = {
-    "hookahplacemars",
-    "musthave",
-    "lounge_neon",
-}
-
-def create_access_token(data: dict) -> str:
-    expire = datetime.utcnow() + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
-    to_encode = data.copy()
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# -------------------------------------------------------------------
-# MODELS
-# -------------------------------------------------------------------
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, nullable=False)
-    username = Column(String, unique=True)
-    password_hash = Column(String, nullable=False)
-    is_admin = Column(Boolean, default=False, nullable=False)
-    is_banned = Column(Boolean, default=False, nullable=False)
-    ban_reason = Column(Text)
-    banned_at = Column(DateTime)
-
-    mixes = relationship("Mix", back_populates="author")
-    favorites = relationship("Favorite", back_populates="user")
-    comments = relationship("Comment", back_populates="user")
-    following_links = relationship(
-        "UserFollow",
-        foreign_keys="UserFollow.follower_id",
-        back_populates="follower",
-        cascade="all, delete-orphan"
-    )
-    follower_links = relationship(
-        "UserFollow",
-        foreign_keys="UserFollow.following_id",
-        back_populates="following",
-        cascade="all, delete-orphan"
-    )
-    progress = relationship("UserProgress", back_populates="user", uselist=False)
-    activities = relationship(
-        "UserActivity",
-        back_populates="user",
-        cascade="all, delete-orphan"
-    )
-    bowl_heat_runs = relationship(
-        "BowlHeatRun",
-        back_populates="user",
-        cascade="all, delete-orphan"
-    )
-
-
-class Mix(Base):
-    __tablename__ = "mixes"
-
-    id = Column(Integer, primary_key=True)
-    author_id = Column(Integer, ForeignKey("users.id"))
-
-    name = Column(String, nullable=False)
-    mood = Column(String)
-    intensity = Column(Float)
-    description = Column(Text)
-    bowl_type = Column(String)
-    packing_style = Column(String)
-    bowl_image_name = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    author = relationship("User", back_populates="mixes")
-    ingredients = relationship(
-        "MixIngredient",
-        cascade="all, delete-orphan"
-    )
-    comments = relationship(
-        "Comment",
-        cascade="all, delete-orphan"
-    )
-    favorited_by = relationship(
-        "Favorite",
-        back_populates="mix"
-    )
-
-
-class MixIngredient(Base):
-    __tablename__ = "mix_ingredients"
-
-    id = Column(Integer, primary_key=True)
-    mix_id = Column(Integer, ForeignKey("mixes.id"))
-    brand = Column(String)
-    flavor = Column(String)
-    percentage = Column(Integer)
-
-
-class Favorite(Base):
-    __tablename__ = "favorites"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    mix_id = Column(Integer, ForeignKey("mixes.id"))
-
-    __table_args__ = (UniqueConstraint("user_id", "mix_id"),)
-
-    user = relationship("User", back_populates="favorites")
-    mix = relationship("Mix", back_populates="favorited_by")
-
-
-class UserFollow(Base):
-    __tablename__ = "user_follows"
-
-    id = Column(Integer, primary_key=True)
-    follower_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    following_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    __table_args__ = (UniqueConstraint("follower_id", "following_id"),)
-
-    follower = relationship(
-        "User",
-        foreign_keys=[follower_id],
-        back_populates="following_links"
-    )
-    following = relationship(
-        "User",
-        foreign_keys=[following_id],
-        back_populates="follower_links"
-    )
-
-
-class Comment(Base):
-    __tablename__ = "comments"
-
-    id = Column(Integer, primary_key=True)
-    mix_id = Column(Integer, ForeignKey("mixes.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
-    text = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="comments")
-    mix = relationship("Mix", back_populates="comments")
-
-
-class MonthlyVote(Base):
-    __tablename__ = "monthly_votes"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    mix_id = Column(Integer, ForeignKey("mixes.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class UserProgress(Base):
-    __tablename__ = "user_progress"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    points = Column(Integer, default=0, nullable=False)
-    rating = Column(Integer, default=0, nullable=False)
-    streak_days = Column(Integer, default=0, nullable=False)
-    last_active_date = Column(Date)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="progress")
-
-
-class UserActivity(Base):
-    __tablename__ = "user_activities"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    event_type = Column(String, nullable=False)
-    title = Column(String, nullable=False)
-    description = Column(Text)
-    points_delta = Column(Integer, default=0, nullable=False)
-    rating_delta = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="activities")
-
-
-class BowlHeatRun(Base):
-    __tablename__ = "bowl_heat_runs"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    score = Column(Integer, default=0, nullable=False)
-    sweet_spot_seconds = Column(Float, default=0, nullable=False)
-    overheat_seconds = Column(Float, default=0, nullable=False)
-    taps_count = Column(Integer, default=0, nullable=False)
-    duration_seconds = Column(Float, default=BOWL_HEAT_DURATION_SECONDS, nullable=False)
-    reward_points = Column(Integer, default=0, nullable=False)
-    reward_rating = Column(Integer, default=0, nullable=False)
-    tier_title = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="bowl_heat_runs")
-
-# -------------------------------------------------------------------
-# SCHEMAS
-# -------------------------------------------------------------------
-class IngredientIn(BaseModel):
-    brand: Optional[str]
-    flavor: str
-    percentage: int
-
-
-class IngredientOut(IngredientIn):
-    id: int
-    class Config:
-        from_attributes = True
-
-
-class MixCreate(BaseModel):
-    name: str
-    mood: Optional[str] = None
-    intensity: Optional[float] = None
-    description: Optional[str] = None
-    bowl_type: Optional[str] = None
-    packing_style: Optional[str] = None
-    bowl_image_name: Optional[str] = None
-    ingredients: List[IngredientIn]
-
-
-class MixOut(BaseModel):
-    id: int
-    name: str
-    mood: Optional[str]
-    intensity: Optional[float]
-    description: Optional[str]
-    bowl_type: Optional[str]
-    packing_style: Optional[str]
-    bowl_image_name: Optional[str]
-    author_id: Optional[int]
-    author_username: Optional[str]
-    created_at: Optional[datetime]
-    ingredients: List[IngredientOut]
-    likes_count: int
-    is_liked: bool
-    is_author_followed: bool
-
-    class Config:
-        from_attributes = True
-
-
-class CommentOut(BaseModel):
-    id: int
-    mix_id: int
-    user_id: int
-    user_username: Optional[str] = None
-    text: str
-    created_at: Optional[datetime] = None
-    class Config:
-        from_attributes = True
-
-
-class ProfileCommentOut(CommentOut):
-    mix_name: Optional[str] = None
-
-
-class UserProgressOut(BaseModel):
-    points: int
-    rating: int
-    streak_days: int
-    level_title: str
-    next_level_rating: int
-    mixes_used: int
-    max_mix_slots: Optional[int]
-    mixes_remaining: Optional[int]
-    has_unlimited_mix_slots: bool
-
-
-class UserActivityOut(BaseModel):
-    id: int
-    event_type: str
-    title: str
-    description: Optional[str]
-    points_delta: int
-    rating_delta: int
-    created_at: datetime
-
-
-class BowlHeatGameStateOut(BaseModel):
-    title: str
-    subtitle: str
-    attempts_used: int
-    attempts_left: int
-    max_attempts: int
-    best_score_today: int
-    best_tier_today: Optional[str] = None
-    target_score: int
-    duration_seconds: int
-    reward_hint: str
-    can_play: bool
-    last_played_at: Optional[datetime] = None
-
-
-class BowlHeatPlayIn(BaseModel):
-    score: int
-    sweet_spot_seconds: float
-    overheat_seconds: float
-    taps_count: int
-    duration_seconds: float
-
-
-class BowlHeatPlayOut(BaseModel):
-    score: int
-    tier: str
-    result_title: str
-    result_message: str
-    points_awarded: int
-    rating_awarded: int
-    is_new_best: bool
-    state: BowlHeatGameStateOut
-
-
-class FollowUserOut(BaseModel):
-    id: int
-    username: Optional[str]
-    mixes_count: int
-    likes_count: int
-    latest_mix_id: Optional[int] = None
-    latest_mix_name: Optional[str] = None
-    latest_mix_bowl_image_name: Optional[str] = None
-    latest_mix_created_at: Optional[datetime] = None
-    is_following: bool
-
-
-class UserOut(BaseModel):
-    id: int
-    email: str
-    username: Optional[str]
-    is_admin: bool
-    is_banned: bool
-    ban_reason: Optional[str]
-    mixes: List[MixOut]
-    favorites: List[MixOut]
-    comments: List[ProfileCommentOut]
-    progress: UserProgressOut
-    activity_feed: List[UserActivityOut]
-    daily_game: BowlHeatGameStateOut
-    followers_count: int
-    following_count: int
-    following_users: List[FollowUserOut]
-
-
-class SignupRequest(BaseModel):
-    email: EmailStr
-    password: str
-    username: Optional[str]
-
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class LoginResponse(BaseModel):
-    user_id: int
-    token: str
-    username: Optional[str]
-
-
-class CommentIn(BaseModel):
-    text: str
-
-
-class UserUpdate(BaseModel):
-    username: Optional[str]
-    email: Optional[EmailStr]
-
-
-class FollowToggleOut(BaseModel):
-    user_id: int
-    is_following: bool
-
-
-class VoteMixOut(BaseModel):
-    id: int
-    name: str
-    lounge: str
-    percentage: float
-    image_name: Optional[str] = None
-
-
-class MonthlyFlavorOut(BaseModel):
-    title: str
-    subtitle: str
-    remaining_time: str
-    progress: float
-    sponsor_brand: Optional[str] = None
-    featured_flavor: Optional[str] = None
-    challenge_title: Optional[str] = None
-    challenge_reward: Optional[str] = None
-    cta_title: Optional[str] = None
-    mixes: List[VoteMixOut]
-
-
-class AdminDashboardStatsOut(BaseModel):
-    total_users: int
-    banned_users: int
-    total_mixes: int
-    total_comments: int
-    total_favorites: int
-
-
-class AdminUserRowOut(BaseModel):
-    id: int
-    email: str
-    username: Optional[str]
-    is_admin: bool
-    is_banned: bool
-    ban_reason: Optional[str]
-    mixes_count: int
-    followers_count: int
-    favorites_received: int
-    latest_mix_name: Optional[str] = None
-    latest_mix_created_at: Optional[datetime] = None
-
-
-class AdminMixRowOut(BaseModel):
-    id: int
-    name: str
-    author_id: Optional[int]
-    author_username: Optional[str]
-    created_at: Optional[datetime]
-    likes_count: int
-    comments_count: int
-    ingredients_count: int
-
-
-class AdminDashboardOut(BaseModel):
-    stats: AdminDashboardStatsOut
-    users: List[AdminUserRowOut]
-    recent_mixes: List[AdminMixRowOut]
-
-
-class AdminBanIn(BaseModel):
-    reason: Optional[str] = None
+from app.core.database import Base, SessionLocal, engine
+from app.core.security import create_access_token, security
+from app.models import (
+    BowlHeatRun,
+    Comment,
+    Favorite,
+    Mix,
+    MixIngredient,
+    MonthlyVote,
+    User,
+    UserActivity,
+    UserFollow,
+    UserProgress,
+)
+from app.schemas import (
+    AdminBanIn,
+    AdminDashboardOut,
+    AdminDashboardStatsOut,
+    AdminMixRowOut,
+    AdminUserRowOut,
+    BowlHeatGameStateOut,
+    BowlHeatPlayIn,
+    BowlHeatPlayOut,
+    CommentIn,
+    CommentOut,
+    FollowToggleOut,
+    FollowUserOut,
+    IngredientOut,
+    LoginRequest,
+    LoginResponse,
+    MixCreate,
+    MixOut,
+    MonthlyFlavorOut,
+    ProfileCommentOut,
+    SignupRequest,
+    UserActivityOut,
+    UserOut,
+    UserProgressOut,
+    UserUpdate,
+    VoteMixOut,
+)
 
 # -------------------------------------------------------------------
 # UTILS
@@ -2103,4 +1630,6 @@ def filter_mixes(
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
