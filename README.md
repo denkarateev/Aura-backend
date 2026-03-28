@@ -13,10 +13,10 @@ The service covers auth, user profiles, mixes, comments, favorites, follows, mon
 
 ## Project Files
 
-- [`main4.py`](./main4.py) — current main backend entrypoint used by the app
+- [`main.py`](./main.py) — current main backend entrypoint used by the app
 - [`seed_demo_content.py`](./seed_demo_content.py) — demo content seeder for users, mixes, comments, favorites
 - [`requirements.txt`](./requirements.txt) — Python dependencies
-- `main.py`, `main2.py`, `main3.py`, `main5.py` — older/experimental backend snapshots kept in the repo
+- [`legacy/`](./legacy) — archived backend snapshots kept only for reference
 
 ## Features
 
@@ -64,7 +64,7 @@ export SECRET_KEY="super-secret-key"
 ## Run Locally
 
 ```bash
-uvicorn main4:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Swagger docs:
@@ -73,7 +73,7 @@ Swagger docs:
 
 ## Database
 
-The project uses SQLAlchemy models defined in [`main4.py`](./main4.py).
+The project uses SQLAlchemy models defined in [`main.py`](./main.py).
 
 Main entities:
 
@@ -198,7 +198,7 @@ Some accounts are excluded from slot limits through internal allowlists for admi
 
 ## Admin Notes
 
-The backend contains a simple admin allowlist for default admin accounts in [`main4.py`](./main4.py).
+The backend contains a simple admin allowlist for default admin accounts in [`main.py`](./main.py).
 
 Default admin identifiers include:
 
@@ -216,7 +216,7 @@ Before production usage, you should:
 3. Put the API behind Nginx or another reverse proxy
 4. Serve it over HTTPS
 5. Add proper migrations instead of relying only on current SQLAlchemy table definitions
-6. Split `main4.py` into modules as the codebase grows
+6. Split `main.py` into modules as the codebase grows
 
 ## Suggested Next Cleanup
 
@@ -224,4 +224,3 @@ Before production usage, you should:
 - split routers / models / schemas / services
 - move hardcoded configs and allowlists into env or admin settings
 - add tests for auth, mixes, comments, and admin actions
-
