@@ -93,6 +93,10 @@ export DATABASE_URL="postgresql://postgres:pass@localhost:5433/hookahmix"
 export SECRET_KEY="super-secret-key"
 ```
 
+Example file:
+
+- [`.env.example`](./.env.example)
+
 ## Run Locally
 
 ```bash
@@ -102,6 +106,43 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 Swagger docs:
 
 - [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+## Docker
+
+The backend includes a ready Docker setup:
+
+- [`Dockerfile`](./Dockerfile)
+- [`docker-compose.yml`](./docker-compose.yml)
+- [`.dockerignore`](./.dockerignore)
+
+### Build image
+
+```bash
+docker build -t aura-backend .
+```
+
+### Run only API container
+
+```bash
+docker run --rm \
+  -p 8000:8000 \
+  -e DATABASE_URL="postgresql://postgres:pass@host.docker.internal:5433/hookahmix" \
+  -e SECRET_KEY="super-secret-key" \
+  aura-backend
+```
+
+### Run full stack with PostgreSQL
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- API on `http://127.0.0.1:8000`
+- PostgreSQL on `localhost:5433`
+
+The compose stack waits for Postgres health before starting the API.
 
 ## Database
 
