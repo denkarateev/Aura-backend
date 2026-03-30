@@ -56,6 +56,16 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan"
     )
+    lounge_loyalty_states = relationship(
+        "LoungeGuestLoyalty",
+        foreign_keys="LoungeGuestLoyalty.user_id",
+        cascade="all, delete-orphan"
+    )
+    lounge_personalizations = relationship(
+        "LoungeGuestPersonalization",
+        foreign_keys="LoungeGuestPersonalization.user_id",
+        cascade="all, delete-orphan"
+    )
 
 
 class Mix(Base):
@@ -202,3 +212,60 @@ class BowlHeatRun(Base):
 
     user = relationship("User", back_populates="bowl_heat_runs")
 
+
+class LoungeProgram(Base):
+    __tablename__ = "lounge_programs"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, unique=True, nullable=False)
+    title = Column(String, nullable=False)
+    summary = Column(Text, nullable=False)
+    base_discount_percent = Column(Integer, default=5, nullable=False)
+    welcome_offer_title = Column(String, nullable=False)
+    welcome_offer_body = Column(Text, nullable=False)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"))
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LoungeGuestLoyalty(Base):
+    __tablename__ = "lounge_guest_loyalties"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    visit_count = Column(Integer, default=0, nullable=False)
+    last_visit_at = Column(DateTime)
+
+    __table_args__ = (UniqueConstraint("brand_id", "user_id"),)
+
+
+class LoungeGuestPersonalization(Base):
+    __tablename__ = "lounge_guest_personalizations"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    display_name = Column(String)
+    favorite_order = Column(Text)
+    average_check = Column(Integer)
+    visit_count = Column(Integer, default=1, nullable=False)
+    personal_tier_title = Column(String)
+    personal_discount_percent = Column(Integer)
+    personal_offer_title = Column(String)
+    personal_offer_body = Column(Text)
+    note = Column(Text)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"))
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("brand_id", "user_id"),)
+
+
+class LoungeBusinessEvent(Base):
+    __tablename__ = "lounge_business_events"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"))
+    guest_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

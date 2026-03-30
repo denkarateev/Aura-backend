@@ -1,4 +1,5 @@
 import os
+import json
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -75,3 +76,43 @@ DEFAULT_UNLIMITED_MIX_USERNAMES = {
     "lounge_neon",
 }
 
+DEFAULT_BRAND_MANAGER_USERNAMES = {
+    "hookahplace_mars": {"hookahplacemars"},
+    "secret_lounge_yauza": {"gallery_secret_lounge", "secretloungeyauza"},
+    "must_have": {"musthave"},
+    "darkside": {"darkside"},
+    "hoob": {"hoob"},
+    "alpha_hookah": {"alphahookah", "alpha_hookah"},
+}
+
+
+def load_brand_manager_usernames() -> dict[str, set[str]]:
+    raw_value = os.getenv("BRAND_MANAGER_USERNAMES_JSON")
+    if not raw_value:
+        return {
+            brand_id: {username.lower() for username in usernames}
+            for brand_id, usernames in DEFAULT_BRAND_MANAGER_USERNAMES.items()
+        }
+
+    try:
+        decoded = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return {
+            brand_id: {username.lower() for username in usernames}
+            for brand_id, usernames in DEFAULT_BRAND_MANAGER_USERNAMES.items()
+        }
+
+    normalized: dict[str, set[str]] = {}
+    for brand_id, usernames in decoded.items():
+        if not isinstance(usernames, list):
+            continue
+        normalized[str(brand_id)] = {
+            str(username).strip().lower()
+            for username in usernames
+            if str(username).strip()
+        }
+
+    return normalized or {
+        brand_id: {username.lower() for username in usernames}
+        for brand_id, usernames in DEFAULT_BRAND_MANAGER_USERNAMES.items()
+    }

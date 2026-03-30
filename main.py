@@ -1,15 +1,18 @@
 import hashlib
 import os
 from datetime import datetime, timedelta
+from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import func
 from jose import jwt
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import (
     ALGORITHM,
+    DEFAULT_BRAND_MANAGER_USERNAMES,
     BOWL_HEAT_DURATION_SECONDS,
     BOWL_HEAT_TARGET_SCORE,
     DEFAULT_ADMIN_EMAILS,
@@ -21,6 +24,7 @@ from app.core.config import (
     RATING_LEVELS,
     REWARD_RULES,
     SECRET_KEY,
+    load_brand_manager_usernames,
 )
 from app.core.database import Base, SessionLocal, engine
 from app.core.security import create_access_token, security
@@ -28,6 +32,10 @@ from app.models import (
     BowlHeatRun,
     Comment,
     Favorite,
+    LoungeBusinessEvent,
+    LoungeGuestLoyalty,
+    LoungeGuestPersonalization,
+    LoungeProgram,
     Mix,
     MixIngredient,
     MonthlyVote,
@@ -52,12 +60,24 @@ from app.schemas import (
     IngredientOut,
     LoginRequest,
     LoginResponse,
+    LoungeAnalyticsDayOut,
+    LoungeAnalyticsOut,
+    LoungeCheckinIn,
+    LoungeCheckinOut,
+    LoungeGuestRecordIn,
+    LoungeGuestRecordOut,
+    LoungeMyLoyaltyOut,
+    LoungeProgramIn,
+    LoungeProgramOut,
+    LoungeTierOut,
     MixCreate,
     MixOut,
     MonthlyFlavorOut,
     ProfileCommentOut,
     SignupRequest,
+    StatusOut,
     UserActivityOut,
+    UserSearchOut,
     UserOut,
     UserProgressOut,
     UserUpdate,
@@ -607,6 +627,253 @@ def user_to_out(profile_user: User, viewer: Optional[User], db: Session) -> User
     )
 
 
+BRAND_MANAGER_USERNAMES = load_brand_manager_usernames()
+
+
+def normalize_key(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def display_title_from_brand_id(brand_id: str) -> str:
+    pieces = [piece for piece in brand_id.replace("-", "_").split("_") if piece]
+    if not pieces:
+        return "Lounge"
+    return " ".join(piece.capitalize() for piece in pieces)
+
+
+def default_lounge_program_values(brand_id: str) -> dict:
+    title = f"{display_title_from_brand_id(brand_id)} Club"
+    return {
+        "title": title,
+        "summary": "Сохраняй визиты, чтобы копить скидку и получать персональные предложения от заведения.",
+        "base_discount_percent": 5,
+        "welcome_offer_title": f"Welcome в {display_title_from_brand_id(brand_id)}",
+        "welcome_offer_body": "Стартовая скидка 5% на первую бронь и быстрый вход в профиль заведения.",
+    }
+
+
+def lounge_tier_for_visits(visits: int) -> LoungeTierOut:
+    if visits >= 8:
+        return LoungeTierOut(
+            title="Signature",
+            discount_percent=15,
+            discount_text="15%",
+            benefit="Приоритет на VIP и закрытые офферы",
+            next_goal=None,
+        )
+    if visits >= 4:
+        return LoungeTierOut(
+            title="Resident",
+            discount_percent=10,
+            discount_text="10%",
+            benefit="Ранняя бронь и бонус к вечерним слотам",
+            next_goal=8,
+        )
+    if visits >= 1:
+        return LoungeTierOut(
+            title="Insider",
+            discount_percent=7,
+            discount_text="7%",
+            benefit="Скидка на посадку и персональные офферы",
+            next_goal=4,
+        )
+    return LoungeTierOut(
+        title="Welcome",
+        discount_percent=5,
+        discount_text="5%",
+        benefit="Стартовая скидка и welcome-предложение",
+        next_goal=1,
+    )
+
+
+def user_search_to_out(user: User) -> UserSearchOut:
+    display_name = (user.username or "").strip() or user.email
+    return UserSearchOut(
+        id=user.id,
+        username=user.username or display_name,
+        display_name=display_name,
+    )
+
+
+def resolve_brand_managers(brand_id: str) -> set[str]:
+    if brand_id in BRAND_MANAGER_USERNAMES:
+        return BRAND_MANAGER_USERNAMES[brand_id]
+    defaults = DEFAULT_BRAND_MANAGER_USERNAMES.get(brand_id, set())
+    return {username.lower() for username in defaults}
+
+
+def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
+    if not user:
+        return False
+    if user.is_admin:
+        return True
+
+    allowed = resolve_brand_managers(brand_id)
+    email = normalize_key(user.email)
+    username = normalize_key(user.username)
+    return username in allowed or email in allowed
+
+
+def get_required_user(user: Optional[User]) -> User:
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+    return user
+
+
+def get_lounge_program(brand_id: str, db: Session) -> LoungeProgram | None:
+    return db.query(LoungeProgram).filter(LoungeProgram.brand_id == brand_id).first()
+
+
+def lounge_program_to_out(program: Optional[LoungeProgram], brand_id: str) -> LoungeProgramOut:
+    if not program:
+        return LoungeProgramOut(
+            brand_id=brand_id,
+            updated_at=None,
+            **default_lounge_program_values(brand_id),
+        )
+
+    return LoungeProgramOut(
+        brand_id=program.brand_id,
+        title=program.title,
+        summary=program.summary,
+        base_discount_percent=program.base_discount_percent,
+        welcome_offer_title=program.welcome_offer_title,
+        welcome_offer_body=program.welcome_offer_body,
+        updated_at=program.updated_at,
+    )
+
+
+def lounge_personalization_to_out(
+    record: LoungeGuestPersonalization,
+    guest_user: User,
+) -> LoungeGuestRecordOut:
+    return LoungeGuestRecordOut(
+        id=record.id,
+        user_id=guest_user.id,
+        username=guest_user.username or guest_user.email,
+        display_name=record.display_name or guest_user.username or guest_user.email,
+        favorite_order=record.favorite_order,
+        average_check=record.average_check,
+        visit_count=record.visit_count,
+        personal_tier_title=record.personal_tier_title,
+        personal_discount_percent=record.personal_discount_percent,
+        personal_offer_title=record.personal_offer_title,
+        personal_offer_body=record.personal_offer_body,
+        note=record.note,
+        updated_at=record.updated_at,
+    )
+
+
+def build_lounge_loyalty_out(
+    brand_id: str,
+    guest_user: User,
+    db: Session,
+) -> LoungeMyLoyaltyOut:
+    program = get_lounge_program(brand_id, db)
+    program_out = lounge_program_to_out(program, brand_id)
+    loyalty = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == guest_user.id,
+    ).first()
+    personalization = db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.brand_id == brand_id,
+        LoungeGuestPersonalization.user_id == guest_user.id,
+    ).first()
+
+    visit_count = loyalty.visit_count if loyalty else 0
+    tier = lounge_tier_for_visits(visit_count)
+
+    personalization_out = None
+    if personalization:
+        personalization_out = lounge_personalization_to_out(personalization, guest_user)
+
+    return LoungeMyLoyaltyOut(
+        brand_id=brand_id,
+        visit_count=visit_count,
+        last_visit_at=loyalty.last_visit_at if loyalty else None,
+        tier=tier,
+        program=program_out,
+        personalization=personalization_out,
+    )
+
+
+def record_lounge_event(
+    brand_id: str,
+    event_type: str,
+    db: Session,
+    actor_user_id: Optional[int] = None,
+    guest_user_id: Optional[int] = None,
+):
+    db.add(
+        LoungeBusinessEvent(
+            brand_id=brand_id,
+            event_type=event_type,
+            actor_user_id=actor_user_id,
+            guest_user_id=guest_user_id,
+        )
+    )
+
+
+def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut:
+    events = db.query(LoungeBusinessEvent).filter(
+        LoungeBusinessEvent.brand_id == brand_id
+    ).all()
+
+    counts = defaultdict(int)
+    timeline_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for event in events:
+        counts[event.event_type] += 1
+        day_key = event.created_at.strftime("%Y-%m-%d")
+        timeline_counts[day_key][event.event_type] += 1
+
+    loyalty_states = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id
+    ).all()
+    personalizations = db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.brand_id == brand_id
+    ).all()
+
+    today = datetime.utcnow().date()
+    timeline: list[LoungeAnalyticsDayOut] = []
+    for offset in range(6, -1, -1):
+        day = datetime.utcnow().date() - timedelta(days=offset)
+        day_key = day.strftime("%Y-%m-%d")
+        bucket = timeline_counts.get(day_key, {})
+        timeline.append(
+            LoungeAnalyticsDayOut(
+                day_key=day_key,
+                profile_views=bucket.get("profile_view", 0),
+                qr_shows=bucket.get("qr_show", 0),
+                qr_checkins=bucket.get("qr_checkin", 0),
+                loyalty_assignments=bucket.get("loyalty_assignment", 0),
+            )
+        )
+
+    return LoungeAnalyticsOut(
+        brand_id=brand_id,
+        profile_views=counts.get("profile_view", 0),
+        qr_shows=counts.get("qr_show", 0),
+        qr_checkins=counts.get("qr_checkin", 0),
+        loyalty_guests_count=len(loyalty_states),
+        total_visits=sum(item.visit_count for item in loyalty_states),
+        today_visits=sum(
+            1 for item in loyalty_states
+            if item.last_visit_at and item.last_visit_at.date() == today
+        ),
+        assigned_guests_count=len(personalizations),
+        offers_count=sum(
+            1 for item in personalizations
+            if (item.personal_offer_title or "").strip() or (item.personal_offer_body or "").strip()
+        ),
+        max_assigned_discount=max(
+            (item.personal_discount_percent or 0 for item in personalizations),
+            default=0,
+        ),
+        timeline=timeline,
+    )
+
+
 def admin_user_to_out(user: User, db: Session) -> AdminUserRowOut:
     latest_mix = db.query(Mix).filter(
         Mix.author_id == user.id
@@ -723,6 +990,27 @@ def delete_user_record(user: User, db: Session):
     ).delete(synchronize_session=False)
     db.query(UserProgress).filter(
         UserProgress.user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.updated_by_user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(LoungeProgram).filter(
+        LoungeProgram.updated_by_user_id == user.id
+    ).update(
+        {"updated_by_user_id": None},
+        synchronize_session=False
+    )
+    db.query(LoungeBusinessEvent).filter(
+        LoungeBusinessEvent.actor_user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(LoungeBusinessEvent).filter(
+        LoungeBusinessEvent.guest_user_id == user.id
     ).delete(synchronize_session=False)
     db.delete(user)
 
@@ -1005,6 +1293,313 @@ def get_me(
     db.commit()
     db.refresh(user)
     return user_to_out(user, user, db)
+
+
+@app.get("/users/search", response_model=List[UserSearchOut])
+def search_users(
+    query: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    normalized_query = query.strip()
+    if not normalized_query:
+        return []
+
+    users = db.query(User).filter(
+        User.is_banned.is_(False),
+        User.id != current_user.id,
+        (
+            User.username.ilike(f"%{normalized_query}%")
+            | User.email.ilike(f"%{normalized_query}%")
+        )
+    ).order_by(
+        User.username.asc(),
+        User.id.asc()
+    ).limit(12).all()
+
+    return [user_search_to_out(item) for item in users if item.username]
+
+
+@app.get("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
+def get_lounge_program_endpoint(
+    brand_id: str,
+    db: Session = Depends(get_db),
+):
+    return lounge_program_to_out(get_lounge_program(brand_id, db), brand_id)
+
+
+@app.put("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
+def update_lounge_program(
+    brand_id: str,
+    payload: LoungeProgramIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    program = get_lounge_program(brand_id, db)
+    if not program:
+        program = LoungeProgram(brand_id=brand_id)
+        db.add(program)
+
+    program.title = payload.title.strip()
+    program.summary = payload.summary.strip()
+    program.base_discount_percent = max(min(payload.base_discount_percent, 50), 0)
+    program.welcome_offer_title = payload.welcome_offer_title.strip()
+    program.welcome_offer_body = payload.welcome_offer_body.strip()
+    program.updated_by_user_id = current_user.id
+    program.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(program)
+    return lounge_program_to_out(program, brand_id)
+
+
+@app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)
+def get_my_lounge_loyalty(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    return build_lounge_loyalty_out(brand_id, current_user, db)
+
+
+@app.get("/lounges/{brand_id}/guests", response_model=List[LoungeGuestRecordOut])
+def list_lounge_guest_records(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    rows = db.query(LoungeGuestPersonalization, User).join(
+        User, User.id == LoungeGuestPersonalization.user_id
+    ).filter(
+        LoungeGuestPersonalization.brand_id == brand_id
+    ).order_by(
+        LoungeGuestPersonalization.updated_at.desc(),
+        LoungeGuestPersonalization.id.desc()
+    ).all()
+
+    return [lounge_personalization_to_out(record, guest_user) for record, guest_user in rows]
+
+
+@app.post("/lounges/{brand_id}/guests", response_model=LoungeGuestRecordOut)
+def upsert_lounge_guest_record(
+    brand_id: str,
+    payload: LoungeGuestRecordIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    guest_user = None
+    if payload.user_id is not None:
+        guest_user = db.query(User).filter(User.id == payload.user_id).first()
+    if guest_user is None and payload.username:
+        guest_user = db.query(User).filter(
+            func.lower(User.username) == payload.username.strip().replace("@", "").lower()
+        ).first()
+    if guest_user is None:
+        raise HTTPException(404, "User not found")
+
+    record = db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.brand_id == brand_id,
+        LoungeGuestPersonalization.user_id == guest_user.id,
+    ).first()
+    if not record:
+        record = LoungeGuestPersonalization(
+            brand_id=brand_id,
+            user_id=guest_user.id,
+        )
+        db.add(record)
+
+    record.display_name = (payload.display_name or "").strip() or guest_user.username
+    record.favorite_order = (payload.favorite_order or "").strip() or None
+    record.average_check = payload.average_check
+    record.visit_count = max(payload.visit_count, 0)
+    record.personal_tier_title = (payload.personal_tier_title or "").strip() or None
+    record.personal_discount_percent = payload.personal_discount_percent
+    record.personal_offer_title = (payload.personal_offer_title or "").strip() or None
+    record.personal_offer_body = (payload.personal_offer_body or "").strip() or None
+    record.note = (payload.note or "").strip() or None
+    record.updated_by_user_id = current_user.id
+    record.updated_at = datetime.utcnow()
+
+    record_lounge_event(
+        brand_id,
+        "loyalty_assignment",
+        db,
+        actor_user_id=current_user.id,
+        guest_user_id=guest_user.id,
+    )
+
+    db.commit()
+    db.refresh(record)
+    return lounge_personalization_to_out(record, guest_user)
+
+
+@app.delete("/lounges/{brand_id}/guests/{guest_user_id}", response_model=StatusOut)
+def delete_lounge_guest_record(
+    brand_id: str,
+    guest_user_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.brand_id == brand_id,
+        LoungeGuestPersonalization.user_id == guest_user_id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return StatusOut(status="ok", message="Guest loyalty record removed")
+
+
+@app.post("/lounges/{brand_id}/checkin", response_model=LoungeCheckinOut)
+def register_lounge_checkin(
+    brand_id: str,
+    payload: LoungeCheckinIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    guest_user = None
+    if payload.user_id is not None:
+        guest_user = db.query(User).filter(User.id == payload.user_id).first()
+    if guest_user is None and payload.username:
+        guest_user = db.query(User).filter(
+            func.lower(User.username) == payload.username.strip().replace("@", "").lower()
+        ).first()
+    if guest_user is None or not guest_user.username:
+        raise HTTPException(404, "Guest user not found")
+
+    loyalty = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == guest_user.id,
+    ).first()
+    if not loyalty:
+        loyalty = LoungeGuestLoyalty(
+            brand_id=brand_id,
+            user_id=guest_user.id,
+            visit_count=0,
+        )
+        db.add(loyalty)
+        db.flush()
+
+    if loyalty.last_visit_at and loyalty.last_visit_at.date() == datetime.utcnow().date():
+        raise HTTPException(400, "Visit already registered today")
+
+    previous_tier = lounge_tier_for_visits(loyalty.visit_count)
+    loyalty.visit_count += 1
+    loyalty.last_visit_at = datetime.utcnow()
+
+    personalization = db.query(LoungeGuestPersonalization).filter(
+        LoungeGuestPersonalization.brand_id == brand_id,
+        LoungeGuestPersonalization.user_id == guest_user.id,
+    ).first()
+    program = get_lounge_program(brand_id, db)
+    program_out = lounge_program_to_out(program, brand_id)
+    if not personalization:
+        personalization = LoungeGuestPersonalization(
+            brand_id=brand_id,
+            user_id=guest_user.id,
+            display_name=(payload.display_name or guest_user.username),
+            visit_count=loyalty.visit_count,
+            personal_discount_percent=program_out.base_discount_percent,
+            updated_by_user_id=current_user.id,
+            updated_at=datetime.utcnow(),
+        )
+        db.add(personalization)
+    else:
+        personalization.visit_count = max(personalization.visit_count, loyalty.visit_count)
+        personalization.updated_by_user_id = current_user.id
+        personalization.updated_at = datetime.utcnow()
+
+    record_lounge_event(
+        brand_id,
+        "qr_checkin",
+        db,
+        actor_user_id=current_user.id,
+        guest_user_id=guest_user.id,
+    )
+
+    db.commit()
+
+    loyalty_out = build_lounge_loyalty_out(brand_id, guest_user, db)
+    is_level_up = previous_tier.title != loyalty_out.tier.title
+    message = (
+        f"Визит @{guest_user.username} в {display_title_from_brand_id(brand_id)} засчитан: "
+        f"{loyalty_out.tier.title}, {loyalty_out.tier.discount_text} скидки."
+    )
+
+    return LoungeCheckinOut(
+        guest=user_search_to_out(guest_user),
+        loyalty=loyalty_out,
+        is_level_up=is_level_up,
+        message=message,
+    )
+
+
+@app.get("/lounges/{brand_id}/analytics", response_model=LoungeAnalyticsOut)
+def get_lounge_analytics(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+    return build_lounge_analytics_out(brand_id, db)
+
+
+@app.post("/lounges/{brand_id}/events/profile-view", response_model=StatusOut)
+def track_lounge_profile_view(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    record_lounge_event(
+        brand_id,
+        "profile_view",
+        db,
+        actor_user_id=user.id if user else None,
+    )
+    db.commit()
+    return StatusOut(status="ok")
+
+
+@app.post("/lounges/{brand_id}/events/qr-show", response_model=StatusOut)
+def track_lounge_qr_show(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    record_lounge_event(
+        brand_id,
+        "qr_show",
+        db,
+        actor_user_id=current_user.id,
+    )
+    db.commit()
+    return StatusOut(status="ok")
 
 
 @app.get("/mini-game/heat-bowl", response_model=BowlHeatGameStateOut)

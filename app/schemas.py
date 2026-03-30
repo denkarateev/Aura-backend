@@ -133,6 +133,12 @@ class FollowUserOut(BaseModel):
     is_following: bool
 
 
+class UserSearchOut(BaseModel):
+    id: int
+    username: str
+    display_name: Optional[str] = None
+
+
 class UserOut(BaseModel):
     id: int
     email: str
@@ -244,3 +250,103 @@ class AdminDashboardOut(BaseModel):
 
 class AdminBanIn(BaseModel):
     reason: Optional[str] = None
+
+
+class LoungeProgramIn(BaseModel):
+    title: str
+    summary: str
+    base_discount_percent: int
+    welcome_offer_title: str
+    welcome_offer_body: str
+
+
+class LoungeProgramOut(LoungeProgramIn):
+    brand_id: str
+    updated_at: Optional[datetime] = None
+
+
+class LoungeGuestRecordIn(BaseModel):
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+    favorite_order: Optional[str] = None
+    average_check: Optional[int] = None
+    visit_count: int = 1
+    personal_tier_title: Optional[str] = None
+    personal_discount_percent: Optional[int] = None
+    personal_offer_title: Optional[str] = None
+    personal_offer_body: Optional[str] = None
+    note: Optional[str] = None
+
+
+class LoungeGuestRecordOut(BaseModel):
+    id: int
+    user_id: int
+    username: str
+    display_name: Optional[str] = None
+    favorite_order: Optional[str] = None
+    average_check: Optional[int] = None
+    visit_count: int
+    personal_tier_title: Optional[str] = None
+    personal_discount_percent: Optional[int] = None
+    personal_offer_title: Optional[str] = None
+    personal_offer_body: Optional[str] = None
+    note: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+class LoungeTierOut(BaseModel):
+    title: str
+    discount_percent: int
+    discount_text: str
+    benefit: str
+    next_goal: Optional[int] = None
+
+
+class LoungeMyLoyaltyOut(BaseModel):
+    brand_id: str
+    visit_count: int
+    last_visit_at: Optional[datetime] = None
+    tier: LoungeTierOut
+    program: LoungeProgramOut
+    personalization: Optional[LoungeGuestRecordOut] = None
+
+
+class LoungeCheckinIn(BaseModel):
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+
+
+class LoungeCheckinOut(BaseModel):
+    guest: UserSearchOut
+    loyalty: LoungeMyLoyaltyOut
+    is_level_up: bool
+    message: str
+
+
+class LoungeAnalyticsDayOut(BaseModel):
+    day_key: str
+    profile_views: int
+    qr_shows: int
+    qr_checkins: int
+    loyalty_assignments: int
+
+
+class LoungeAnalyticsOut(BaseModel):
+    brand_id: str
+    profile_views: int
+    qr_shows: int
+    qr_checkins: int
+    loyalty_guests_count: int
+    total_visits: int
+    today_visits: int
+    assigned_guests_count: int
+    offers_count: int
+    max_assigned_discount: int
+    timeline: List[LoungeAnalyticsDayOut]
+
+
+class StatusOut(BaseModel):
+    status: str
+    message: Optional[str] = None

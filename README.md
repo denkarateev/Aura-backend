@@ -3,6 +3,11 @@
 FastAPI backend for the Aura / Hooka3 app.  
 The service covers auth, user profiles, mixes, comments, favorites, follows, monthly challenges, mini-game rewards, business/lounge flows, and basic admin CRM actions.
 
+## Documentation
+
+- [Backend architecture](./docs/BACKEND_ARCHITECTURE.md)
+- [API reference](./docs/API_REFERENCE.md)
+
 ## Stack
 
 - Python
