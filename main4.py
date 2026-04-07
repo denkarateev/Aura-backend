@@ -1,102 +1,540 @@
-import uuid
-import random
-import string
-import asyncio
-from fastapi import WebSocket, WebSocketDisconnect
-import hashlib
-import os
-from datetime import datetime, timedelta
-from collections import defaultdict
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
-
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import func
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float,
+    ForeignKey, Text, UniqueConstraint, DateTime, Date, Boolean
+)
+from sqlalchemy.orm import (
+    sessionmaker, declarative_base, relationship,
+    Session, joinedload
+)
+import hashlib, os
+from datetime import datetime, timedelta
 from jose import jwt
-from sqlalchemy.orm import Session, joinedload
 
-from app.core.config import (
-    ALGORITHM,
-    DEFAULT_BRAND_MANAGER_USERNAMES,
-    BOWL_HEAT_DURATION_SECONDS,
-    BOWL_HEAT_TARGET_SCORE,
-    DEFAULT_ADMIN_EMAILS,
-    DEFAULT_ADMIN_USERNAMES,
-    DEFAULT_UNLIMITED_MIX_EMAILS,
-    DEFAULT_UNLIMITED_MIX_USERNAMES,
-    MAX_BOWL_HEAT_ATTEMPTS,
-    MIX_SLOT_RULES,
-    RATING_LEVELS,
-    REWARD_RULES,
-    SECRET_KEY,
-    load_brand_manager_usernames,
+# -------------------------------------------------------------------
+# DATABASE
+# -------------------------------------------------------------------
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:pass@localhost:5433/hookahmix"
 )
-from app.core.database import Base, SessionLocal, engine
-from app.core.security import create_access_token, security
-from app.models import (
-    Duel,
-    BowlHeatRun,
-    Comment,
-    Favorite,
-    LoungeBusinessEvent,
-    LoungeGuestLoyalty,
-    LoungeGuestPersonalization,
-    LoungeProgram,
-    Mix,
-    MixIngredient,
-    MonthlyVote,
-    User,
-    UserActivity,
-    UserFollow,
-    UserProgress,
-)
-from app.schemas import (
-    DuelCreateIn,
-    DuelCreateOut,
-    DuelJoinIn,
-    DuelStateOut,
-    AdminBanIn,
-    AdminDashboardOut,
-    AdminDashboardStatsOut,
-    AdminMixRowOut,
-    AdminUserRowOut,
-    BowlHeatGameStateOut,
-    BowlHeatPlayIn,
-    BowlHeatPlayOut,
-    CommentIn,
-    CommentOut,
-    FollowToggleOut,
-    FollowUserOut,
-    IngredientOut,
-    LoginRequest,
-    LoginResponse,
-    LoungeAnalyticsDayOut,
-    LoungeAnalyticsOut,
-    LoungeCheckinIn,
-    LoungeCheckinOut,
-    LoungeGuestRecordIn,
-    LoungeGuestRecordOut,
-    LoungeMyLoyaltyOut,
-    LoungeProgramIn,
-    LoungeProgramOut,
-    LoungeTierOut,
-    MixCreate,
-    MixOut,
-    MonthlyFlavorOut,
-    ProfileCommentOut,
-    SignupRequest,
-    StatusOut,
-    UserActivityOut,
-    UserSearchOut,
-    WalletConnectIn,
-    WalletBalanceOut,
-    WalletMintOut,
-    WalletBurnOut,
-    UserOut,
-    UserProgressOut,
-    UserUpdate,
-    VoteMixOut,
-)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, autoflush=False)
+Base = declarative_base()
+
+# -------------------------------------------------------------------
+# JWT
+# -------------------------------------------------------------------
+SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+security = HTTPBearer(auto_error=False)
+
+REWARD_RULES = {
+    "daily_login": {
+        "title": "Ежедневный вход",
+        "points": 5,
+        "rating": 0,
+        "daily_limit": 1,
+    },
+    "mix_created": {
+        "title": "Новый микс",
+        "points": 20,
+        "rating": 5,
+        "daily_limit": 3,
+    },
+    "mix_favorited": {
+        "title": "Микс сохранили",
+        "points": 4,
+        "rating": 3,
+        "daily_limit": 30,
+    },
+    "comment_created": {
+        "title": "Комментарий отправлен",
+        "points": 3,
+        "rating": 0,
+        "daily_limit": 10,
+    },
+    "comment_received": {
+        "title": "Новый отзыв на микс",
+        "points": 2,
+        "rating": 2,
+        "daily_limit": 20,
+    },
+}
+
+RATING_LEVELS = [
+    (0, "Новичок"),
+    (100, "Миксер"),
+    (300, "Блендер"),
+    (700, "Мастер чаши"),
+    (1500, "Hookah Legend"),
+]
+
+MIX_SLOT_RULES = [
+    (0, 2),
+    (100, 4),
+    (300, 6),
+    (700, 8),
+    (1500, 10),
+]
+
+MAX_BOWL_HEAT_ATTEMPTS = 3
+BOWL_HEAT_TARGET_SCORE = 75
+BOWL_HEAT_DURATION_SECONDS = 20
+DEFAULT_ADMIN_EMAILS = {"dorf.foto@yandex.ru"}
+DEFAULT_ADMIN_USERNAMES = {"dorfden"}
+DEFAULT_UNLIMITED_MIX_EMAILS = {
+    "hookahplacemars@hooka3.app",
+    "musthave.originals.seed@example.com",
+    "neon.lounge.seed@example.com",
+}
+DEFAULT_UNLIMITED_MIX_USERNAMES = {
+    "hookahplacemars",
+    "musthave",
+    "lounge_neon",
+}
+
+def create_access_token(data: dict) -> str:
+    expire = datetime.utcnow() + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    to_encode = data.copy()
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, nullable=False)
+    username = Column(String, unique=True)
+    password_hash = Column(String, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
+    is_banned = Column(Boolean, default=False, nullable=False)
+    ban_reason = Column(Text)
+    banned_at = Column(DateTime)
+
+    mixes = relationship("Mix", back_populates="author")
+    favorites = relationship("Favorite", back_populates="user")
+    comments = relationship("Comment", back_populates="user")
+    following_links = relationship(
+        "UserFollow",
+        foreign_keys="UserFollow.follower_id",
+        back_populates="follower",
+        cascade="all, delete-orphan"
+    )
+    follower_links = relationship(
+        "UserFollow",
+        foreign_keys="UserFollow.following_id",
+        back_populates="following",
+        cascade="all, delete-orphan"
+    )
+    progress = relationship("UserProgress", back_populates="user", uselist=False)
+    activities = relationship(
+        "UserActivity",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+    bowl_heat_runs = relationship(
+        "BowlHeatRun",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+
+
+class Mix(Base):
+    __tablename__ = "mixes"
+
+    id = Column(Integer, primary_key=True)
+    author_id = Column(Integer, ForeignKey("users.id"))
+
+    name = Column(String, nullable=False)
+    mood = Column(String)
+    intensity = Column(Float)
+    description = Column(Text)
+    bowl_type = Column(String)
+    packing_style = Column(String)
+    bowl_image_name = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    author = relationship("User", back_populates="mixes")
+    ingredients = relationship(
+        "MixIngredient",
+        cascade="all, delete-orphan"
+    )
+    comments = relationship(
+        "Comment",
+        cascade="all, delete-orphan"
+    )
+    favorited_by = relationship(
+        "Favorite",
+        back_populates="mix"
+    )
+
+
+class MixIngredient(Base):
+    __tablename__ = "mix_ingredients"
+
+    id = Column(Integer, primary_key=True)
+    mix_id = Column(Integer, ForeignKey("mixes.id"))
+    brand = Column(String)
+    flavor = Column(String)
+    percentage = Column(Integer)
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    mix_id = Column(Integer, ForeignKey("mixes.id"))
+
+    __table_args__ = (UniqueConstraint("user_id", "mix_id"),)
+
+    user = relationship("User", back_populates="favorites")
+    mix = relationship("Mix", back_populates="favorited_by")
+
+
+class UserFollow(Base):
+    __tablename__ = "user_follows"
+
+    id = Column(Integer, primary_key=True)
+    follower_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    following_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("follower_id", "following_id"),)
+
+    follower = relationship(
+        "User",
+        foreign_keys=[follower_id],
+        back_populates="following_links"
+    )
+    following = relationship(
+        "User",
+        foreign_keys=[following_id],
+        back_populates="follower_links"
+    )
+
+
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True)
+    mix_id = Column(Integer, ForeignKey("mixes.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))
+    text = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="comments")
+    mix = relationship("Mix", back_populates="comments")
+
+
+class MonthlyVote(Base):
+    __tablename__ = "monthly_votes"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    mix_id = Column(Integer, ForeignKey("mixes.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class UserProgress(Base):
+    __tablename__ = "user_progress"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    points = Column(Integer, default=0, nullable=False)
+    rating = Column(Integer, default=0, nullable=False)
+    streak_days = Column(Integer, default=0, nullable=False)
+    last_active_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="progress")
+
+
+class UserActivity(Base):
+    __tablename__ = "user_activities"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    event_type = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text)
+    points_delta = Column(Integer, default=0, nullable=False)
+    rating_delta = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="activities")
+
+
+class BowlHeatRun(Base):
+    __tablename__ = "bowl_heat_runs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    score = Column(Integer, default=0, nullable=False)
+    sweet_spot_seconds = Column(Float, default=0, nullable=False)
+    overheat_seconds = Column(Float, default=0, nullable=False)
+    taps_count = Column(Integer, default=0, nullable=False)
+    duration_seconds = Column(Float, default=BOWL_HEAT_DURATION_SECONDS, nullable=False)
+    reward_points = Column(Integer, default=0, nullable=False)
+    reward_rating = Column(Integer, default=0, nullable=False)
+    tier_title = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="bowl_heat_runs")
+
+# -------------------------------------------------------------------
+# SCHEMAS
+# -------------------------------------------------------------------
+class IngredientIn(BaseModel):
+    brand: Optional[str]
+    flavor: str
+    percentage: int
+
+
+class IngredientOut(IngredientIn):
+    id: int
+    class Config:
+        from_attributes = True
+
+
+class MixCreate(BaseModel):
+    name: str
+    mood: Optional[str] = None
+    intensity: Optional[float] = None
+    description: Optional[str] = None
+    bowl_type: Optional[str] = None
+    packing_style: Optional[str] = None
+    bowl_image_name: Optional[str] = None
+    ingredients: List[IngredientIn]
+
+
+class MixOut(BaseModel):
+    id: int
+    name: str
+    mood: Optional[str]
+    intensity: Optional[float]
+    description: Optional[str]
+    bowl_type: Optional[str]
+    packing_style: Optional[str]
+    bowl_image_name: Optional[str]
+    author_id: Optional[int]
+    author_username: Optional[str]
+    created_at: Optional[datetime]
+    ingredients: List[IngredientOut]
+    likes_count: int
+    is_liked: bool
+    is_author_followed: bool
+
+    class Config:
+        from_attributes = True
+
+
+class CommentOut(BaseModel):
+    id: int
+    mix_id: int
+    user_id: int
+    user_username: Optional[str] = None
+    text: str
+    created_at: Optional[datetime] = None
+    class Config:
+        from_attributes = True
+
+
+class ProfileCommentOut(CommentOut):
+    mix_name: Optional[str] = None
+
+
+class UserProgressOut(BaseModel):
+    points: int
+    rating: int
+    streak_days: int
+    level_title: str
+    next_level_rating: int
+    mixes_used: int
+    max_mix_slots: Optional[int]
+    mixes_remaining: Optional[int]
+    has_unlimited_mix_slots: bool
+
+
+class UserActivityOut(BaseModel):
+    id: int
+    event_type: str
+    title: str
+    description: Optional[str]
+    points_delta: int
+    rating_delta: int
+    created_at: datetime
+
+
+class BowlHeatGameStateOut(BaseModel):
+    title: str
+    subtitle: str
+    attempts_used: int
+    attempts_left: int
+    max_attempts: int
+    best_score_today: int
+    best_tier_today: Optional[str] = None
+    target_score: int
+    duration_seconds: int
+    reward_hint: str
+    can_play: bool
+    last_played_at: Optional[datetime] = None
+
+
+class BowlHeatPlayIn(BaseModel):
+    score: int
+    sweet_spot_seconds: float
+    overheat_seconds: float
+    taps_count: int
+    duration_seconds: float
+
+
+class BowlHeatPlayOut(BaseModel):
+    score: int
+    tier: str
+    result_title: str
+    result_message: str
+    points_awarded: int
+    rating_awarded: int
+    is_new_best: bool
+    state: BowlHeatGameStateOut
+
+
+class FollowUserOut(BaseModel):
+    id: int
+    username: Optional[str]
+    mixes_count: int
+    likes_count: int
+    latest_mix_id: Optional[int] = None
+    latest_mix_name: Optional[str] = None
+    latest_mix_bowl_image_name: Optional[str] = None
+    latest_mix_created_at: Optional[datetime] = None
+    is_following: bool
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    username: Optional[str]
+    is_admin: bool
+    is_banned: bool
+    ban_reason: Optional[str]
+    mixes: List[MixOut]
+    favorites: List[MixOut]
+    comments: List[ProfileCommentOut]
+    progress: UserProgressOut
+    activity_feed: List[UserActivityOut]
+    daily_game: BowlHeatGameStateOut
+    followers_count: int
+    following_count: int
+    following_users: List[FollowUserOut]
+
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+    username: Optional[str]
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginResponse(BaseModel):
+    user_id: int
+    token: str
+    username: Optional[str]
+
+
+class CommentIn(BaseModel):
+    text: str
+
+
+class UserUpdate(BaseModel):
+    username: Optional[str]
+    email: Optional[EmailStr]
+
+
+class FollowToggleOut(BaseModel):
+    user_id: int
+    is_following: bool
+
+
+class VoteMixOut(BaseModel):
+    id: int
+    name: str
+    lounge: str
+    percentage: float
+    image_name: Optional[str] = None
+
+
+class MonthlyFlavorOut(BaseModel):
+    title: str
+    subtitle: str
+    remaining_time: str
+    progress: float
+    sponsor_brand: Optional[str] = None
+    featured_flavor: Optional[str] = None
+    challenge_title: Optional[str] = None
+    challenge_reward: Optional[str] = None
+    cta_title: Optional[str] = None
+    mixes: List[VoteMixOut]
+
+
+class AdminDashboardStatsOut(BaseModel):
+    total_users: int
+    banned_users: int
+    total_mixes: int
+    total_comments: int
+    total_favorites: int
+
+
+class AdminUserRowOut(BaseModel):
+    id: int
+    email: str
+    username: Optional[str]
+    is_admin: bool
+    is_banned: bool
+    ban_reason: Optional[str]
+    mixes_count: int
+    followers_count: int
+    favorites_received: int
+    latest_mix_name: Optional[str] = None
+    latest_mix_created_at: Optional[datetime] = None
+
+
+class AdminMixRowOut(BaseModel):
+    id: int
+    name: str
+    author_id: Optional[int]
+    author_username: Optional[str]
+    created_at: Optional[datetime]
+    likes_count: int
+    comments_count: int
+    ingredients_count: int
+
+
+class AdminDashboardOut(BaseModel):
+    stats: AdminDashboardStatsOut
+    users: List[AdminUserRowOut]
+    recent_mixes: List[AdminMixRowOut]
+
+
+class AdminBanIn(BaseModel):
+    reason: Optional[str] = None
 
 # -------------------------------------------------------------------
 # UTILS
@@ -641,253 +1079,6 @@ def user_to_out(profile_user: User, viewer: Optional[User], db: Session) -> User
     )
 
 
-BRAND_MANAGER_USERNAMES = load_brand_manager_usernames()
-
-
-def normalize_key(value: Optional[str]) -> str:
-    return (value or "").strip().lower()
-
-
-def display_title_from_brand_id(brand_id: str) -> str:
-    pieces = [piece for piece in brand_id.replace("-", "_").split("_") if piece]
-    if not pieces:
-        return "Lounge"
-    return " ".join(piece.capitalize() for piece in pieces)
-
-
-def default_lounge_program_values(brand_id: str) -> dict:
-    title = f"{display_title_from_brand_id(brand_id)} Club"
-    return {
-        "title": title,
-        "summary": "Сохраняй визиты, чтобы копить скидку и получать персональные предложения от заведения.",
-        "base_discount_percent": 5,
-        "welcome_offer_title": f"Welcome в {display_title_from_brand_id(brand_id)}",
-        "welcome_offer_body": "Стартовая скидка 5% на первую бронь и быстрый вход в профиль заведения.",
-    }
-
-
-def lounge_tier_for_visits(visits: int) -> LoungeTierOut:
-    if visits >= 8:
-        return LoungeTierOut(
-            title="Signature",
-            discount_percent=15,
-            discount_text="15%",
-            benefit="Приоритет на VIP и закрытые офферы",
-            next_goal=None,
-        )
-    if visits >= 4:
-        return LoungeTierOut(
-            title="Resident",
-            discount_percent=10,
-            discount_text="10%",
-            benefit="Ранняя бронь и бонус к вечерним слотам",
-            next_goal=8,
-        )
-    if visits >= 1:
-        return LoungeTierOut(
-            title="Insider",
-            discount_percent=7,
-            discount_text="7%",
-            benefit="Скидка на посадку и персональные офферы",
-            next_goal=4,
-        )
-    return LoungeTierOut(
-        title="Welcome",
-        discount_percent=5,
-        discount_text="5%",
-        benefit="Стартовая скидка и welcome-предложение",
-        next_goal=1,
-    )
-
-
-def user_search_to_out(user: User) -> UserSearchOut:
-    display_name = (user.username or "").strip() or user.email
-    return UserSearchOut(
-        id=user.id,
-        username=user.username or display_name,
-        display_name=display_name,
-    )
-
-
-def resolve_brand_managers(brand_id: str) -> set[str]:
-    if brand_id in BRAND_MANAGER_USERNAMES:
-        return BRAND_MANAGER_USERNAMES[brand_id]
-    defaults = DEFAULT_BRAND_MANAGER_USERNAMES.get(brand_id, set())
-    return {username.lower() for username in defaults}
-
-
-def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
-    if not user:
-        return False
-    if user.is_admin:
-        return True
-
-    allowed = resolve_brand_managers(brand_id)
-    email = normalize_key(user.email)
-    username = normalize_key(user.username)
-    return username in allowed or email in allowed
-
-
-def get_required_user(user: Optional[User]) -> User:
-    if not user:
-        raise HTTPException(401, "Unauthorized")
-    return user
-
-
-def get_lounge_program(brand_id: str, db: Session) -> LoungeProgram | None:
-    return db.query(LoungeProgram).filter(LoungeProgram.brand_id == brand_id).first()
-
-
-def lounge_program_to_out(program: Optional[LoungeProgram], brand_id: str) -> LoungeProgramOut:
-    if not program:
-        return LoungeProgramOut(
-            brand_id=brand_id,
-            updated_at=None,
-            **default_lounge_program_values(brand_id),
-        )
-
-    return LoungeProgramOut(
-        brand_id=program.brand_id,
-        title=program.title,
-        summary=program.summary,
-        base_discount_percent=program.base_discount_percent,
-        welcome_offer_title=program.welcome_offer_title,
-        welcome_offer_body=program.welcome_offer_body,
-        updated_at=program.updated_at,
-    )
-
-
-def lounge_personalization_to_out(
-    record: LoungeGuestPersonalization,
-    guest_user: User,
-) -> LoungeGuestRecordOut:
-    return LoungeGuestRecordOut(
-        id=record.id,
-        user_id=guest_user.id,
-        username=guest_user.username or guest_user.email,
-        display_name=record.display_name or guest_user.username or guest_user.email,
-        favorite_order=record.favorite_order,
-        average_check=record.average_check,
-        visit_count=record.visit_count,
-        personal_tier_title=record.personal_tier_title,
-        personal_discount_percent=record.personal_discount_percent,
-        personal_offer_title=record.personal_offer_title,
-        personal_offer_body=record.personal_offer_body,
-        note=record.note,
-        updated_at=record.updated_at,
-    )
-
-
-def build_lounge_loyalty_out(
-    brand_id: str,
-    guest_user: User,
-    db: Session,
-) -> LoungeMyLoyaltyOut:
-    program = get_lounge_program(brand_id, db)
-    program_out = lounge_program_to_out(program, brand_id)
-    loyalty = db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.brand_id == brand_id,
-        LoungeGuestLoyalty.user_id == guest_user.id,
-    ).first()
-    personalization = db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.brand_id == brand_id,
-        LoungeGuestPersonalization.user_id == guest_user.id,
-    ).first()
-
-    visit_count = loyalty.visit_count if loyalty else 0
-    tier = lounge_tier_for_visits(visit_count)
-
-    personalization_out = None
-    if personalization:
-        personalization_out = lounge_personalization_to_out(personalization, guest_user)
-
-    return LoungeMyLoyaltyOut(
-        brand_id=brand_id,
-        visit_count=visit_count,
-        last_visit_at=loyalty.last_visit_at if loyalty else None,
-        tier=tier,
-        program=program_out,
-        personalization=personalization_out,
-    )
-
-
-def record_lounge_event(
-    brand_id: str,
-    event_type: str,
-    db: Session,
-    actor_user_id: Optional[int] = None,
-    guest_user_id: Optional[int] = None,
-):
-    db.add(
-        LoungeBusinessEvent(
-            brand_id=brand_id,
-            event_type=event_type,
-            actor_user_id=actor_user_id,
-            guest_user_id=guest_user_id,
-        )
-    )
-
-
-def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut:
-    events = db.query(LoungeBusinessEvent).filter(
-        LoungeBusinessEvent.brand_id == brand_id
-    ).all()
-
-    counts = defaultdict(int)
-    timeline_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-
-    for event in events:
-        counts[event.event_type] += 1
-        day_key = event.created_at.strftime("%Y-%m-%d")
-        timeline_counts[day_key][event.event_type] += 1
-
-    loyalty_states = db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.brand_id == brand_id
-    ).all()
-    personalizations = db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.brand_id == brand_id
-    ).all()
-
-    today = datetime.utcnow().date()
-    timeline: list[LoungeAnalyticsDayOut] = []
-    for offset in range(6, -1, -1):
-        day = datetime.utcnow().date() - timedelta(days=offset)
-        day_key = day.strftime("%Y-%m-%d")
-        bucket = timeline_counts.get(day_key, {})
-        timeline.append(
-            LoungeAnalyticsDayOut(
-                day_key=day_key,
-                profile_views=bucket.get("profile_view", 0),
-                qr_shows=bucket.get("qr_show", 0),
-                qr_checkins=bucket.get("qr_checkin", 0),
-                loyalty_assignments=bucket.get("loyalty_assignment", 0),
-            )
-        )
-
-    return LoungeAnalyticsOut(
-        brand_id=brand_id,
-        profile_views=counts.get("profile_view", 0),
-        qr_shows=counts.get("qr_show", 0),
-        qr_checkins=counts.get("qr_checkin", 0),
-        loyalty_guests_count=len(loyalty_states),
-        total_visits=sum(item.visit_count for item in loyalty_states),
-        today_visits=sum(
-            1 for item in loyalty_states
-            if item.last_visit_at and item.last_visit_at.date() == today
-        ),
-        assigned_guests_count=len(personalizations),
-        offers_count=sum(
-            1 for item in personalizations
-            if (item.personal_offer_title or "").strip() or (item.personal_offer_body or "").strip()
-        ),
-        max_assigned_discount=max(
-            (item.personal_discount_percent or 0 for item in personalizations),
-            default=0,
-        ),
-        timeline=timeline,
-    )
-
-
 def admin_user_to_out(user: User, db: Session) -> AdminUserRowOut:
     latest_mix = db.query(Mix).filter(
         Mix.author_id == user.id
@@ -1004,27 +1195,6 @@ def delete_user_record(user: User, db: Session):
     ).delete(synchronize_session=False)
     db.query(UserProgress).filter(
         UserProgress.user_id == user.id
-    ).delete(synchronize_session=False)
-    db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.user_id == user.id
-    ).delete(synchronize_session=False)
-    db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.user_id == user.id
-    ).delete(synchronize_session=False)
-    db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.updated_by_user_id == user.id
-    ).delete(synchronize_session=False)
-    db.query(LoungeProgram).filter(
-        LoungeProgram.updated_by_user_id == user.id
-    ).update(
-        {"updated_by_user_id": None},
-        synchronize_session=False
-    )
-    db.query(LoungeBusinessEvent).filter(
-        LoungeBusinessEvent.actor_user_id == user.id
-    ).delete(synchronize_session=False)
-    db.query(LoungeBusinessEvent).filter(
-        LoungeBusinessEvent.guest_user_id == user.id
     ).delete(synchronize_session=False)
     db.delete(user)
 
@@ -1307,326 +1477,6 @@ def get_me(
     db.commit()
     db.refresh(user)
     return user_to_out(user, user, db)
-
-
-@app.get("/users/search", response_model=List[UserSearchOut])
-def search_users(
-    query: str = Query(..., min_length=1),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    normalized_query = query.strip()
-    if not normalized_query:
-        return []
-
-    users = db.query(User).filter(
-        User.is_banned.is_(False),
-        User.id != current_user.id,
-        (
-            User.username.ilike(f"%{normalized_query}%")
-            | User.email.ilike(f"%{normalized_query}%")
-        )
-    ).order_by(
-        User.username.asc(),
-        User.id.asc()
-    ).limit(12).all()
-
-    return [user_search_to_out(item) for item in users if item.username]
-
-
-@app.get("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
-def get_lounge_program_endpoint(
-    brand_id: str,
-    db: Session = Depends(get_db),
-):
-    return lounge_program_to_out(get_lounge_program(brand_id, db), brand_id)
-
-
-@app.put("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
-def update_lounge_program(
-    brand_id: str,
-    payload: LoungeProgramIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    program = get_lounge_program(brand_id, db)
-    if not program:
-        program = LoungeProgram(brand_id=brand_id)
-        db.add(program)
-
-    program.title = payload.title.strip()
-    program.summary = payload.summary.strip()
-    program.base_discount_percent = max(min(payload.base_discount_percent, 50), 0)
-    program.welcome_offer_title = payload.welcome_offer_title.strip()
-    program.welcome_offer_body = payload.welcome_offer_body.strip()
-    program.updated_by_user_id = current_user.id
-    program.updated_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(program)
-    return lounge_program_to_out(program, brand_id)
-
-
-@app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)
-def get_my_lounge_loyalty(
-    brand_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    return build_lounge_loyalty_out(brand_id, current_user, db)
-
-
-@app.get("/lounges/{brand_id}/guests", response_model=List[LoungeGuestRecordOut])
-def list_lounge_guest_records(
-    brand_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    rows = db.query(LoungeGuestPersonalization, User).join(
-        User, User.id == LoungeGuestPersonalization.user_id
-    ).filter(
-        LoungeGuestPersonalization.brand_id == brand_id
-    ).order_by(
-        LoungeGuestPersonalization.updated_at.desc(),
-        LoungeGuestPersonalization.id.desc()
-    ).all()
-
-    return [lounge_personalization_to_out(record, guest_user) for record, guest_user in rows]
-
-
-@app.post("/lounges/{brand_id}/guests", response_model=LoungeGuestRecordOut)
-def upsert_lounge_guest_record(
-    brand_id: str,
-    payload: LoungeGuestRecordIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    guest_user = None
-    if payload.user_id is not None:
-        guest_user = db.query(User).filter(User.id == payload.user_id).first()
-    if guest_user is None and payload.username:
-        guest_user = db.query(User).filter(
-            func.lower(User.username) == payload.username.strip().replace("@", "").lower()
-        ).first()
-    if guest_user is None:
-        raise HTTPException(404, "User not found")
-
-    record = db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.brand_id == brand_id,
-        LoungeGuestPersonalization.user_id == guest_user.id,
-    ).first()
-    if not record:
-        record = LoungeGuestPersonalization(
-            brand_id=brand_id,
-            user_id=guest_user.id,
-        )
-        db.add(record)
-
-    record.display_name = (payload.display_name or "").strip() or guest_user.username
-    record.favorite_order = (payload.favorite_order or "").strip() or None
-    record.average_check = payload.average_check
-    record.visit_count = max(payload.visit_count, 0)
-    record.personal_tier_title = (payload.personal_tier_title or "").strip() or None
-    record.personal_discount_percent = payload.personal_discount_percent
-    record.personal_offer_title = (payload.personal_offer_title or "").strip() or None
-    record.personal_offer_body = (payload.personal_offer_body or "").strip() or None
-    record.note = (payload.note or "").strip() or None
-    record.updated_by_user_id = current_user.id
-    record.updated_at = datetime.utcnow()
-
-    record_lounge_event(
-        brand_id,
-        "loyalty_assignment",
-        db,
-        actor_user_id=current_user.id,
-        guest_user_id=guest_user.id,
-    )
-
-    db.commit()
-    db.refresh(record)
-    return lounge_personalization_to_out(record, guest_user)
-
-
-@app.delete("/lounges/{brand_id}/guests/{guest_user_id}", response_model=StatusOut)
-def delete_lounge_guest_record(
-    brand_id: str,
-    guest_user_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.brand_id == brand_id,
-        LoungeGuestPersonalization.user_id == guest_user_id,
-    ).delete(synchronize_session=False)
-    db.commit()
-    return StatusOut(status="ok", message="Guest loyalty record removed")
-
-
-@app.post("/lounges/{brand_id}/checkin", response_model=LoungeCheckinOut)
-def register_lounge_checkin(
-    brand_id: str,
-    payload: LoungeCheckinIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    guest_user = None
-    if payload.user_id is not None:
-        guest_user = db.query(User).filter(User.id == payload.user_id).first()
-    if guest_user is None and payload.username:
-        guest_user = db.query(User).filter(
-            func.lower(User.username) == payload.username.strip().replace("@", "").lower()
-        ).first()
-    if guest_user is None or not guest_user.username:
-        raise HTTPException(404, "Guest user not found")
-
-    loyalty = db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.brand_id == brand_id,
-        LoungeGuestLoyalty.user_id == guest_user.id,
-    ).first()
-    if not loyalty:
-        loyalty = LoungeGuestLoyalty(
-            brand_id=brand_id,
-            user_id=guest_user.id,
-            visit_count=0,
-        )
-        db.add(loyalty)
-        db.flush()
-
-    today = datetime.utcnow().date()
-    # Unlimited visits for dorfden (user_id=1)
-    is_unlimited_user = (guest_user.id == 1)
-    if loyalty.last_visit_at and loyalty.last_visit_at.date() == today and not is_unlimited_user:
-        cnt = loyalty.today_visit_count or 0
-        if cnt >= 3:
-            raise HTTPException(400, "Visit already registered today")
-        loyalty.today_visit_count = cnt + 1
-    else:
-        loyalty.today_visit_count = (loyalty.today_visit_count or 0) + 1 if (loyalty.last_visit_at and loyalty.last_visit_at.date() == today) else 1
-
-    previous_tier = lounge_tier_for_visits(loyalty.visit_count)
-    loyalty.visit_count += 1
-    loyalty.last_visit_at = datetime.utcnow()
-
-    personalization = db.query(LoungeGuestPersonalization).filter(
-        LoungeGuestPersonalization.brand_id == brand_id,
-        LoungeGuestPersonalization.user_id == guest_user.id,
-    ).first()
-    program = get_lounge_program(brand_id, db)
-    program_out = lounge_program_to_out(program, brand_id)
-    if not personalization:
-        personalization = LoungeGuestPersonalization(
-            brand_id=brand_id,
-            user_id=guest_user.id,
-            display_name=(payload.display_name or guest_user.username),
-            visit_count=loyalty.visit_count,
-            personal_discount_percent=program_out.base_discount_percent,
-            updated_by_user_id=current_user.id,
-            updated_at=datetime.utcnow(),
-        )
-        db.add(personalization)
-    else:
-        personalization.visit_count = max(personalization.visit_count, loyalty.visit_count)
-        personalization.updated_by_user_id = current_user.id
-        personalization.updated_at = datetime.utcnow()
-
-    record_lounge_event(
-        brand_id,
-        "qr_checkin",
-        db,
-        actor_user_id=current_user.id,
-        guest_user_id=guest_user.id,
-    )
-
-    db.commit()
-
-    loyalty_out = build_lounge_loyalty_out(brand_id, guest_user, db)
-    is_level_up = previous_tier.title != loyalty_out.tier.title
-    message = (
-        f"Визит @{guest_user.username} в {display_title_from_brand_id(brand_id)} засчитан: "
-        f"{loyalty_out.tier.title}, {loyalty_out.tier.discount_text} скидки."
-    )
-
-
-    # Create pending duel offer for guest
-    from sqlalchemy import text as _sa_text
-    db.execute(_sa_text("INSERT INTO pending_duel_offers (user_id, brand_id, discount_percent) VALUES (:uid, :bid, :disc)"), {"uid": guest_user.id, "bid": brand_id, "disc": loyalty_out.tier.discount_percent})
-    db.commit()
-    return LoungeCheckinOut(
-        guest=user_search_to_out(guest_user),
-        loyalty=loyalty_out,
-        is_level_up=is_level_up,
-        message=message,
-    )
-
-
-@app.get("/lounges/{brand_id}/analytics", response_model=LoungeAnalyticsOut)
-def get_lounge_analytics(
-    brand_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-    return build_lounge_analytics_out(brand_id, db)
-
-
-@app.post("/lounges/{brand_id}/events/profile-view", response_model=StatusOut)
-def track_lounge_profile_view(
-    brand_id: str,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
-):
-    record_lounge_event(
-        brand_id,
-        "profile_view",
-        db,
-        actor_user_id=user.id if user else None,
-    )
-    db.commit()
-    return StatusOut(status="ok")
-
-
-@app.post("/lounges/{brand_id}/events/qr-show", response_model=StatusOut)
-def track_lounge_qr_show(
-    brand_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    current_user = get_required_user(user)
-    if not can_manage_brand(current_user, brand_id):
-        raise HTTPException(403, "Business access required")
-
-    record_lounge_event(
-        brand_id,
-        "qr_show",
-        db,
-        actor_user_id=current_user.id,
-    )
-    db.commit()
-    return StatusOut(status="ok")
 
 
 @app.get("/mini-game/heat-bowl", response_model=BowlHeatGameStateOut)
@@ -2248,439 +2098,4 @@ def filter_mixes(
         query = query.filter(Mix.mood == mood)
 
     mixes = query.all()
-    return [mix_to_out(m, user, db) for m in mixes]
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-# ── Wallet endpoints ──
-
-@app.post("/wallet/connect", response_model=WalletBalanceOut)
-def wallet_connect(body: WalletConnectIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    user.ton_address = body.ton_address
-    db.commit()
-    db.refresh(user)
-    progress = ensure_user_progress(user, db)
-    ugolki = max(progress.points, 0)
-    return WalletBalanceOut(user_id=user.id, ton_address=user.ton_address, ugolki_balance=ugolki, hooka_balance=round(ugolki / 100.0, 2))
-
-@app.get("/wallet/balance", response_model=WalletBalanceOut)
-def wallet_balance(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    progress = ensure_user_progress(user, db)
-    ugolki = max(progress.points, 0)
-    return WalletBalanceOut(user_id=user.id, ton_address=getattr(user, "ton_address", None), ugolki_balance=ugolki, hooka_balance=round(ugolki / 100.0, 2))
-
-@app.post("/wallet/mint", response_model=WalletMintOut)
-def wallet_mint(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    progress = ensure_user_progress(user, db)
-    ugolki = max(progress.points, 0)
-    return WalletMintOut(success=True, amount=ugolki, new_ugolki_balance=ugolki, new_hooka_balance=round(ugolki / 100.0, 2), tx_hash=None)
-
-@app.post("/wallet/burn", response_model=WalletBurnOut)
-def wallet_burn(amount: int = Query(..., gt=0), reason: str = Query(default="spend"), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    progress = ensure_user_progress(user, db)
-    if amount > progress.points:
-        raise HTTPException(400, f"Not enough: have {progress.points}, need {amount}")
-    activity = UserActivity(user_id=user.id, event_type="shop_purchase", points_delta=-amount, rating_delta=0, description=f"Burn: {reason}", created_at=datetime.utcnow())
-    db.add(activity)
-    progress.points -= amount
-    db.commit()
-    return WalletBurnOut(success=True, amount=amount, reason=reason, new_ugolki_balance=max(progress.points, 0), new_hooka_balance=round(max(progress.points, 0) / 100.0, 2))
-
-@app.post("/admin/users/{user_id}/set-rating")
-def admin_set_rating(user_id: int, rating: int = Query(...), admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
-    target = db.query(User).filter(User.id == user_id).first()
-    if not target:
-        raise HTTPException(404, "User not found")
-    progress = ensure_user_progress(target, db)
-    progress.rating = rating
-    db.commit()
-    return {"user_id": user_id, "new_rating": rating, "level_title": level_title_for_rating(rating)}
-
-@app.post("/admin/users/{user_id}/set-points")
-def admin_set_points(user_id: int, points: int = Query(...), admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
-    target = db.query(User).filter(User.id == user_id).first()
-    if not target:
-        raise HTTPException(404, "User not found")
-    progress = ensure_user_progress(target, db)
-    progress.points = points
-    db.commit()
-    return {"user_id": user_id, "new_points": points}
-
-
-# -------------------------------------------------------------------
-# DUEL ENDPOINTS
-# -------------------------------------------------------------------
-
-# In-memory duel rooms
-active_duel_rooms = {}
-
-@app.post("/duels/create", response_model=DuelCreateOut)
-def create_duel(body: DuelCreateIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Check rate limit: 1 duel per venue per day per user
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    existing = db.query(Duel).filter(
-        Duel.guest_user_id == user.id,
-        Duel.brand_id == body.brand_id,
-        Duel.created_at >= today_start
-    ).first()
-    if existing and existing.status != "expired":
-        raise HTTPException(400, "Already have an active duel at this venue today")
-
-    # Get base discount from tier
-    loyalty = db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.user_id == user.id,
-        LoungeGuestLoyalty.brand_id == body.brand_id
-    ).first()
-    visit_count = loyalty.visit_count if loyalty else 0
-    tier = lounge_tier_for_visits(visit_count)
-    base = tier.discount_percent
-    duel = base * 2 if base * 2 <= 30 else 30
-
-    join_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    duel_id = str(uuid.uuid4())[:8]
-
-    d = Duel(id=duel_id, brand_id=body.brand_id, guest_user_id=user.id,
-             base_discount=base, duel_discount=duel, join_code=join_code)
-    db.add(d)
-    db.commit()
-
-    return DuelCreateOut(duel_id=duel_id, join_code=join_code,
-                         base_discount=base, duel_discount=duel, status="waiting")
-
-@app.post("/duels/join", response_model=DuelStateOut)
-def join_duel(body: DuelJoinIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    d = db.query(Duel).filter(Duel.join_code == body.join_code, Duel.status == "waiting").first()
-    if not d:
-        raise HTTPException(404, "Duel not found or already started")
-    d.host_user_id = user.id
-    d.status = "active"
-    d.started_at = datetime.utcnow()
-    db.commit()
-
-    guest = db.query(User).filter(User.id == d.guest_user_id).first()
-    return DuelStateOut(duel_id=d.id, brand_id=d.brand_id,
-                       guest_username=guest.username if guest else None,
-                       host_username=user.username,
-                       status=d.status, guest_score=0, host_score=0,
-                       winner_id=None, base_discount=d.base_discount,
-                       duel_discount=d.duel_discount)
-
-@app.get("/duels/{duel_id}", response_model=DuelStateOut)
-def get_duel(duel_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    d = db.query(Duel).filter(Duel.id == duel_id).first()
-    if not d:
-        raise HTTPException(404, "Duel not found")
-    guest = db.query(User).filter(User.id == d.guest_user_id).first()
-    host = db.query(User).filter(User.id == d.host_user_id).first() if d.host_user_id else None
-    return DuelStateOut(duel_id=d.id, brand_id=d.brand_id,
-                       guest_username=guest.username if guest else None,
-                       host_username=host.username if host else None,
-                       status=d.status, guest_score=d.guest_score, host_score=d.host_score,
-                       winner_id=d.winner_id, base_discount=d.base_discount,
-                       duel_discount=d.duel_discount)
-
-@app.get("/duels/pending/{brand_id}")
-def get_pending_duels(brand_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    duels = db.query(Duel).filter(Duel.brand_id == brand_id, Duel.status == "waiting").all()
-    return [{"duel_id": d.id, "join_code": d.join_code, "guest_user_id": d.guest_user_id,
-             "duel_discount": d.duel_discount} for d in duels]
-
-@app.websocket("/ws/duel/{duel_id}")
-async def duel_websocket(websocket: WebSocket, duel_id: str):
-    await websocket.accept()
-
-    # Get token from query params
-    token = websocket.query_params.get("token", "")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-    except Exception:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
-
-    # Initialize room
-    if duel_id not in active_duel_rooms:
-        active_duel_rooms[duel_id] = {"players": {}, "scores": {}, "ready": set()}
-
-    room = active_duel_rooms[duel_id]
-    room["players"][str(user_id)] = websocket
-    room["scores"][str(user_id)] = 0
-
-    try:
-        # Notify opponent joined
-        if len(room["players"]) == 2:
-            for uid, ws in room["players"].items():
-                opponent_id = [k for k in room["players"] if k != uid][0]
-                await ws.send_json({"type": "opponent_joined", "opponent_id": opponent_id})
-
-        while True:
-            data = await websocket.receive_json()
-
-            if data["type"] == "ready":
-                room["ready"].add(str(user_id))
-                if len(room["ready"]) == 2:
-                    # Countdown
-                    for i in [3, 2, 1]:
-                        for ws in room["players"].values():
-                            await ws.send_json({"type": "countdown", "value": i})
-                        await asyncio.sleep(1)
-                    for ws in room["players"].values():
-                        await ws.send_json({"type": "start"})
-
-            elif data["type"] == "score_update":
-                room["scores"][str(user_id)] = data["score"]
-                # Send to opponent
-                for uid, ws in room["players"].items():
-                    if uid != str(user_id):
-                        await ws.send_json({
-                            "type": "opponent_score",
-                            "score": data["score"],
-                            "combo": data.get("combo", 0)
-                        })
-
-            elif data["type"] == "final_score":
-                room["scores"][str(user_id)] = data["score"]
-                # Check if both submitted
-                if all(room["scores"].get(uid, -1) >= 0 for uid in room["players"]):
-                    scores = room["scores"]
-                    uids = list(scores.keys())
-                    s0, s1 = scores[uids[0]], scores[uids[1]]
-
-                    if s0 > s1:
-                        winner = int(uids[0])
-                    elif s1 > s0:
-                        winner = int(uids[1])
-                    else:
-                        winner = None  # draw
-
-                    # Save to DB
-                    finish_db = SessionLocal()
-                    try:
-                        d = finish_db.query(Duel).filter(Duel.id == duel_id).first()
-                        if d:
-                            d.guest_score = scores.get(str(d.guest_user_id), 0)
-                            d.host_score = scores.get(str(d.host_user_id), 0)
-                            d.winner_id = winner
-                            d.status = "finished"
-                            d.finished_at = datetime.utcnow()
-                            finish_db.commit()
-                    finally:
-                        finish_db.close()
-
-                    # Notify both
-                    for uid, ws in room["players"].items():
-                        await ws.send_json({
-                            "type": "result",
-                            "winner_id": winner,
-                            "your_score": scores[uid],
-                            "opponent_score": scores[[k for k in scores if k != uid][0]],
-                            "discount": d.duel_discount if winner == int(uid) else (d.base_discount if winner is None else 0)
-                        })
-
-                    del active_duel_rooms[duel_id]
-
-    except WebSocketDisconnect:
-        # Auto-win for remaining player
-        if duel_id in active_duel_rooms:
-            room = active_duel_rooms[duel_id]
-            for uid, ws in room["players"].items():
-                if uid != str(user_id):
-                    try:
-                        await ws.send_json({
-                            "type": "result",
-                            "winner_id": int(uid),
-                            "your_score": room["scores"].get(uid, 0),
-                            "opponent_score": 0,
-                            "discount": 10,
-                            "reason": "opponent_disconnected"
-                        })
-                    except Exception:
-                        pass
-            del active_duel_rooms[duel_id]
-
-
-
-# ── Pending Duel Offer (guest-side notification) ──
-
-@app.get("/me/pending-duel-offer")
-def get_pending_duel_offer(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Check if guest has a pending duel offer after venue check-in."""
-    from sqlalchemy import text
-    result = db.execute(
-        text("SELECT id, brand_id, discount_percent, created_at FROM pending_duel_offers WHERE user_id = :uid AND consumed = FALSE ORDER BY created_at DESC LIMIT 1"),
-        {"uid": user.id}
-    ).fetchone()
-    if not result:
-        return {"has_offer": False}
-    return {
-        "has_offer": True,
-        "offer_id": result[0],
-        "brand_id": result[1],
-        "discount_percent": result[2],
-        "created_at": str(result[3])
-    }
-
-@app.post("/me/pending-duel-offer/{offer_id}/consume")
-def consume_duel_offer(offer_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Mark a pending duel offer as consumed."""
-    from sqlalchemy import text
-    db.execute(
-        text("UPDATE pending_duel_offers SET consumed = TRUE WHERE id = :oid AND user_id = :uid"),
-        {"oid": offer_id, "uid": user.id}
-    )
-    db.commit()
-    return {"status": "ok"}
-
-# ── Duel WebSocket ──────────────────────────────────────────────────────────
-from typing import Dict as _Dict
-
-class DuelConnectionManager:
-    def __init__(self):
-        self.connections = {}  # duel_id -> [(ws, user_id)]
-        self.ready = {}
-        self.scores = {}
-
-    async def connect(self, duel_id: str, websocket: WebSocket, user_id: int):
-        await websocket.accept()
-        if duel_id not in self.connections:
-            self.connections[duel_id] = []
-            self.ready[duel_id] = set()
-            self.scores[duel_id] = {}
-        self.connections[duel_id].append((websocket, user_id))
-        await self.broadcast(duel_id, {"type": "opponent_joined", "user_id": user_id}, exclude=websocket)
-        if len(self.connections[duel_id]) >= 2:
-            await self.start_countdown(duel_id)
-
-    async def disconnect(self, duel_id: str, websocket: WebSocket):
-        if duel_id in self.connections:
-            self.connections[duel_id] = [(ws, uid) for ws, uid in self.connections[duel_id] if ws != websocket]
-            await self.broadcast(duel_id, {"type": "opponent_disconnected"}, exclude=websocket)
-
-    async def broadcast(self, duel_id: str, message: dict, exclude=None):
-        if duel_id not in self.connections:
-            return
-        dead = []
-        for ws, uid in self.connections[duel_id]:
-            if ws == exclude:
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception:
-                dead.append((ws, uid))
-        for d in dead:
-            self.connections[duel_id].remove(d)
-
-    async def start_countdown(self, duel_id: str):
-        for i in [3, 2, 1]:
-            await self.broadcast_all(duel_id, {"type": "countdown", "value": i})
-            await asyncio.sleep(1)
-        await self.broadcast_all(duel_id, {"type": "start"})
-        asyncio.create_task(self.end_game(duel_id))
-
-    async def broadcast_all(self, duel_id: str, message: dict):
-        if duel_id not in self.connections:
-            return
-        dead = []
-        for ws, uid in self.connections[duel_id]:
-            try:
-                await ws.send_json(message)
-            except Exception:
-                dead.append((ws, uid))
-        for d in dead:
-            self.connections[duel_id].remove(d)
-
-    async def handle_score_update(self, duel_id: str, user_id: int, score: int, combo: int, heat: float, websocket):
-        self.scores[duel_id][user_id] = {"score": score, "combo": combo, "heat": heat}
-        await self.broadcast(duel_id, {"type": "opponent_score", "score": score, "combo": combo, "heat": heat}, exclude=websocket)
-
-    async def handle_final_score(self, duel_id: str, user_id: int, score: int, db):
-        self.scores[duel_id]["final_" + str(user_id)] = score
-        finals = {k: v for k, v in self.scores[duel_id].items() if str(k).startswith("final_")}
-        if len(finals) >= 2 or len(self.connections.get(duel_id, [])) <= 1:
-            await self.end_game(duel_id, db=db)
-
-    async def end_game(self, duel_id: str, db=None):
-        scores = {k: v for k, v in self.scores.get(duel_id, {}).items() if str(k).startswith("final_")}
-        if not scores:
-            scores = {"raw_" + str(k): v["score"] for k, v in self.scores.get(duel_id, {}).items() if isinstance(v, dict)}
-        winner_id = None
-        result_msg = {"type": "result", "winner_id": None, "is_draw": True, "discount": 5}
-        if scores and db:
-            try:
-                duel = db.query(Duel).filter(Duel.id == duel_id).first()
-                if duel:
-                    score_items = list(scores.items())
-                    if len(score_items) >= 2:
-                        uid1 = int(str(score_items[0][0]).replace("final_", "").replace("raw_", ""))
-                        s1 = score_items[0][1]
-                        uid2 = int(str(score_items[1][0]).replace("final_", "").replace("raw_", ""))
-                        s2 = score_items[1][1]
-                        winner_id = uid1 if s1 > s2 else (uid2 if s2 > s1 else None)
-                    duel.winner_id = winner_id
-                    duel.status = "finished"
-                    duel.guest_score = score_items[0][1] if score_items else 0
-                    duel.host_score = score_items[1][1] if len(score_items) > 1 else 0
-                    db.commit()
-                    result_msg = {
-                        "type": "result",
-                        "winner_id": winner_id,
-                        "is_draw": winner_id is None,
-                        "duel_discount": getattr(duel, "duel_discount", None),
-                        "base_discount": getattr(duel, "base_discount", None),
-                    }
-            except Exception as e:
-                print("end_game error:", e)
-        await self.broadcast_all(duel_id, result_msg)
-
-
-duel_manager = DuelConnectionManager()
-
-
-@app.websocket("/ws/duel/{duel_id}")
-async def duel_websocket(duel_id: str, websocket: WebSocket, token: str = None, db: Session = Depends(get_db)):
-    user_id = None
-    if token:
-        try:
-            from jose import jwt as jose_jwt
-            payload = jose_jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            user_id = payload.get("sub") or payload.get("user_id") or payload.get("id")
-            user_id = int(user_id)
-        except Exception as e:
-            print("WS auth error:", e)
-            await websocket.close(code=4001)
-            return
-    await duel_manager.connect(duel_id, websocket, user_id)
-    try:
-        while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-            print("[WS] duel=" + str(duel_id) + " user=" + str(user_id) + " type=" + str(msg_type))
-            if msg_type == "ready":
-                duel_manager.ready[duel_id].add(user_id)
-                if len(duel_manager.ready[duel_id]) >= 2:
-                    await duel_manager.start_countdown(duel_id)
-            elif msg_type == "score_update":
-                await duel_manager.handle_score_update(
-                    duel_id, user_id,
-                    data.get("score", 0),
-                    data.get("combo", 0),
-                    data.get("heat", 0.0),
-                    websocket
-                )
-            elif msg_type == "final_score":
-                await duel_manager.handle_final_score(
-                    duel_id, user_id,
-                    data.get("score", 0),
-                    db
-                )
-    except WebSocketDisconnect:
-        await duel_manager.disconnect(duel_id, websocket)
-    except Exception as e:
-        print("[WS] error duel=" + str(duel_id) + ":", e)
-        await duel_manager.disconnect(duel_id, websocket)
+    return [mix_to_out(m, user, db) for m in mixes]  

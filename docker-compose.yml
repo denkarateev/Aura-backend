@@ -1,36 +1,32 @@
 services:
   db:
-    image: postgres:16-alpine
-    container_name: aura_backend_db
+    image: postgres:16
+    container_name: hooka_db
     restart: unless-stopped
     environment:
       POSTGRES_DB: hookahmix
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: pass
-    ports:
-      - "5433:5432"
+      POSTGRES_PASSWORD: vQFwbliAT9PziFf3nJE_nTQOmwx1MfSowAB-E7F6k5ODN4nhWNuivLOUnhowvPiG 
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d hookahmix"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout: 3s
+      retries: 20
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: aura_backend_api
+    build: .
+    container_name: hooka_api
     restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:vQFwbliAT9PziFf3nJE_nTQOmwx1MfSowAB-E7F6k5ODN4nhWNuivLOUnhowvPiG@db:5432/hookahmix
+      SECRET_KEY: vQFwbliAT9PziFf3nJE_nTQOmwx1MfSowAB-E7F6k5ODN4nhWNuivLOUnhowvPiG
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:pass@db:5432/hookahmix
-      SECRET_KEY: change_me_in_production
     ports:
       - "8000:8000"
 
 volumes:
-  postgres_data:
+  pgdata:
