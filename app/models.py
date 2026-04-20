@@ -236,6 +236,9 @@ class LoungeGuestLoyalty(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     visit_count = Column(Integer, default=0, nullable=False)
     last_visit_at = Column(DateTime)
+    # Added in prod via manual ALTER for "≤3 visits/day per guest" rule.
+    today_visit_count = Column(Integer, default=0)
+    today_date = Column(Date)
 
     __table_args__ = (UniqueConstraint("brand_id", "user_id"),)
 
