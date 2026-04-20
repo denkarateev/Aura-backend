@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import (
     ALGORITHM,
+    BUNDLE_TIERS,
     DEFAULT_BRAND_MANAGER_USERNAMES,
     BOWL_HEAT_DURATION_SECONDS,
     BOWL_HEAT_TARGET_SCORE,
@@ -29,6 +30,9 @@ from app.core.config import (
     RATING_LEVELS,
     REWARD_RULES,
     SECRET_KEY,
+    YOOKASSA_RETURN_URL,
+    YOOKASSA_SECRET_KEY,
+    YOOKASSA_SHOP_ID,
     load_brand_manager_usernames,
 )
 from app.core.database import Base, SessionLocal, engine
@@ -38,9 +42,12 @@ from app.models import (
     BowlHeatRun,
     Comment,
     Favorite,
+    LoungeBundle,
+    LoungeBundleVisit,
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
+    LoungeLedgerEntry,
     LoungeProgram,
     Mix,
     MixIngredient,
@@ -63,6 +70,12 @@ from app.schemas import (
     BowlHeatGameStateOut,
     BowlHeatPlayIn,
     BowlHeatPlayOut,
+    BundleListOut,
+    BundleOut,
+    BundlePaymentCreateIn,
+    BundlePaymentCreateOut,
+    BundlePaymentStatusOut,
+    BundleVisitOut,
     CommentIn,
     CommentOut,
     FollowToggleOut,
@@ -2249,6 +2262,245 @@ def filter_mixes(
 
     mixes = query.all()
     return [mix_to_out(m, user, db) for m in mixes]
+
+
+# ===============================================================
+# BUNDLE SUBSCRIPTIONS — YooKassa payments + ledger
+# ===============================================================
+
+# YooKassa SDK init. Library reads Configuration.account_id / secret_key
+# at send time, so we set them once at import. If env vars are missing
+# endpoints return 503 — we never want to silently fall back to a
+# wrong shop.
+try:
+    from yookassa import Configuration as YooKassaConfig, Payment as YooKassaPayment
+    if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+        YooKassaConfig.account_id = YOOKASSA_SHOP_ID
+        YooKassaConfig.secret_key = YOOKASSA_SECRET_KEY
+        _YOOKASSA_ENABLED = True
+    else:
+        _YOOKASSA_ENABLED = False
+except ImportError:
+    _YOOKASSA_ENABLED = False
+
+
+def _require_yookassa():
+    if not _YOOKASSA_ENABLED:
+        raise HTTPException(503, "YooKassa is not configured on the server")
+
+
+def bundle_to_out(bundle: LoungeBundle) -> BundleOut:
+    return BundleOut(
+        id=bundle.id,
+        tier=bundle.tier,
+        price_rub=bundle.price_rub,
+        compensation_per_visit_rub=bundle.compensation_per_visit_rub,
+        max_visits=bundle.max_visits,
+        started_at=bundle.started_at,
+        expires_at=bundle.expires_at,
+        status=bundle.status,
+        visits=[
+            BundleVisitOut(
+                id=v.id,
+                brand_id=v.brand_id,
+                visited_at=v.visited_at,
+                compensation_rub=v.compensation_rub,
+            )
+            for v in bundle.visits
+        ],
+    )
+
+
+def _expire_stale_bundles(db: Session, user_id: int):
+    """Mark bundles as 'expired' once they pass the term. Keeps 'active'
+    accurate so queries don't need datetime filters in every callsite."""
+    now = datetime.utcnow()
+    stale = db.query(LoungeBundle).filter(
+        LoungeBundle.user_id == user_id,
+        LoungeBundle.status == "active",
+        LoungeBundle.expires_at < now,
+    ).all()
+    for b in stale:
+        b.status = "expired"
+
+
+@app.post("/payments/yookassa/create", response_model=BundlePaymentCreateOut)
+def create_bundle_payment(
+    payload: BundlePaymentCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Kick off a YooKassa payment for a bundle tier. Returns the
+    confirmation URL the iOS client opens in a WebView.
+    The bundle record is NOT created yet — we wait for the payment
+    status to flip to 'succeeded' (either via polling or webhook)
+    before calling /bundles/purchase to finalise."""
+    _require_yookassa()
+    current_user = get_required_user(user)
+
+    tier_cfg = BUNDLE_TIERS.get(payload.tier)
+    if not tier_cfg:
+        raise HTTPException(400, f"Unknown tier: {payload.tier}")
+
+    amount_rub = tier_cfg["price_rub"]
+    idempotence_key = f"bundle-{current_user.id}-{payload.tier}-{int(datetime.utcnow().timestamp())}"
+
+    try:
+        yp = YooKassaPayment.create({
+            "amount": {
+                "value": f"{amount_rub:.2f}",
+                "currency": "RUB",
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": YOOKASSA_RETURN_URL,
+            },
+            "capture": True,
+            "description": f"{tier_cfg['title']} — Hooka3",
+            "metadata": {
+                "user_id": str(current_user.id),
+                "tier": payload.tier,
+                "source": "ios_app",
+            },
+        }, idempotence_key)
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+
+    return BundlePaymentCreateOut(
+        payment_id=yp.id,
+        confirmation_url=yp.confirmation.confirmation_url,
+        amount_rub=amount_rub,
+    )
+
+
+@app.get("/payments/yookassa/{payment_id}/status", response_model=BundlePaymentStatusOut)
+def get_bundle_payment_status(
+    payment_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Polled by the iOS client after the WebView closes. If paid,
+    the client calls /bundles/purchase to finalise — the status
+    endpoint itself is idempotent and does NOT create bundles."""
+    _require_yookassa()
+    current_user = get_required_user(user)
+
+    try:
+        yp = YooKassaPayment.find_one(payment_id)
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+
+    meta_user_id = (yp.metadata or {}).get("user_id") if yp else None
+    if meta_user_id and str(current_user.id) != str(meta_user_id):
+        raise HTTPException(403, "Payment belongs to a different user")
+
+    existing = db.query(LoungeBundle).filter(
+        LoungeBundle.user_id == current_user.id,
+        LoungeBundle.purchase_receipt_id == payment_id,
+    ).first()
+
+    return BundlePaymentStatusOut(
+        payment_id=payment_id,
+        status=yp.status,
+        paid=bool(yp.paid),
+        bundle_id=existing.id if existing else None,
+    )
+
+
+@app.post("/bundles/purchase", response_model=BundleOut)
+def finalise_bundle_purchase(
+    payload: BundlePaymentCreateOut,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Finalise a bundle after YooKassa reports succeeded.
+    Idempotent: if a bundle already exists for this payment_id it is
+    returned as-is.
+    Reuses BundlePaymentCreateOut as input since we only need
+    payment_id + tier — lightweight and matches what the client has."""
+    _require_yookassa()
+    current_user = get_required_user(user)
+
+    # Idempotency
+    existing = db.query(LoungeBundle).filter(
+        LoungeBundle.user_id == current_user.id,
+        LoungeBundle.purchase_receipt_id == payload.payment_id,
+    ).first()
+    if existing:
+        return bundle_to_out(existing)
+
+    # Verify payment succeeded on YooKassa side — never trust the client
+    try:
+        yp = YooKassaPayment.find_one(payload.payment_id)
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+    if not yp.paid or yp.status != "succeeded":
+        raise HTTPException(400, f"Payment is not succeeded (status={yp.status})")
+
+    meta = yp.metadata or {}
+    meta_user_id = meta.get("user_id")
+    if meta_user_id and str(current_user.id) != str(meta_user_id):
+        raise HTTPException(403, "Payment belongs to a different user")
+
+    tier = meta.get("tier")
+    tier_cfg = BUNDLE_TIERS.get(tier)
+    if not tier_cfg:
+        raise HTTPException(400, f"Unknown tier in payment metadata: {tier}")
+
+    now = datetime.utcnow()
+    bundle = LoungeBundle(
+        user_id=current_user.id,
+        tier=tier,
+        lounge_ids="",  # legacy column, not used in the "any partner" model
+        discount_percent=0,
+        max_visits=(tier_cfg["hookahs"] or 0),
+        compensation_per_visit_rub=tier_cfg["comp_rub"],
+        price_rub=tier_cfg["price_rub"],
+        purchase_provider="yookassa",
+        purchase_receipt_id=payload.payment_id,
+        started_at=now,
+        expires_at=now + timedelta(days=tier_cfg["days"]),
+        status="active",
+    )
+    db.add(bundle)
+    db.flush()
+
+    # Inflow entry — user paid us
+    db.add(LoungeLedgerEntry(
+        brand_id=None,
+        user_id=current_user.id,
+        bundle_id=bundle.id,
+        direction="inflow",
+        amount_rub=tier_cfg["price_rub"],
+        status="settled",  # money hit our YooKassa account already
+        description=f"Bundle sale — {tier_cfg['title']}",
+        settled_at=now,
+    ))
+
+    db.commit()
+    db.refresh(bundle)
+    return bundle_to_out(bundle)
+
+
+@app.get("/users/me/bundles", response_model=BundleListOut)
+def list_my_bundles(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    _expire_stale_bundles(db, current_user.id)
+    db.commit()
+
+    all_bundles = db.query(LoungeBundle).filter(
+        LoungeBundle.user_id == current_user.id,
+    ).order_by(LoungeBundle.started_at.desc()).all()
+
+    active = [b for b in all_bundles if b.status == "active"]
+    past = [b for b in all_bundles if b.status != "active"]
+    return BundleListOut(
+        active=[bundle_to_out(b) for b in active],
+        past=[bundle_to_out(b) for b in past],
+    )
 
 
 if __name__ == "__main__":

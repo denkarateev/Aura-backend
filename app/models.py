@@ -288,3 +288,81 @@ class Duel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+
+
+# MARK: - Pre-paid lounge bundle subscriptions
+
+class LoungeBundle(Base):
+    """
+    A pre-paid pack giving the owner a per-visit discount at a set of
+    partner lounges. Each check-in at a covered lounge creates a
+    LoungeBundleVisit and queues a LoungeLedgerEntry that settles to
+    the lounge on the next monthly payout.
+    """
+    __tablename__ = "lounge_bundles"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    tier = Column(String, nullable=False)  # five | ten | cityPass | group
+    lounge_ids = Column(Text, nullable=False, default="")  # comma-separated brand ids; empty for cityPass
+    discount_percent = Column(Integer, nullable=False, default=10)
+    max_visits = Column(Integer, nullable=False)  # tier.maxLounges; 0 means unlimited (cityPass)
+    compensation_per_visit_rub = Column(Integer, nullable=False)
+    price_rub = Column(Integer, nullable=False)
+    purchase_provider = Column(String, nullable=False)  # yookassa | apple_storekit
+    purchase_receipt_id = Column(String, nullable=False)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    status = Column(String, nullable=False, default="active")  # active | expired | refunded
+
+    visits = relationship(
+        "LoungeBundleVisit",
+        back_populates="bundle",
+        cascade="all, delete-orphan",
+        order_by="LoungeBundleVisit.visited_at",
+    )
+
+
+class LoungeBundleVisit(Base):
+    """
+    One redemption of a bundle at a specific lounge. Created by the
+    /lounges/{id}/checkin endpoint when the guest has an active bundle
+    covering that lounge. Backed by a ledger entry for payout.
+    """
+    __tablename__ = "lounge_bundle_visits"
+
+    id = Column(Integer, primary_key=True)
+    bundle_id = Column(Integer, ForeignKey("lounge_bundles.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    brand_id = Column(String, nullable=False, index=True)
+    compensation_rub = Column(Integer, nullable=False)
+    visited_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    bundle = relationship("LoungeBundle", back_populates="visits")
+
+
+class LoungeLedgerEntry(Base):
+    """
+    Double-sided accounting ledger for bundle settlement.
+
+    direction = "outflow" — Hooka3 pays the lounge (per bundle visit).
+    direction = "inflow"  — Hooka3 receives from the user (bundle sale).
+
+    On the monthly payout, all pending outflow entries for a given
+    lounge are aggregated, the sum is transferred, and status flips
+    to "settled".
+    """
+    __tablename__ = "lounge_ledger_entries"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, nullable=True, index=True)  # null for inflow (sale)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    bundle_id = Column(Integer, ForeignKey("lounge_bundles.id"), nullable=True)
+    bundle_visit_id = Column(Integer, ForeignKey("lounge_bundle_visits.id"), nullable=True)
+    direction = Column(String, nullable=False)  # outflow | inflow
+    amount_rub = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default="pending", index=True)  # pending | settled
+    description = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    settled_at = Column(DateTime, nullable=True)
+    settlement_batch_id = Column(String, nullable=True, index=True)

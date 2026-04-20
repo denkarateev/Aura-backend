@@ -5,3 +5,5 @@ psycopg2-binary
 python-jose[cryptography]
 pydantic
 email-validator
+yookassa
+python-dotenv

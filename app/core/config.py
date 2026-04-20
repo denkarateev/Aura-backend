@@ -1,6 +1,12 @@
 import os
 import json
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:pass@localhost:5433/hookahmix"
@@ -9,6 +15,19 @@ DATABASE_URL = os.getenv(
 SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+
+# YooKassa — pack purchases. Secret key must NEVER be logged / returned to client.
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "hooka3://bundle_success")
+
+# Pack catalog — price / comp / hookah-count — kept in sync with iOS BundleTier.
+BUNDLE_TIERS = {
+    "five":     {"hookahs": 5,   "price_rub": 5500,  "comp_rub": 1000, "days": 30, "seats": 1, "title": "Пак 5 кальянов"},
+    "ten":      {"hookahs": 10,  "price_rub": 10500, "comp_rub": 1000, "days": 30, "seats": 1, "title": "Пак 10 кальянов"},
+    "cityPass": {"hookahs": None, "price_rub": 11000, "comp_rub": 1000, "days": 30, "seats": 1, "title": "Безлимит месяц"},
+    "group":    {"hookahs": 12,  "price_rub": 14000, "comp_rub": 1000, "days": 30, "seats": 4, "title": "Пак для компании"},
+}
 
 REWARD_RULES = {
     "daily_login": {

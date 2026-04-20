@@ -352,7 +352,6 @@ class StatusOut(BaseModel):
     message: Optional[str] = None
 
 
-
 class WalletConnectIn(BaseModel):
     ton_address: str
 
@@ -403,3 +402,46 @@ class DuelStateOut(BaseModel):
 
 class DuelJoinIn(BaseModel):
     join_code: str
+
+
+# MARK: - Bundle subscription schemas
+
+class BundlePaymentCreateIn(BaseModel):
+    tier: str  # "five" | "ten" | "cityPass" | "group"
+
+
+class BundlePaymentCreateOut(BaseModel):
+    payment_id: str
+    confirmation_url: str
+    amount_rub: int
+
+
+class BundlePaymentStatusOut(BaseModel):
+    payment_id: str
+    status: str          # pending | waiting_for_capture | succeeded | canceled
+    paid: bool
+    bundle_id: Optional[int] = None  # set once /bundles/purchase has finalised
+
+
+class BundleVisitOut(BaseModel):
+    id: int
+    brand_id: str
+    visited_at: datetime
+    compensation_rub: int
+
+
+class BundleOut(BaseModel):
+    id: int
+    tier: str
+    price_rub: int
+    compensation_per_visit_rub: int
+    max_visits: int  # 0 means unlimited (cityPass)
+    started_at: datetime
+    expires_at: datetime
+    status: str
+    visits: List[BundleVisitOut] = []
+
+
+class BundleListOut(BaseModel):
+    active: List[BundleOut]
+    past: List[BundleOut]
