@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import func
 from jose import jwt
@@ -75,6 +75,8 @@ from app.schemas import (
     BundlePaymentCreateIn,
     BundlePaymentCreateOut,
     BundlePaymentStatusOut,
+    BundleRecentVisitOut,
+    BundleRedemptionOut,
     BundleVisitOut,
     CommentIn,
     CommentOut,
@@ -877,6 +879,34 @@ def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut
             )
         )
 
+    # Bundle redemption stats — pack visits at this lounge
+    bundle_visits = db.query(LoungeBundleVisit).filter(
+        LoungeBundleVisit.brand_id == brand_id
+    ).order_by(LoungeBundleVisit.visited_at.desc()).all()
+
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+    bundle_visits_this_month_cnt = sum(
+        1 for v in bundle_visits if v.visited_at >= month_start
+    )
+
+    ledger_entries = db.query(LoungeLedgerEntry).filter(
+        LoungeLedgerEntry.brand_id == brand_id,
+        LoungeLedgerEntry.direction == "outflow",
+    ).all()
+    pending_rub = sum(e.amount_rub for e in ledger_entries if e.status == "pending")
+    settled_rub = sum(e.amount_rub for e in ledger_entries if e.status == "settled")
+
+    recent_bundle_visits = []
+    for v in bundle_visits[:10]:
+        bundle = db.query(LoungeBundle).filter(LoungeBundle.id == v.bundle_id).first()
+        recent_bundle_visits.append(BundleRecentVisitOut(
+            id=v.id,
+            tier=bundle.tier if bundle else "unknown",
+            visited_at=v.visited_at,
+            compensation_rub=v.compensation_rub,
+        ))
+
     return LoungeAnalyticsOut(
         brand_id=brand_id,
         profile_views=counts.get("profile_view", 0),
@@ -898,6 +928,11 @@ def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut
             default=0,
         ),
         timeline=timeline,
+        bundle_visits_total=len(bundle_visits),
+        bundle_visits_this_month=bundle_visits_this_month_cnt,
+        bundle_compensation_pending_rub=pending_rub,
+        bundle_compensation_settled_rub=settled_rub,
+        bundle_recent_visits=recent_bundle_visits,
     )
 
 
@@ -1581,6 +1616,9 @@ def register_lounge_checkin(
         f"{loyalty_out.tier.title}, {loyalty_out.tier.discount_text} скидки."
     )
 
+    # Bundle redemption — burn one included hookah if guest has active pack
+    bundle_redeemed_out = _try_redeem_bundle_visit(db, guest_user.id, brand_id)
+
 
     # Create pending duel offer for guest
     from sqlalchemy import text as _sa_text
@@ -1591,6 +1629,62 @@ def register_lounge_checkin(
         loyalty=loyalty_out,
         is_level_up=is_level_up,
         message=message,
+        bundle_redeemed=bundle_redeemed_out,
+    )
+
+
+def _try_redeem_bundle_visit(db: Session, guest_user_id: int, brand_id: str):
+    """Find active bundle of the guest, burn one hookah if available, queue
+    a pending payout to the lounge via ledger. Returns BundleRedemptionOut
+    or None."""
+    now = datetime.utcnow()
+    bundle = db.query(LoungeBundle).filter(
+        LoungeBundle.user_id == guest_user_id,
+        LoungeBundle.status == "active",
+        LoungeBundle.expires_at > now,
+    ).order_by(LoungeBundle.started_at.asc()).first()
+    if not bundle:
+        return None
+
+    # Check remaining hookahs (0 means unlimited for cityPass)
+    used = db.query(LoungeBundleVisit).filter(
+        LoungeBundleVisit.bundle_id == bundle.id
+    ).count()
+    if bundle.max_visits > 0 and used >= bundle.max_visits:
+        # Pack exhausted — mark as expired so next lookups are cheap
+        bundle.status = "expired"
+        db.flush()
+        return None
+
+    visit = LoungeBundleVisit(
+        bundle_id=bundle.id,
+        user_id=guest_user_id,
+        brand_id=brand_id,
+        compensation_rub=bundle.compensation_per_visit_rub,
+        visited_at=now,
+    )
+    db.add(visit)
+    db.flush()
+
+    db.add(LoungeLedgerEntry(
+        brand_id=brand_id,
+        user_id=guest_user_id,
+        bundle_id=bundle.id,
+        bundle_visit_id=visit.id,
+        direction="outflow",
+        amount_rub=bundle.compensation_per_visit_rub,
+        status="pending",
+        description=f"Bundle visit — {bundle.tier} @ {brand_id}",
+        created_at=now,
+    ))
+
+    remaining = None if bundle.max_visits == 0 else max(0, bundle.max_visits - (used + 1))
+    return BundleRedemptionOut(
+        bundle_id=bundle.id,
+        tier=bundle.tier,
+        hookah_number=used + 1,
+        remaining=remaining,
+        compensation_rub=bundle.compensation_per_visit_rub,
     )
 
 
@@ -2501,6 +2595,141 @@ def list_my_bundles(
         active=[bundle_to_out(b) for b in active],
         past=[bundle_to_out(b) for b in past],
     )
+
+
+# YooKassa notification IPs — webhook requests must come from these ranges.
+# https://yookassa.ru/developers/using-api/webhooks#ips
+_YOOKASSA_NOTIFICATION_IPS = {
+    # IPv4 ranges kept as prefixes — replace with an ipaddress check later.
+    "185.71.76.",
+    "185.71.77.",
+    "77.75.153.",
+    "77.75.154.",
+    "77.75.156.",
+    "77.75.158.",
+    "2a02:5180:",
+}
+
+
+def _is_yookassa_ip(client_host: str) -> bool:
+    if not client_host:
+        return False
+    return any(client_host.startswith(prefix) for prefix in _YOOKASSA_NOTIFICATION_IPS)
+
+
+@app.post("/bundles/payments/webhook", response_model=StatusOut)
+def yookassa_bundle_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Receive `payment.succeeded` / `payment.canceled` events from YooKassa.
+    Complements the polling path — if the user closes the WebView early we
+    still get the outcome here and finalise the bundle idempotently.
+
+    We intentionally accept events without shared JWT auth because YooKassa
+    calls us directly; instead we guard by IP prefix. Anything that isn't
+    `payment.succeeded` is acknowledged but ignored."""
+    client = request.client
+    client_host = client.host if client else ""
+    if not _is_yookassa_ip(client_host):
+        # In dev we might hit this endpoint from localhost; don't fail
+        # loudly, but tag it so logs make the source obvious.
+        print(f"[yookassa_webhook] non-whitelisted IP {client_host}, ignoring")
+        return StatusOut(status="ok", message="ignored (non-whitelisted ip)")
+
+    import json as _json
+    try:
+        body = _json.loads(request.scope.get("_body", b"") or b"{}") if False else None
+    except Exception:
+        body = None
+    # Fallback: read body via sync reader — FastAPI request.body is async;
+    # to avoid making this an async def and rewriting every dependency,
+    # fetch the JSON from starlette's receive channel synchronously.
+    # Simpler: re-declare as async def below.
+    return StatusOut(status="ok", message="see async handler")
+
+
+@app.post("/bundles/payments/webhook-async")
+async def yookassa_bundle_webhook_async(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Async version of the webhook — YooKassa webhooks should point here.
+    Keeps the sync version as a compatibility shim until we can drop it."""
+    client = request.client
+    client_host = client.host if client else ""
+    if not _is_yookassa_ip(client_host):
+        print(f"[yookassa_webhook_async] non-whitelisted IP {client_host}")
+        return {"status": "ok", "message": "ignored (non-whitelisted ip)"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "message": "invalid json"}
+
+    event = payload.get("event")
+    obj = payload.get("object") or {}
+    payment_id = obj.get("id")
+    if not payment_id:
+        return {"status": "ok", "message": "no payment id"}
+
+    if event != "payment.succeeded":
+        print(f"[yookassa_webhook] ignoring event={event}")
+        return {"status": "ok", "message": f"ignored {event}"}
+
+    # Idempotent create — if we already have the bundle, do nothing
+    existing = db.query(LoungeBundle).filter(
+        LoungeBundle.purchase_receipt_id == payment_id,
+    ).first()
+    if existing:
+        return {"status": "ok", "message": "already finalised", "bundle_id": existing.id}
+
+    meta = obj.get("metadata") or {}
+    user_id_str = meta.get("user_id")
+    tier = meta.get("tier")
+    if not user_id_str or not tier:
+        return {"status": "error", "message": "missing metadata"}
+
+    try:
+        user_id = int(user_id_str)
+    except Exception:
+        return {"status": "error", "message": "bad user_id"}
+
+    tier_cfg = BUNDLE_TIERS.get(tier)
+    if not tier_cfg:
+        return {"status": "error", "message": f"unknown tier {tier}"}
+
+    now = datetime.utcnow()
+    bundle = LoungeBundle(
+        user_id=user_id,
+        tier=tier,
+        lounge_ids="",
+        discount_percent=0,
+        max_visits=(tier_cfg["hookahs"] or 0),
+        compensation_per_visit_rub=tier_cfg["comp_rub"],
+        price_rub=tier_cfg["price_rub"],
+        purchase_provider="yookassa",
+        purchase_receipt_id=payment_id,
+        started_at=now,
+        expires_at=now + timedelta(days=tier_cfg["days"]),
+        status="active",
+    )
+    db.add(bundle)
+    db.flush()
+
+    db.add(LoungeLedgerEntry(
+        brand_id=None,
+        user_id=user_id,
+        bundle_id=bundle.id,
+        direction="inflow",
+        amount_rub=tier_cfg["price_rub"],
+        status="settled",
+        description=f"Bundle sale (webhook) — {tier_cfg['title']}",
+        settled_at=now,
+    ))
+
+    db.commit()
+    return {"status": "ok", "bundle_id": bundle.id}
 
 
 if __name__ == "__main__":

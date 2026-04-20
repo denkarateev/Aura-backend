@@ -318,11 +318,28 @@ class LoungeCheckinIn(BaseModel):
     display_name: Optional[str] = None
 
 
+class BundleRedemptionOut(BaseModel):
+    """Info about a bundle visit redeemed during check-in, if any."""
+    bundle_id: int
+    tier: str
+    hookah_number: int            # which one it is (1..max) or total for cityPass
+    remaining: Optional[int]      # None for cityPass unlimited
+    compensation_rub: int
+
+
 class LoungeCheckinOut(BaseModel):
     guest: UserSearchOut
     loyalty: LoungeMyLoyaltyOut
     is_level_up: bool
     message: str
+    bundle_redeemed: Optional[BundleRedemptionOut] = None
+
+
+class BundleRecentVisitOut(BaseModel):
+    id: int
+    tier: str
+    visited_at: datetime
+    compensation_rub: int
 
 
 class LoungeAnalyticsDayOut(BaseModel):
@@ -343,6 +360,12 @@ class LoungeAnalyticsOut(BaseModel):
     today_visits: int
     assigned_guests_count: int
     offers_count: int
+    # Bundle redemption stats — populated when the caller manages this lounge
+    bundle_visits_total: int = 0
+    bundle_visits_this_month: int = 0
+    bundle_compensation_pending_rub: int = 0
+    bundle_compensation_settled_rub: int = 0
+    bundle_recent_visits: List[BundleRecentVisitOut] = []
     max_assigned_discount: int
     timeline: List[LoungeAnalyticsDayOut]
 
