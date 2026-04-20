@@ -47,6 +47,7 @@ from app.models import (
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
+    DeviceToken,
     LoungeLedgerEntry,
     LoungeProgram,
     Mix,
@@ -78,6 +79,9 @@ from app.schemas import (
     BundleRecentVisitOut,
     BundleRedemptionOut,
     BundleVisitOut,
+    AppleSignInIn,
+    AppleSignInOut,
+    DeviceTokenIn,
     CommentIn,
     CommentOut,
     FollowToggleOut,
@@ -2730,6 +2734,151 @@ async def yookassa_bundle_webhook_async(
 
     db.commit()
     return {"status": "ok", "bundle_id": bundle.id}
+
+
+# ===============================================================
+# DEVICE TOKEN — push registration
+# ===============================================================
+
+@app.post("/users/me/device-token", response_model=StatusOut)
+def register_device_token(
+    payload: DeviceTokenIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    token = payload.token.strip()
+    if not token:
+        raise HTTPException(400, "Empty token")
+
+    existing = db.query(DeviceToken).filter(DeviceToken.token == token).first()
+    now = datetime.utcnow()
+    if existing:
+        existing.user_id = current_user.id  # re-claim if token was on another user
+        existing.platform = payload.platform or "ios"
+        existing.app_version = payload.app_version
+        existing.updated_at = now
+    else:
+        db.add(DeviceToken(
+            user_id=current_user.id,
+            token=token,
+            platform=payload.platform or "ios",
+            app_version=payload.app_version,
+            created_at=now,
+            updated_at=now,
+        ))
+    db.commit()
+    return StatusOut(status="ok", message="device token saved")
+
+
+@app.delete("/users/me/device-token", response_model=StatusOut)
+def delete_device_token(
+    token: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current_user = get_required_user(user)
+    db.query(DeviceToken).filter(
+        DeviceToken.user_id == current_user.id,
+        DeviceToken.token == token,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return StatusOut(status="ok", message="device token removed")
+
+
+# ===============================================================
+# APPLE SIGN-IN
+# ===============================================================
+
+import httpx as _httpx
+import jwt as _pyjwt
+from jwt import PyJWKClient as _PyJWKClient
+
+_APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+_APPLE_ISSUER = "https://appleid.apple.com"
+# TODO: replace with real bundle id once set in the Apple Developer Console
+_APPLE_AUDIENCE = os.getenv("APPLE_BUNDLE_ID", "com.krasnoe.Hooka3")
+
+_apple_jwk_client = None
+
+def _get_apple_jwk_client():
+    global _apple_jwk_client
+    if _apple_jwk_client is None:
+        _apple_jwk_client = _PyJWKClient(_APPLE_JWKS_URL)
+    return _apple_jwk_client
+
+
+@app.post("/auth/apple", response_model=AppleSignInOut)
+def apple_sign_in(
+    payload: AppleSignInIn,
+    db: Session = Depends(get_db),
+):
+    """Accept an identity token from Sign in with Apple, verify it against
+    Apple's public keys, then create or find a matching user.
+    Apple only returns the email on the first auth per app — we persist
+    it. The `sub` claim is the stable user id we key by when email is
+    unavailable on subsequent calls."""
+    try:
+        signing_key = _get_apple_jwk_client().get_signing_key_from_jwt(payload.identity_token)
+        decoded = _pyjwt.decode(
+            payload.identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=_APPLE_AUDIENCE,
+            issuer=_APPLE_ISSUER,
+        )
+    except Exception as exc:
+        raise HTTPException(401, f"Apple identity token invalid: {exc}")
+
+    apple_sub = decoded.get("sub")
+    apple_email = (payload.email or decoded.get("email") or "").lower().strip()
+
+    if not apple_sub:
+        raise HTTPException(401, "Apple token missing sub")
+
+    # Lookup by stable apple_sub proxy — stored in email pattern "apple-sub:{sub}"
+    # or by email if the user already exists with that address.
+    proxy_email = f"apple-sub-{apple_sub}@apple.hooka3.internal"
+    user = None
+    if apple_email:
+        user = db.query(User).filter(User.email == apple_email).first()
+    if user is None:
+        user = db.query(User).filter(User.email == proxy_email).first()
+
+    is_new = False
+    if user is None:
+        # Create user. Username falls back to apple_sub prefix.
+        base_username = (payload.full_name or apple_email.split("@")[0] or f"apple{apple_sub[:6]}")
+        base_username = "".join(ch for ch in base_username.lower() if ch.isalnum() or ch == "_")[:24] or f"apple{apple_sub[:6]}"
+        username = base_username
+        suffix = 1
+        while db.query(User).filter(User.username == username).first() is not None:
+            suffix += 1
+            username = f"{base_username}{suffix}"
+
+        user = User(
+            email=apple_email or proxy_email,
+            username=username,
+            password_hash=hashlib.sha256(f"apple-{apple_sub}-no-password".encode()).hexdigest(),
+            is_admin=False,
+            is_banned=False,
+        )
+        db.add(user)
+        db.flush()
+        is_new = True
+    elif apple_email and not user.email:
+        user.email = apple_email
+
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token({"sub": str(user.id)})
+    return AppleSignInOut(
+        user_id=user.id,
+        token=token,
+        username=user.username,
+        is_new_user=is_new,
+    )
 
 
 if __name__ == "__main__":

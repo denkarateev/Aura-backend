@@ -468,3 +468,26 @@ class BundleOut(BaseModel):
 class BundleListOut(BaseModel):
     active: List[BundleOut]
     past: List[BundleOut]
+
+
+# MARK: - Device token
+
+class DeviceTokenIn(BaseModel):
+    token: str
+    platform: str = "ios"       # ios | android
+    app_version: Optional[str] = None
+
+
+# MARK: - Apple Sign-In
+
+class AppleSignInIn(BaseModel):
+    identity_token: str         # JWT from Sign in with Apple
+    full_name: Optional[str] = None  # only on first auth per Apple
+    email: Optional[str] = None      # only on first auth per Apple
+
+
+class AppleSignInOut(BaseModel):
+    user_id: int
+    token: str
+    username: Optional[str] = None
+    is_new_user: bool

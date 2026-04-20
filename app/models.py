@@ -341,6 +341,21 @@ class LoungeBundleVisit(Base):
     bundle = relationship("LoungeBundle", back_populates="visits")
 
 
+class DeviceToken(Base):
+    """APNs / FCM device token registered per user. One user can have
+    multiple devices (phone + iPad), so (user_id, token) is unique.
+    Old tokens are expected to be replaced when the OS rotates them."""
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String, nullable=False, unique=True)
+    platform = Column(String, nullable=False, default="ios")  # ios | android
+    app_version = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class LoungeLedgerEntry(Base):
     """
     Double-sided accounting ledger for bundle settlement.

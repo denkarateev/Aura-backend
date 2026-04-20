@@ -3,6 +3,8 @@ uvicorn[standard]
 sqlalchemy
 psycopg2-binary
 python-jose[cryptography]
+pyjwt[crypto]
+httpx
 pydantic
 email-validator
 yookassa
