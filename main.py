@@ -2324,7 +2324,7 @@ def _expire_stale_bundles(db: Session, user_id: int):
         b.status = "expired"
 
 
-@app.post("/payments/yookassa/create", response_model=BundlePaymentCreateOut)
+@app.post("/bundles/payments/create", response_model=BundlePaymentCreateOut)
 def create_bundle_payment(
     payload: BundlePaymentCreateIn,
     db: Session = Depends(get_db),
@@ -2373,7 +2373,7 @@ def create_bundle_payment(
     )
 
 
-@app.get("/payments/yookassa/{payment_id}/status", response_model=BundlePaymentStatusOut)
+@app.get("/bundles/payments/{payment_id}/status", response_model=BundlePaymentStatusOut)
 def get_bundle_payment_status(
     payment_id: str,
     db: Session = Depends(get_db),
