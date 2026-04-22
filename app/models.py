@@ -30,6 +30,10 @@ class User(Base):
     is_banned = Column(Boolean, default=False, nullable=False)
     ban_reason = Column(Text)
     banned_at = Column(DateTime)
+    # Premium subscription — nullable. premium_until ≥ now() means active.
+    premium_until = Column(DateTime, nullable=True)
+    premium_plan = Column(String, nullable=True)  # premium_monthly | premium_yearly
+    premium_provider = Column(String, nullable=True)  # yookassa | storekit
 
     mixes = relationship("Mix", back_populates="author")
     favorites = relationship("Favorite", back_populates="user")
@@ -356,6 +360,27 @@ class DeviceToken(Base):
     platform = Column(String, nullable=False, default="ios")  # ios | android
     app_version = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LoungeAssets(Base):
+    """
+    Static media assets and structured info for a lounge brand.
+    Stored on backend to avoid parsing/scraping on iOS client side.
+
+    avatar_url  — square logo / avatar (400×400), shown in lists and cards
+    cover_url   — hero cover image (1200×675, 16:9), shown on brand profile header
+    photo_urls  — JSON array of gallery photo URLs (up to 10)
+    info_json   — JSON object: cuisine, atmosphere, signature_mix, vibe, address, etc.
+    """
+    __tablename__ = "lounge_assets"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String, unique=True, nullable=False, index=True)
+    avatar_url = Column(Text, nullable=True)
+    cover_url = Column(Text, nullable=True)
+    photo_urls = Column(Text, nullable=True, default="[]")  # JSON array string
+    info_json = Column(Text, nullable=True, default="{}")   # JSON object string
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

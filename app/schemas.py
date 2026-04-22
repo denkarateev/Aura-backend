@@ -491,3 +491,26 @@ class AppleSignInOut(BaseModel):
     token: str
     username: Optional[str] = None
     is_new_user: bool
+
+
+# MARK: - Lounge assets (media + structured info)
+
+class LoungeAssetsIn(BaseModel):
+    """Payload for PUT /lounges/{brand_id}/assets — manager sets media + info."""
+    avatar_url: Optional[str] = None
+    cover_url: Optional[str] = None
+    photos: Optional[List[str]] = None          # replaces the whole gallery
+    info: Optional[dict] = None                  # cuisine/atmosphere/signature_mix/vibe/...
+
+
+class LoungeAssetsOut(BaseModel):
+    """Response for GET /lounges/{brand_id}/assets — returned to iOS."""
+    brand_id: str
+    avatar_url: Optional[str] = None
+    cover_url: Optional[str] = None
+    photos: List[str] = []
+    info: dict = {}
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

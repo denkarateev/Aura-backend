@@ -42,6 +42,7 @@ from app.models import (
     BowlHeatRun,
     Comment,
     Favorite,
+    LoungeAssets,
     LoungeBundle,
     LoungeBundleVisit,
     LoungeBusinessEvent,
@@ -115,6 +116,8 @@ from app.schemas import (
     UserProgressOut,
     UserUpdate,
     VoteMixOut,
+    LoungeAssetsIn,
+    LoungeAssetsOut,
 )
 
 # -------------------------------------------------------------------
@@ -1213,6 +1216,25 @@ app = FastAPI(title="HookahMix API")
 def startup():
     Base.metadata.create_all(bind=engine)
     with engine.begin() as conn:
+        # MARK: lounge_assets — created by create_all if new DB, or via ALTER for existing prod
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS lounge_assets (
+                id SERIAL PRIMARY KEY,
+                brand_id VARCHAR UNIQUE NOT NULL,
+                avatar_url TEXT,
+                cover_url TEXT,
+                photo_urls TEXT DEFAULT '[]',
+                info_json TEXT DEFAULT '{}',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE INDEX IF NOT EXISTS ix_lounge_assets_brand_id ON lounge_assets (brand_id)
+            """
+        )
         conn.exec_driver_sql(
             """
             ALTER TABLE users
@@ -1422,6 +1444,88 @@ def update_lounge_program(
     db.commit()
     db.refresh(program)
     return lounge_program_to_out(program, brand_id)
+
+
+# -------------------------------------------------------------------
+# LOUNGE ASSETS  (avatar / cover / gallery / info)
+# -------------------------------------------------------------------
+
+def _parse_lounge_assets(assets: Optional[LoungeAssets], brand_id: str) -> LoungeAssetsOut:
+    """Convert DB row → response DTO. Handles missing row gracefully."""
+    import json as _json
+    if assets is None:
+        return LoungeAssetsOut(brand_id=brand_id)
+    try:
+        photos = _json.loads(assets.photo_urls or "[]")
+        if not isinstance(photos, list):
+            photos = []
+    except Exception:
+        photos = []
+    try:
+        info = _json.loads(assets.info_json or "{}")
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
+    return LoungeAssetsOut(
+        brand_id=brand_id,
+        avatar_url=assets.avatar_url,
+        cover_url=assets.cover_url,
+        photos=photos,
+        info=info,
+        updated_at=assets.updated_at,
+    )
+
+
+@app.get("/lounges/{brand_id}/assets", response_model=LoungeAssetsOut)
+def get_lounge_assets(
+    brand_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint — returns stored avatar, cover, gallery and info for a lounge.
+    No auth required: iOS uses this to display venue card without parsing.
+    """
+    assets = db.query(LoungeAssets).filter(LoungeAssets.brand_id == brand_id).first()
+    return _parse_lounge_assets(assets, brand_id)
+
+
+@app.put("/lounges/{brand_id}/assets", response_model=LoungeAssetsOut)
+def update_lounge_assets(
+    brand_id: str,
+    payload: LoungeAssetsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Manager-only endpoint — set / update avatar, cover, gallery photos and info JSON.
+    Partial update: omit a field to keep existing value.
+    """
+    import json as _json
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    assets = db.query(LoungeAssets).filter(LoungeAssets.brand_id == brand_id).first()
+    if assets is None:
+        assets = LoungeAssets(brand_id=brand_id, photo_urls="[]", info_json="{}")
+        db.add(assets)
+
+    if payload.avatar_url is not None:
+        assets.avatar_url = payload.avatar_url.strip() or None
+    if payload.cover_url is not None:
+        assets.cover_url = payload.cover_url.strip() or None
+    if payload.photos is not None:
+        # Validate: list of non-empty strings, max 20
+        clean = [u.strip() for u in payload.photos if isinstance(u, str) and u.strip()][:20]
+        assets.photo_urls = _json.dumps(clean, ensure_ascii=False)
+    if payload.info is not None:
+        assets.info_json = _json.dumps(payload.info, ensure_ascii=False)
+
+    assets.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(assets)
+    return _parse_lounge_assets(assets, brand_id)
 
 
 @app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)
