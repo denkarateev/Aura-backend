@@ -51,6 +51,11 @@ from app.models import (
     DeviceToken,
     LoungeLedgerEntry,
     LoungeProgram,
+    ManagerTelegramLink,
+    Master,
+    MasterFollower,
+    MasterReview,
+    MasterWorkHistory,
     Mix,
     MixIngredient,
     MonthlyVote,
@@ -100,6 +105,18 @@ from app.schemas import (
     LoungeProgramIn,
     LoungeProgramOut,
     LoungeTierOut,
+    MasterCreateIn,
+    MasterListOut,
+    MasterOut,
+    MasterReviewCreateIn,
+    MasterReviewOut,
+    MasterReviewsListOut,
+    MasterResponseCreateIn,
+    MasterResponseOut,
+    MasterUpdateIn,
+    MasterWorkHistoryAddIn,
+    MasterWorkHistoryAddOut,
+    MasterWorkplaceOut,
     MixCreate,
     MixOut,
     MonthlyFlavorOut,
@@ -118,6 +135,10 @@ from app.schemas import (
     VoteMixOut,
     LoungeAssetsIn,
     LoungeAssetsOut,
+    LoungeBusynessOut,
+    LoungeRefreshBusynessIn,
+    TelegramLinkCodeOut,
+    TelegramLinkStatusOut,
 )
 
 # -------------------------------------------------------------------
@@ -1104,7 +1125,35 @@ def format_remaining_time(until: datetime) -> str:
     return f"{hours} ч. {minutes} мин."
 
 
-def vote_mix_to_out(mix: Mix, percentage: float) -> VoteMixOut:
+def get_mix_cover_url(mix: Mix, db: Session) -> str:
+    """
+    Get cover_url for a mix from lounge assets.
+    Priority:
+    1. If mix has brands in ingredients, fetch LoungeAssets.cover_url for first brand
+    2. Fallback to rotating Unsplash hookah photos
+    Always returns a non-empty string.
+    """
+    brands = [ingredient.brand for ingredient in mix.ingredients if ingredient.brand]
+
+    if brands:
+        # Try to get cover from first brand's lounge assets
+        for brand in brands:
+            lounge_asset = db.query(LoungeAssets).filter(
+                LoungeAssets.brand_id == brand
+            ).first()
+            if lounge_asset and lounge_asset.cover_url:
+                return lounge_asset.cover_url
+
+    # Fallback: rotate through 3 Unsplash hookah photos based on mix id
+    unsplash_photos = [
+        "https://images.unsplash.com/photo-1536663815808-535e2280d2c2?w=1200&h=675&fit=crop&q=80",
+        "https://images.unsplash.com/photo-1485872299712-4b80e6bc0002?w=1200&h=675&fit=crop&q=80",
+        "https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=1200&h=675&fit=crop&q=80",
+    ]
+    return unsplash_photos[mix.id % len(unsplash_photos)]
+
+
+def vote_mix_to_out(mix: Mix, percentage: float, cover_url: str = "") -> VoteMixOut:
     brands = [ingredient.brand for ingredient in mix.ingredients if ingredient.brand]
     lounge = mix.author.username if mix.author and mix.author.username else ""
     if not lounge:
@@ -1116,7 +1165,8 @@ def vote_mix_to_out(mix: Mix, percentage: float) -> VoteMixOut:
         name=mix.name,
         lounge=lounge,
         percentage=percentage,
-        image_name=mix.bowl_image_name
+        image_name=mix.bowl_image_name,
+        cover_url=cover_url
     )
 
 
@@ -1187,7 +1237,7 @@ def build_monthly_flavor(db: Session) -> MonthlyFlavorOut:
 
     total_score = max(sum(weighted_scores), 1)
     vote_mix_items = [
-        vote_mix_to_out(mix, score / total_score)
+        vote_mix_to_out(mix, score / total_score, get_mix_cover_url(mix, db))
         for mix, score in zip(top_mixes, weighted_scores)
     ]
 
@@ -1309,6 +1359,65 @@ def startup():
                 FROM user_progress
                 WHERE user_progress.user_id = users.id
             )
+            """
+        )
+        # MARK: Masters domain — Phase 1 migrations (additive, no DROP)
+        # Extend users table
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'user'
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS master_profile_id VARCHAR(40)
+            """
+        )
+        # Extend existing 'masters' table (created in S192-S194)
+        # with additional columns needed for Phase 1+2
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE masters
+            ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE masters
+            ADD COLUMN IF NOT EXISTS reviews_count INTEGER DEFAULT 0
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE masters
+            ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_masters_user_id
+            ON masters(user_id) WHERE user_id IS NOT NULL
+            """
+        )
+        # Extend existing 'master_reviews' table with response fields
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE master_reviews
+            ADD COLUMN IF NOT EXISTS master_response_text TEXT
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE master_reviews
+            ADD COLUMN IF NOT EXISTS master_responded_at TIMESTAMP
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE master_reviews
+            ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN DEFAULT FALSE
             """
         )
     db = SessionLocal()
@@ -1844,6 +1953,253 @@ def track_lounge_qr_show(
     return StatusOut(status="ok")
 
 
+@app.get("/lounges/{brand_id}/busyness", response_model=LoungeBusynessOut)
+def get_lounge_busyness(
+    brand_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns current busyness % for a lounge.
+
+    Source priority:
+      1. yandex_maps — manual override stored in lounge_assets.info_json["busyness"].
+         Set via POST /lounges/{brand_id}/refresh-busyness by manager or admin.
+         Expires after 4 hours to avoid stale data (falls through to next source).
+      2. dgis — live congestion from 2GIS Catalog API. Used when info_json has
+         dgis_branch_id or address. Cached for 30 min in info_json["busyness_2gis_cache"]
+         to avoid hammering the API quota.
+      3. checkins_last_hour — counts qr_checkin events in the last 60 min.
+         If count > 0, normalize to 0-100 (15 checkins/h = 100%).
+      4. mock_hourly — fallback when no real data is available.
+         Uses hour-of-day curve + brand_id seed for variance.
+    """
+    import json as _json
+    from app.services.dgis_busyness import (
+        fetch_congestion_by_branch_id,
+        fetch_congestion_by_address,
+    )
+
+    busyness_updated_at = None
+    assets = db.query(LoungeAssets).filter(LoungeAssets.brand_id == brand_id).first()
+    info: dict = {}
+    if assets:
+        try:
+            parsed = _json.loads(assets.info_json or "{}")
+            if isinstance(parsed, dict):
+                info = parsed
+        except Exception:
+            info = {}
+
+    def _level_for(p: int) -> str:
+        if p < 25:
+            return "quiet"
+        if p < 55:
+            return "moderate"
+        if p < 80:
+            return "busy"
+        return "peak"
+
+    # --- Path 0: Yandex Maps manual override (stored in info_json) ---
+    bdata = info.get("busyness") if isinstance(info, dict) else None
+    if isinstance(bdata, dict) and "percent" in bdata and "updated_at" in bdata:
+        try:
+            stored_at = datetime.fromisoformat(bdata["updated_at"])
+            age_hours = (datetime.utcnow() - stored_at).total_seconds() / 3600
+            if age_hours < 4:
+                percent = int(bdata["percent"])
+                return LoungeBusynessOut(
+                    brand_id=brand_id,
+                    percent=percent,
+                    level=_level_for(percent),
+                    source="yandex_maps",
+                    updated_at=stored_at,
+                )
+        except Exception:
+            pass  # malformed — fall through
+
+    # --- Path 0.5: 2GIS live congestion (cached 30 min) ---
+    dgis_branch_id = info.get("dgis_branch_id") if isinstance(info, dict) else None
+    dgis_address = info.get("address") if isinstance(info, dict) else None
+    cache = info.get("busyness_2gis_cache") if isinstance(info, dict) else None
+    dgis_percent: Optional[int] = None
+    dgis_cached_at: Optional[datetime] = None
+
+    if isinstance(cache, dict) and "percent" in cache and "updated_at" in cache:
+        try:
+            cached_at = datetime.fromisoformat(cache["updated_at"])
+            if (datetime.utcnow() - cached_at).total_seconds() < 1800:  # 30 min
+                dgis_percent = int(cache["percent"])
+                dgis_cached_at = cached_at
+        except Exception:
+            pass
+
+    if dgis_percent is None and assets and (dgis_branch_id or dgis_address):
+        fetched = None
+        if dgis_branch_id:
+            fetched = fetch_congestion_by_branch_id(str(dgis_branch_id))
+        if fetched is None and dgis_address:
+            fetched = fetch_congestion_by_address(str(dgis_address))
+        if fetched is not None:
+            dgis_percent = fetched
+            dgis_cached_at = datetime.utcnow()
+            info["busyness_2gis_cache"] = {
+                "percent": fetched,
+                "updated_at": dgis_cached_at.isoformat(),
+            }
+            try:
+                assets.info_json = _json.dumps(info, ensure_ascii=False)
+                assets.updated_at = dgis_cached_at
+                db.commit()
+            except Exception:
+                db.rollback()
+
+    if dgis_percent is not None:
+        return LoungeBusynessOut(
+            brand_id=brand_id,
+            percent=dgis_percent,
+            level=_level_for(dgis_percent),
+            source="dgis",
+            updated_at=dgis_cached_at,
+        )
+
+    # --- Path 1: real check-ins from the last hour ---
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    checkin_count = (
+        db.query(func.count(LoungeBusinessEvent.id))
+        .filter(
+            LoungeBusinessEvent.brand_id == brand_id,
+            LoungeBusinessEvent.event_type == "qr_checkin",
+            LoungeBusinessEvent.created_at >= one_hour_ago,
+        )
+        .scalar()
+    ) or 0
+
+    MAX_CHECKINS_PER_HOUR = 15
+
+    if checkin_count > 0:
+        percent = min(int(checkin_count / MAX_CHECKINS_PER_HOUR * 100), 100)
+        source = "checkins_last_hour"
+    else:
+        # --- Fallback: mock hourly curve + brand_id variance ---
+        hour = datetime.utcnow().hour  # UTC hour (Moscow ≈ UTC+3)
+        # Base load by hour of day
+        if 0 <= hour < 7:
+            base = 20
+        elif 7 <= hour < 11:
+            base = 10
+        elif 11 <= hour < 16:
+            base = 40
+        elif 16 <= hour < 20:
+            base = 70
+        elif 20 <= hour < 23:
+            base = 85
+        else:
+            base = 60
+        # Deterministic variance from brand_id so each lounge looks different
+        seed_offset = sum(ord(c) for c in brand_id) % 21 - 10  # -10 … +10
+        percent = max(0, min(100, base + seed_offset))
+        source = "mock_hourly"
+
+    return LoungeBusynessOut(
+        brand_id=brand_id,
+        percent=percent,
+        level=_level_for(percent),
+        source=source,
+        updated_at=busyness_updated_at,
+    )
+
+
+@app.post("/lounges/{brand_id}/refresh-busyness", response_model=LoungeBusynessOut)
+def refresh_lounge_busyness(
+    brand_id: str,
+    payload: LoungeRefreshBusynessIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Manager/admin endpoint — manually set the current busyness % for a lounge.
+
+    Stores the value in lounge_assets.info_json["busyness"] with a timestamp.
+    GET /lounges/{brand_id}/busyness will return this as source="yandex_maps"
+    for up to 4 hours before expiry.
+
+    Optionally store yandex_org_id for future daemon integration:
+      yandex_org_id — numeric org ID from yandex.ru/maps, e.g. "1024693268"
+                       Found in URL: yandex.ru/maps/org/name/<ORG_ID>/
+
+    Auth: must be lounge manager or admin.
+    """
+    import json as _json
+
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    # Validate percent range
+    if not (0 <= payload.percent <= 100):
+        raise HTTPException(422, "percent must be between 0 and 100")
+
+    # Load or create assets row
+    assets = db.query(LoungeAssets).filter(LoungeAssets.brand_id == brand_id).first()
+    if assets is None:
+        assets = LoungeAssets(brand_id=brand_id, photo_urls="[]", info_json="{}")
+        db.add(assets)
+        db.flush()
+
+    try:
+        info = _json.loads(assets.info_json or "{}")
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
+
+    now = datetime.utcnow()
+
+    # Update busyness sub-object
+    info["busyness"] = {
+        "percent": payload.percent,
+        "updated_at": now.isoformat(),
+        "set_by": current_user.username or current_user.email,
+    }
+
+    # Optionally store yandex_org_id for future daemon use
+    if payload.yandex_org_id is not None:
+        yid = payload.yandex_org_id.strip()
+        if yid:
+            info["yandex_org_id"] = yid
+
+    # Optionally store 2GIS branch ID — enables auto busyness via 2GIS Catalog API
+    if payload.dgis_branch_id is not None:
+        did = payload.dgis_branch_id.strip()
+        if did:
+            info["dgis_branch_id"] = did
+
+    # Manual override invalidates any cached 2GIS reading
+    info.pop("busyness_2gis_cache", None)
+
+    assets.info_json = _json.dumps(info, ensure_ascii=False)
+    assets.updated_at = now
+    db.commit()
+
+    percent = payload.percent
+    if percent < 25:
+        level = "quiet"
+    elif percent < 55:
+        level = "moderate"
+    elif percent < 80:
+        level = "busy"
+    else:
+        level = "peak"
+
+    return LoungeBusynessOut(
+        brand_id=brand_id,
+        percent=percent,
+        level=level,
+        source="yandex_maps",
+        updated_at=now,
+    )
+
+
 @app.get("/mini-game/heat-bowl", response_model=BowlHeatGameStateOut)
 def get_bowl_heat_state(
     db: Session = Depends(get_db),
@@ -1963,7 +2319,7 @@ def vote_for_mix(
         if candidate.id == mix_id:
             return candidate
 
-    return vote_mix_to_out(mix, 0.0)
+    return vote_mix_to_out(mix, 0.0, get_mix_cover_url(mix, db))
 
 
 @app.get("/mixes/following", response_model=List[MixOut])
@@ -3270,6 +3626,500 @@ def consume_duel_offer(offer_id: int, user: User = Depends(get_current_user), db
     )
     db.commit()
     return {"status": "ok"}
+
+
+# ── Telegram bot link (manager busyness polling) ────────────────────────────
+@app.post("/me/telegram/link-code", response_model=TelegramLinkCodeOut)
+def generate_telegram_link_code(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Generate a one-time 6-digit code for linking the manager's Telegram account
+    to their Hooka3 user. Manager sends `/start <code>` to the bot to bind.
+    Code expires in 10 minutes.
+    """
+    import secrets as _secrets
+    from app.core.config import TELEGRAM_BOT_USERNAME
+
+    current_user = get_required_user(user)
+
+    # Verify the user manages at least one brand (bot is useless otherwise)
+    managed_brands = [
+        bid for bid, usernames in BRAND_MANAGER_USERNAMES.items()
+        if normalize_key(current_user.username) in usernames
+        or normalize_key(current_user.email) in usernames
+    ]
+    if not managed_brands and not current_user.is_admin:
+        raise HTTPException(403, "Only brand managers can link Telegram")
+
+    code = f"{_secrets.randbelow(1_000_000):06d}"
+    expires = datetime.utcnow() + timedelta(minutes=10)
+
+    link = db.query(ManagerTelegramLink).filter(
+        ManagerTelegramLink.user_id == current_user.id
+    ).first()
+    if link is None:
+        link = ManagerTelegramLink(user_id=current_user.id)
+        db.add(link)
+    link.link_code = code
+    link.code_expires_at = expires
+    db.commit()
+
+    return TelegramLinkCodeOut(
+        code=code,
+        expires_at=expires,
+        bot_username=TELEGRAM_BOT_USERNAME,
+        deep_link=f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={code}",
+    )
+
+
+@app.get("/me/telegram/status", response_model=TelegramLinkStatusOut)
+def get_telegram_link_status(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Whether the current manager has a verified Telegram link."""
+    current_user = get_required_user(user)
+    link = db.query(ManagerTelegramLink).filter(
+        ManagerTelegramLink.user_id == current_user.id
+    ).first()
+    if link is None or link.verified_at is None:
+        return TelegramLinkStatusOut(linked=False)
+    return TelegramLinkStatusOut(
+        linked=True,
+        telegram_username=link.telegram_username,
+        verified_at=link.verified_at,
+    )
+
+
+@app.delete("/me/telegram/link")
+def unlink_telegram(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    link = db.query(ManagerTelegramLink).filter(
+        ManagerTelegramLink.user_id == current_user.id
+    ).first()
+    if link is not None:
+        db.delete(link)
+        db.commit()
+    return StatusOut(status="ok")
+
+
+# ── Masters CRUD ─────────────────────────────────────────────────────────────
+
+def _master_to_out(m: Master, current_user_id: Optional[int] = None) -> dict:
+    """Convert Master ORM row to MasterOut-compatible dict.
+    Adapts production column names (from_date/to_date) to iOS DTO names."""
+    wh = []
+    for w in (m.work_history or []):
+        wh.append({
+            "id": w.id,
+            "lounge_id": w.lounge_id,
+            "started_at": datetime.combine(w.from_date, datetime.min.time()) if w.from_date else None,
+            "ended_at": datetime.combine(w.to_date, datetime.min.time()) if w.to_date else None,
+            "is_current": w.to_date is None,
+        })
+    return {
+        "id": m.id,
+        "handle": m.handle,
+        "display_name": m.display_name,
+        "avatar_url": m.avatar_url,
+        "bio": m.bio,
+        "current_lounge_id": m.current_lounge_id,
+        "rating": float(m.rating or 0.0),
+        "followers_count": m.followers_count or 0,
+        "mixes_count": m.mixes_count or 0,
+        "reviews_count": m.reviews_count or 0,
+        "is_verified": m.is_verified or False,
+        "is_following": False,  # master_followers-based check (Phase 3 TODO)
+        "work_history": wh,
+    }
+
+
+def _recalc_master_rating(master_id: str, db: Session):
+    """Recompute rating and reviews_count on masters from master_reviews."""
+    rows = db.query(MasterReview).filter(
+        MasterReview.master_id == master_id,
+        MasterReview.is_hidden == False,
+    ).all()
+    count = len(rows)
+    avg = round(sum(r.rating for r in rows) / count, 2) if count > 0 else 0.0
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if master:
+        master.rating = avg
+        master.reviews_count = count
+
+
+@app.get("/masters", response_model=MasterListOut)
+def list_masters(
+    lounge_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """List all masters with optional lounge_id filter. Paginated."""
+    q = db.query(Master)
+    if lounge_id:
+        q = q.filter(Master.current_lounge_id == lounge_id)
+    total = q.count()
+    items = q.order_by(Master.followers_count.desc())\
+             .offset((page - 1) * page_size)\
+             .limit(page_size)\
+             .all()
+    return MasterListOut(
+        items=[MasterOut(**_master_to_out(m)) for m in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/masters/by-handle/{handle}", response_model=MasterOut)
+def get_master_by_handle(
+    handle: str,
+    db: Session = Depends(get_db),
+):
+    """Fetch master profile by @handle."""
+    master = db.query(Master).filter(Master.handle == handle).first()
+    if not master:
+        raise HTTPException(404, f"Master with handle '{handle}' not found")
+    return MasterOut(**_master_to_out(master))
+
+
+@app.get("/masters/{master_id}", response_model=MasterOut)
+def get_master(
+    master_id: str,
+    db: Session = Depends(get_db),
+):
+    """Fetch master profile by id."""
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    return MasterOut(**_master_to_out(master))
+
+
+@app.post("/masters", response_model=MasterOut)
+def create_master(
+    payload: MasterCreateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new master profile. Admin only."""
+    current_user = get_required_user(user)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    if db.query(Master).filter(Master.id == payload.id).first():
+        raise HTTPException(409, f"Master id '{payload.id}' already exists")
+    if db.query(Master).filter(Master.handle == payload.handle).first():
+        raise HTTPException(409, f"Handle '{payload.handle}' already taken")
+    master = Master(
+        id=payload.id,
+        handle=payload.handle,
+        display_name=payload.display_name,
+        bio=payload.bio,
+        avatar_url=payload.avatar_url,
+        current_lounge_id=payload.current_lounge_id,
+        mixes_count=payload.mixes_count,
+        followers_count=payload.followers_count,
+        rating=payload.rating,
+    )
+    db.add(master)
+    db.commit()
+    db.refresh(master)
+    return MasterOut(**_master_to_out(master))
+
+
+@app.patch("/masters/{master_id}", response_model=MasterOut)
+def update_master(
+    master_id: str,
+    payload: MasterUpdateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update master profile. Auth: only the master owner or admin."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_own = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_own and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized to edit this master profile")
+    if payload.display_name is not None:
+        master.display_name = payload.display_name
+    if payload.bio is not None:
+        master.bio = payload.bio
+    if payload.avatar_url is not None:
+        master.avatar_url = payload.avatar_url
+    if payload.current_lounge_id is not None:
+        master.current_lounge_id = payload.current_lounge_id
+    db.commit()
+    db.refresh(master)
+    return MasterOut(**_master_to_out(master))
+
+
+# ── Master work history ───────────────────────────────────────────────────────
+
+@app.get("/masters/{master_id}/work-history", response_model=List[MasterWorkplaceOut])
+def get_work_history(
+    master_id: str,
+    db: Session = Depends(get_db),
+):
+    """Return all work history entries for a master (oldest first)."""
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    rows = db.query(MasterWorkHistory)\
+             .filter(MasterWorkHistory.master_id == master_id)\
+             .order_by(MasterWorkHistory.from_date)\
+             .all()
+    result = []
+    for w in rows:
+        result.append(MasterWorkplaceOut(
+            id=w.id,
+            lounge_id=w.lounge_id,
+            started_at=datetime.combine(w.from_date, datetime.min.time()) if w.from_date else None,
+            ended_at=datetime.combine(w.to_date, datetime.min.time()) if w.to_date else None,
+            is_current=(w.to_date is None),
+        ))
+    return result
+
+
+@app.post("/masters/{master_id}/work-history", response_model=MasterWorkHistoryAddOut)
+def add_work_history(
+    master_id: str,
+    payload: MasterWorkHistoryAddIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Add a new workplace for the master.
+    Automatically closes current entry (sets to_date = today).
+    Updates masters.current_lounge_id.
+    Auth: master owner or admin.
+    """
+    from datetime import date as date_type
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_own = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_own and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized")
+    try:
+        started = date_type.fromisoformat(payload.started_at)
+    except ValueError:
+        raise HTTPException(400, "Invalid started_at date format, use YYYY-MM-DD")
+    # Close currently open entries (to_date IS NULL)
+    open_entries = db.query(MasterWorkHistory).filter(
+        MasterWorkHistory.master_id == master_id,
+        MasterWorkHistory.to_date == None,  # noqa: E711
+    ).all()
+    today = date_type.today()
+    for entry in open_entries:
+        entry.to_date = today
+    # Create new entry
+    new_entry = MasterWorkHistory(
+        master_id=master_id,
+        lounge_id=payload.lounge_id,
+        from_date=started,
+    )
+    db.add(new_entry)
+    master.current_lounge_id = payload.lounge_id
+    db.commit()
+    db.refresh(new_entry)
+    return MasterWorkHistoryAddOut(
+        status="ok",
+        id=new_entry.id,
+        master_id=master_id,
+        lounge_id=payload.lounge_id,
+    )
+
+
+# ── Master reviews ────────────────────────────────────────────────────────────
+
+@app.get("/masters/{master_id}/reviews", response_model=MasterReviewsListOut)
+def list_master_reviews(
+    master_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """List reviews for a master, paginated, newest first. Excludes hidden."""
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    q = db.query(MasterReview).filter(
+        MasterReview.master_id == master_id,
+        MasterReview.is_hidden == False,
+    )
+    total = q.count()
+    rows = q.order_by(MasterReview.created_at.desc())\
+            .offset((page - 1) * page_size)\
+            .limit(page_size)\
+            .all()
+    items = []
+    for r in rows:
+        author = db.query(User).filter(User.id == r.user_id).first()
+        items.append(MasterReviewOut(
+            id=r.id,
+            master_id=r.master_id,
+            author_user_id=r.user_id,
+            author_display_name=author.username if author else None,
+            author_avatar_url=None,
+            rating=r.rating,
+            text=r.body or "",
+            created_at=r.created_at,
+            master_response_text=r.master_response_text,
+            master_responded_at=r.master_responded_at,
+            is_hidden=r.is_hidden,
+        ))
+    return MasterReviewsListOut(items=items, total=total, page=page, page_size=page_size)
+
+
+@app.post("/masters/{master_id}/reviews", response_model=MasterReviewOut)
+def create_master_review(
+    master_id: str,
+    payload: MasterReviewCreateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Submit a review for a master.
+    Auth: any logged-in user, NOT the master themselves.
+    Triggers rating recalculation.
+    """
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    if master.user_id is not None and master.user_id == current_user.id:
+        raise HTTPException(400, "Cannot review your own master profile")
+    if payload.rating < 1 or payload.rating > 5:
+        raise HTTPException(400, "Rating must be between 1 and 5")
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(400, "Review text cannot be empty")
+    review = MasterReview(
+        master_id=master_id,
+        user_id=current_user.id,       # production column name is user_id
+        rating=payload.rating,
+        body=payload.text.strip(),     # production column name is body
+    )
+    db.add(review)
+    db.flush()
+    _recalc_master_rating(master_id, db)
+    db.commit()
+    db.refresh(review)
+    author = db.query(User).filter(User.id == current_user.id).first()
+    return MasterReviewOut(
+        id=review.id,
+        master_id=review.master_id,
+        author_user_id=review.user_id,
+        author_display_name=author.username if author else None,
+        author_avatar_url=None,
+        rating=review.rating,
+        text=review.body or "",
+        created_at=review.created_at,
+        master_response_text=None,
+        master_responded_at=None,
+        is_hidden=review.is_hidden,
+    )
+
+
+# ── Master review responses ───────────────────────────────────────────────────
+
+@app.post("/reviews/{review_id}/master-response", response_model=MasterResponseOut)
+def add_master_response(
+    review_id: int,
+    payload: MasterResponseCreateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Master responds to a review. Auth: only the master to whom the review belongs."""
+    current_user = get_required_user(user)
+    review = db.query(MasterReview).filter(MasterReview.id == review_id).first()
+    if not review:
+        raise HTTPException(404, "Review not found")
+    master = db.query(Master).filter(Master.id == review.master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_master_owner = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_master_owner and not current_user.is_admin:
+        raise HTTPException(403, "Only the master can respond to their own review")
+    if review.master_response_text is not None:
+        raise HTTPException(409, "Response already exists. Use PATCH to update.")
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(400, "Response text cannot be empty")
+    review.master_response_text = payload.text.strip()
+    review.master_responded_at = datetime.utcnow()
+    db.commit()
+    db.refresh(review)
+    return MasterResponseOut(
+        review_id=review.id,
+        master_response_text=review.master_response_text,
+        master_responded_at=review.master_responded_at,
+    )
+
+
+@app.patch("/reviews/{review_id}/master-response", response_model=MasterResponseOut)
+def update_master_response(
+    review_id: int,
+    payload: MasterResponseCreateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Edit master's response. Auth: master owner or admin."""
+    current_user = get_required_user(user)
+    review = db.query(MasterReview).filter(MasterReview.id == review_id).first()
+    if not review:
+        raise HTTPException(404, "Review not found")
+    master = db.query(Master).filter(Master.id == review.master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_master_owner = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_master_owner and not current_user.is_admin:
+        raise HTTPException(403, "Only the master can edit their response")
+    if review.master_response_text is None:
+        raise HTTPException(404, "No response exists. Use POST first.")
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(400, "Response text cannot be empty")
+    review.master_response_text = payload.text.strip()
+    review.master_responded_at = datetime.utcnow()
+    db.commit()
+    db.refresh(review)
+    return MasterResponseOut(
+        review_id=review.id,
+        master_response_text=review.master_response_text,
+        master_responded_at=review.master_responded_at,
+    )
+
+
+@app.delete("/reviews/{review_id}/master-response", response_model=StatusOut)
+def delete_master_response(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete master's response. Auth: master owner or admin."""
+    current_user = get_required_user(user)
+    review = db.query(MasterReview).filter(MasterReview.id == review_id).first()
+    if not review:
+        raise HTTPException(404, "Review not found")
+    master = db.query(Master).filter(Master.id == review.master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_master_owner = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_master_owner and not current_user.is_admin:
+        raise HTTPException(403, "Only the master can delete their response")
+    if review.master_response_text is None:
+        raise HTTPException(404, "No response to delete")
+    review.master_response_text = None
+    review.master_responded_at = None
+    db.commit()
+    return StatusOut(status="ok", message="Master response deleted")
+
 
 # ── Duel WebSocket ──────────────────────────────────────────────────────────
 from typing import Dict as _Dict

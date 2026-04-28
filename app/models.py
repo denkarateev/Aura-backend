@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     Date,
@@ -34,6 +35,10 @@ class User(Base):
     premium_until = Column(DateTime, nullable=True)
     premium_plan = Column(String, nullable=True)  # premium_monthly | premium_yearly
     premium_provider = Column(String, nullable=True)  # yookassa | storekit
+    # Account type — 'user' (default), 'master', 'lounge_owner'
+    account_type = Column(String(20), default="user", nullable=False, server_default="user")
+    # FK to master_profiles (set when account_type='master')
+    master_profile_id = Column(String, nullable=True)
 
     mixes = relationship("Mix", back_populates="author")
     favorites = relationship("Favorite", back_populates="user")
@@ -384,6 +389,33 @@ class LoungeAssets(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class ManagerTelegramLink(Base):
+    """
+    Links a brand manager's Hooka3 account to their Telegram chat.
+
+    Flow:
+      1. Manager calls POST /me/telegram/link-code → gets 6-digit code (10 min TTL).
+         A row is created with link_code set and verified_at=NULL.
+      2. Manager opens @hooka3_busyness_bot, sends /start <CODE>.
+         Bot finds row by link_code, fills telegram_chat_id + verified_at,
+         clears link_code.
+      3. Scheduler queries verified rows every 30 min, sends busyness poll
+         to each chat with inline buttons per managed brand.
+      4. Button callback writes to LoungeAssets.info_json["busyness"].
+    """
+    __tablename__ = "manager_telegram_links"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    telegram_chat_id = Column(BigInteger, nullable=True, unique=True, index=True)
+    telegram_username = Column(String, nullable=True)
+    link_code = Column(String, nullable=True, index=True)  # cleared after verification
+    code_expires_at = Column(DateTime, nullable=True)
+    verified_at = Column(DateTime, nullable=True)
+    last_poll_sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class LoungeLedgerEntry(Base):
     """
     Double-sided accounting ledger for bundle settlement.
@@ -409,3 +441,91 @@ class LoungeLedgerEntry(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     settled_at = Column(DateTime, nullable=True)
     settlement_batch_id = Column(String, nullable=True, index=True)
+
+
+# MARK: - Masters domain
+
+class Master(Base):
+    """
+    Hookah master public profile.
+    Main table: 'masters' (already in production from S192-S194).
+    Extended with is_verified, reviews_count, user_id via startup ALTER TABLE.
+    """
+    __tablename__ = "masters"
+
+    id = Column(String, primary_key=True)               # e.g. "master_alexey"
+    handle = Column(String(40), unique=True, nullable=False)
+    display_name = Column(String(120), nullable=False)
+    avatar_url = Column(Text, nullable=True)
+    current_lounge_id = Column(Text, nullable=True)
+    bio = Column(Text, nullable=True)
+    accent_color_hex = Column(Text, nullable=True)
+    mixes_count = Column(Integer, default=0, nullable=False)
+    followers_count = Column(Integer, default=0, nullable=False)
+    rating = Column(Float, default=0.0, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Extended columns added via startup ALTER TABLE
+    is_verified = Column(Boolean, default=False, nullable=False, server_default="false")
+    reviews_count = Column(Integer, default=0, nullable=False, server_default="0")
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=True)
+
+    work_history = relationship(
+        "MasterWorkHistory",
+        back_populates="master",
+        cascade="all, delete-orphan",
+        order_by="MasterWorkHistory.from_date",
+    )
+    reviews = relationship(
+        "MasterReview",
+        back_populates="master",
+        cascade="all, delete-orphan",
+    )
+
+
+class MasterWorkHistory(Base):
+    """
+    Timeline of lounges where a master has worked.
+    to_date IS NULL means currently working there.
+    Production columns: from_date / to_date.
+    """
+    __tablename__ = "master_work_history"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    lounge_id = Column(Text, nullable=False)
+    from_date = Column(Date, nullable=False)
+    to_date = Column(Date, nullable=True)              # NULL = currently working here
+
+    master = relationship("Master", back_populates="work_history")
+
+
+class MasterReview(Base):
+    """
+    A user's review of a master.
+    Production columns: master_id, user_id (author), rating, body.
+    Extended with: master_response_text, master_responded_at, is_hidden.
+    """
+    __tablename__ = "master_reviews"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # author
+    rating = Column(Integer, nullable=False)           # 1-5
+    body = Column(Text, nullable=True)                 # review text (production column name)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Extended columns (added via startup ALTER TABLE)
+    master_response_text = Column(Text, nullable=True)
+    master_responded_at = Column(DateTime, nullable=True)
+    is_hidden = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    master = relationship("Master", back_populates="reviews")
+    author = relationship("User", foreign_keys=[user_id])
+
+
+class MasterFollower(Base):
+    """master_followers join table (already in production)."""
+    __tablename__ = "master_followers"
+
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    followed_at = Column(DateTime, default=datetime.utcnow, nullable=False)

@@ -194,6 +194,10 @@ class VoteMixOut(BaseModel):
     lounge: str
     percentage: float
     image_name: Optional[str] = None
+    cover_url: str = ""
+
+    class Config:
+        from_attributes = True
 
 
 class MonthlyFlavorOut(BaseModel):
@@ -514,3 +518,169 @@ class LoungeAssetsOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TelegramLinkCodeOut(BaseModel):
+    """
+    Response for POST /me/telegram/link-code
+
+    Manager copies `code` and sends `/start <code>` to the bot.
+    The code is valid for 10 minutes; expired codes return 410 on bot side.
+    """
+    code: str
+    expires_at: datetime
+    bot_username: str
+    deep_link: str  # https://t.me/<bot>?start=<code>
+
+
+class TelegramLinkStatusOut(BaseModel):
+    """Response for GET /me/telegram/status"""
+    linked: bool
+    telegram_username: Optional[str] = None
+    verified_at: Optional[datetime] = None
+
+
+class LoungeBusynessOut(BaseModel):
+    """Response for GET /lounges/{brand_id}/busyness"""
+    brand_id: str
+    percent: int                        # 0-100
+    level: str                          # quiet | moderate | busy | peak
+    source: str                         # yandex_maps | dgis | checkins_last_hour | mock_hourly
+    updated_at: Optional[datetime] = None  # when yandex_maps source, timestamp of last override
+
+
+class LoungeRefreshBusynessIn(BaseModel):
+    """
+    Payload for POST /lounges/{brand_id}/refresh-busyness
+
+    Manager or admin manually overrides the busyness % for a lounge.
+    This is the primary mechanism until a real-time Yandex scraper daemon is available.
+
+    Fields:
+      percent         — current busyness 0-100 (required)
+      yandex_org_id   — optional: store the Yandex Maps org ID for future daemon use
+                        (numeric string, found in yandex.ru/maps/org/.../ORGID/)
+      dgis_branch_id  — optional: store the 2GIS branch ID for automatic busyness fetching.
+                        Found in 2gis.ru URL: 2gis.ru/.../firm/<BRANCH_ID>/
+                        When set, GET /busyness will auto-fetch via 2GIS API
+                        before falling back to checkins or mock.
+    """
+    percent: int
+    yandex_org_id: Optional[str] = None
+    dgis_branch_id: Optional[str] = None
+
+    class Config:
+        # Validate percent range
+        pass
+
+
+# MARK: - Masters domain schemas
+
+class MasterWorkplaceOut(BaseModel):
+    id: int
+    lounge_id: str
+    started_at: Optional[datetime] = None  # serialised as ISO string
+    ended_at: Optional[datetime] = None
+    is_current: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MasterOut(BaseModel):
+    id: str
+    handle: str
+    display_name: str
+    avatar_url: Optional[str] = None
+    bio: Optional[str] = None
+    current_lounge_id: Optional[str] = None
+    rating: float
+    followers_count: int
+    mixes_count: int
+    reviews_count: int
+    is_verified: bool
+    is_following: bool = False
+    work_history: List[MasterWorkplaceOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class MasterListOut(BaseModel):
+    items: List[MasterOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class MasterCreateIn(BaseModel):
+    id: str                        # e.g. "master_alexey"
+    handle: str
+    display_name: str
+    bio: Optional[str] = None
+    avatar_url: Optional[str] = None
+    current_lounge_id: Optional[str] = None
+    mixes_count: int = 0
+    followers_count: int = 0
+    rating: float = 0.0
+
+
+class MasterUpdateIn(BaseModel):
+    display_name: Optional[str] = None
+    bio: Optional[str] = None
+    avatar_url: Optional[str] = None
+    current_lounge_id: Optional[str] = None
+
+
+# Work history
+class MasterWorkHistoryAddIn(BaseModel):
+    lounge_id: str
+    started_at: str                # ISO date string "YYYY-MM-DD"
+
+
+class MasterWorkHistoryAddOut(BaseModel):
+    status: str
+    id: int
+    master_id: str
+    lounge_id: str
+
+
+# Reviews
+class MasterReviewCreateIn(BaseModel):
+    rating: int                    # 1-5
+    text: str
+    visit_id: Optional[int] = None
+
+
+class MasterReviewOut(BaseModel):
+    id: int
+    master_id: str
+    author_user_id: int
+    author_display_name: Optional[str] = None
+    author_avatar_url: Optional[str] = None
+    rating: int
+    text: str
+    created_at: datetime
+    master_response_text: Optional[str] = None
+    master_responded_at: Optional[datetime] = None
+    is_hidden: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MasterReviewsListOut(BaseModel):
+    items: List[MasterReviewOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class MasterResponseCreateIn(BaseModel):
+    text: str
+
+
+class MasterResponseOut(BaseModel):
+    review_id: int
+    master_response_text: str
+    master_responded_at: datetime
