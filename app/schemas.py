@@ -46,6 +46,7 @@ class MixOut(BaseModel):
     created_at: Optional[datetime]
     ingredients: List[IngredientOut]
     likes_count: int
+    comments_count: int = 0
     is_liked: bool
     is_author_followed: bool
     # MARK: Mix Wizard fields
@@ -718,3 +719,32 @@ class MasterResponseOut(BaseModel):
     review_id: int
     master_response_text: str
     master_responded_at: datetime
+
+
+# MARK: - Master Shifts (расписание смен)
+
+class MasterShiftCreateIn(BaseModel):
+    """Мастер создаёт смену на определённой площадке.
+    Время в ISO 8601 — клиент шлёт UTC."""
+    lounge_id: str
+    starts_at: datetime
+    ends_at: datetime
+    note: Optional[str] = None
+
+
+class MasterShiftOut(BaseModel):
+    id: int
+    master_id: str
+    lounge_id: str
+    starts_at: datetime
+    ends_at: datetime
+    note: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MasterShiftsListOut(BaseModel):
+    items: List[MasterShiftOut]
+    total: int

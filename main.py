@@ -57,6 +57,7 @@ from app.models import (
     Master,
     MasterFollower,
     MasterReview,
+    MasterShift,
     MasterWorkHistory,
     Mix,
     MixIngredient,
@@ -115,6 +116,9 @@ from app.schemas import (
     MasterReviewsListOut,
     MasterResponseCreateIn,
     MasterResponseOut,
+    MasterShiftCreateIn,
+    MasterShiftOut,
+    MasterShiftsListOut,
     MasterUpdateIn,
     MasterWorkHistoryAddIn,
     MasterWorkHistoryAddOut,
@@ -1509,6 +1513,27 @@ def startup():
                 UPDATE mixes
                 SET tags = '[]'
                 WHERE tags IS NULL
+                """
+            )
+
+            # MARK: Master shifts — расписание смен мастера (S2026-04-29)
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS master_shifts (
+                    id SERIAL PRIMARY KEY,
+                    master_id VARCHAR NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+                    lounge_id TEXT NOT NULL,
+                    starts_at TIMESTAMP NOT NULL,
+                    ends_at TIMESTAMP NOT NULL,
+                    note TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_master_shifts_master_starts
+                ON master_shifts(master_id, starts_at)
                 """
             )
     db = SessionLocal()
@@ -4118,6 +4143,100 @@ def add_work_history(
         master_id=master_id,
         lounge_id=payload.lounge_id,
     )
+
+
+# MARK: - Master Shifts (расписание смен)
+# Мастер указывает когда работает в каком зале — клиенты видят на профиле,
+# подписчики получают пуш «твой мастер сегодня в lounge X с 19:00».
+
+@app.get("/masters/{master_id}/shifts", response_model=MasterShiftsListOut)
+def get_master_shifts(
+    master_id: str,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Список смен мастера. Без auth — публично, чтобы клиенты могли смотреть.
+    Опциональные фильтры from_date/to_date — для календарной выборки на месяц.
+    """
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    q = db.query(MasterShift).filter(MasterShift.master_id == master_id)
+    if from_date is not None:
+        q = q.filter(MasterShift.starts_at >= from_date)
+    if to_date is not None:
+        q = q.filter(MasterShift.starts_at <= to_date)
+    rows = q.order_by(MasterShift.starts_at.asc()).all()
+    return MasterShiftsListOut(
+        items=[MasterShiftOut.model_validate(r) for r in rows],
+        total=len(rows),
+    )
+
+
+@app.post("/masters/{master_id}/shifts", response_model=MasterShiftOut)
+def create_master_shift(
+    master_id: str,
+    payload: MasterShiftCreateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Мастер добавляет смену. Auth: только сам мастер или админ.
+    Валидация: ends_at > starts_at, длительность не более 16 часов
+    (защита от опечаток вроде «начал 19:00, кончил 09:00 завтра» без даты).
+    """
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_own = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_own and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized")
+    if payload.ends_at <= payload.starts_at:
+        raise HTTPException(400, "ends_at must be after starts_at")
+    duration_hours = (payload.ends_at - payload.starts_at).total_seconds() / 3600
+    if duration_hours > 16:
+        raise HTTPException(400, "Shift longer than 16 hours — split into multiple shifts")
+
+    shift = MasterShift(
+        master_id=master_id,
+        lounge_id=payload.lounge_id,
+        starts_at=payload.starts_at,
+        ends_at=payload.ends_at,
+        note=payload.note,
+    )
+    db.add(shift)
+    db.commit()
+    db.refresh(shift)
+    return MasterShiftOut.model_validate(shift)
+
+
+@app.delete("/masters/{master_id}/shifts/{shift_id}")
+def delete_master_shift(
+    master_id: str,
+    shift_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Мастер удаляет свою смену. Auth: только мастер-владелец или админ."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_own = (master.user_id is not None and master.user_id == current_user.id)
+    if not is_own and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized")
+    shift = db.query(MasterShift).filter(
+        MasterShift.id == shift_id,
+        MasterShift.master_id == master_id,
+    ).first()
+    if not shift:
+        raise HTTPException(404, "Shift not found")
+    db.delete(shift)
+    db.commit()
+    return {"status": "deleted", "id": shift_id}
 
 
 # ── Master reviews ────────────────────────────────────────────────────────────

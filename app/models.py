@@ -543,3 +543,25 @@ class MasterFollower(Base):
     master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     followed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MasterShift(Base):
+    """
+    Расписание смены мастера. Мастер указывает когда он работает в каком зале —
+    клиенты видят расписание на профиле, могут спланировать визит.
+
+    starts_at / ends_at — таймстампы UTC начала/конца смены.
+    Если на одну дату приходится несколько смен (смена дневная и ночная) —
+    создаётся несколько записей.
+    """
+    __tablename__ = "master_shifts"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    lounge_id = Column(Text, nullable=False)               # soft FK на brand_id
+    starts_at = Column(DateTime, nullable=False, index=True)
+    ends_at = Column(DateTime, nullable=False)
+    note = Column(Text, nullable=True)                     # «только бронь», «event night», etc.
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    master = relationship("Master")
