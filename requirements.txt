@@ -9,3 +9,6 @@ pydantic
 email-validator
 yookassa
 python-dotenv
+aiogram>=3.4
+apscheduler>=3.10
+bcrypt>=4.0

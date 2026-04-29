@@ -4,6 +4,7 @@ import string
 import asyncio
 from fastapi import WebSocket, WebSocketDisconnect
 import hashlib
+import bcrypt
 import os
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -155,12 +156,30 @@ def get_db():
         db.close()
 
 
-def hash_password(password: str):
-    return hashlib.sha256(password.encode()).hexdigest()
+def hash_password(password: str) -> str:
+    """Хеширует пароль bcrypt. Для legacy-сравнения используется
+    `verify_password`, который понимает оба формата (bcrypt + SHA-256)."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
-def verify_password(password: str, hash_):
-    return hash_password(password) == hash_
+def verify_password(password: str, hash_: str) -> bool:
+    """Проверяет пароль. Поддерживает bcrypt (новый, начинается с `$2`)
+    и SHA-256 (legacy, шестнадцать-байтовый hex). Не падает при пустом hash."""
+    if not hash_:
+        return False
+    if hash_.startswith("$2"):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), hash_.encode("utf-8"))
+        except Exception:
+            return False
+    legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return legacy == hash_
+
+
+def password_needs_rehash(hash_: str) -> bool:
+    """True для legacy SHA-256 хэшей — после успешного логина перезаписываем
+    в bcrypt без явного действия пользователя."""
+    return not (hash_ or "").startswith("$2")
 
 
 def normalized_allowlist(name: str, defaults: set[str]) -> set[str]:
@@ -1538,6 +1557,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     if user.is_banned:
         raise HTTPException(403, user.ban_reason or "Account banned")
+
+    # Opportunistic SHA-256 → bcrypt миграция. Юзер ничего не замечает,
+    # на следующем логине пароль будет уже в bcrypt.
+    if password_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(payload.password)
 
     track_daily_login(user, db)
     db.commit()
@@ -3477,7 +3501,7 @@ def apple_sign_in(
         user = User(
             email=apple_email or proxy_email,
             username=username,
-            password_hash=hashlib.sha256(f"apple-{apple_sub}-no-password".encode()).hexdigest(),
+            password_hash=hash_password(f"apple-{apple_sub}-no-password"),
             is_admin=False,
             is_banned=False,
         )
