@@ -261,6 +261,9 @@ def mix_to_out(mix: Mix, user: Optional[User], db: Session):
     likes_count = db.query(Favorite)\
         .filter(Favorite.mix_id == mix.id).count()
 
+    comments_count = db.query(Comment)\
+        .filter(Comment.mix_id == mix.id).count()
+
     is_liked = False
     if user:
         is_liked = db.query(Favorite)\
@@ -290,6 +293,7 @@ def mix_to_out(mix: Mix, user: Optional[User], db: Session):
         created_at=mix.created_at,
         ingredients=mix.ingredients,
         likes_count=likes_count,
+        comments_count=comments_count,
         is_liked=is_liked,
         is_author_followed=is_author_followed,
         status=(mix.status or "public"),
