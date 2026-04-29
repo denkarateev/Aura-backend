@@ -740,6 +740,12 @@ class MasterShiftOut(BaseModel):
     ends_at: datetime
     note: Optional[str] = None
     created_at: datetime
+    # Embedded для агрегированных запросов /shifts — клиент не зовёт каждого
+    # мастера отдельно. На /masters/{id}/shifts эти поля тоже приходят но
+    # дубликаты безвредны.
+    master_handle: Optional[str] = None
+    master_display_name: Optional[str] = None
+    master_avatar_url: Optional[str] = None
 
     class Config:
         from_attributes = True

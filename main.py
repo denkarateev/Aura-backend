@@ -4239,6 +4239,54 @@ def delete_master_shift(
     return {"status": "deleted", "id": shift_id}
 
 
+@app.get("/shifts", response_model=MasterShiftsListOut)
+def list_all_shifts(
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    lounge_id: Optional[str] = None,
+    master_id: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """
+    Глобальный список смен — клиент видит «кто сейчас работает». Подходит для:
+    - Главной: «Сегодня на смене»
+    - Lounge profile: смены в этом зале
+    - Master profile: эквивалент /masters/{id}/shifts (если задан master_id)
+
+    Каждая запись включает имя/handle/avatar мастера (single SQL via JOIN),
+    чтобы клиент не делал N+1 запросов за деталями.
+    """
+    q = db.query(MasterShift, Master).join(
+        Master, MasterShift.master_id == Master.id
+    )
+    if from_date is not None:
+        q = q.filter(MasterShift.starts_at >= from_date)
+    if to_date is not None:
+        q = q.filter(MasterShift.starts_at <= to_date)
+    if lounge_id is not None:
+        q = q.filter(MasterShift.lounge_id == lounge_id)
+    if master_id is not None:
+        q = q.filter(MasterShift.master_id == master_id)
+    rows = q.order_by(MasterShift.starts_at.asc()).limit(min(limit, 500)).all()
+
+    items = []
+    for shift, master in rows:
+        items.append(MasterShiftOut(
+            id=shift.id,
+            master_id=shift.master_id,
+            lounge_id=shift.lounge_id,
+            starts_at=shift.starts_at,
+            ends_at=shift.ends_at,
+            note=shift.note,
+            created_at=shift.created_at,
+            master_handle=master.handle,
+            master_display_name=master.display_name,
+            master_avatar_url=master.avatar_url,
+        ))
+    return MasterShiftsListOut(items=items, total=len(items))
+
+
 # ── Master reviews ────────────────────────────────────────────────────────────
 
 @app.get("/masters/{master_id}/reviews", response_model=MasterReviewsListOut)

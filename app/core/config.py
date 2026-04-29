@@ -21,6 +21,19 @@ YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "hooka3://bundle_success")
 
+# 2GIS Catalog API — real-time venue busyness ("congestion").
+# Get a demo key at https://platform.2gis.ru (self-service, instant).
+DGIS_API_KEY = os.getenv("DGIS_API_KEY", "")
+
+# Telegram bot — busyness polling for brand managers.
+# Create bot via @BotFather, paste HTTP API token here.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "hooka3_busyness_bot")
+# Polling cadence: every N minutes during these Moscow hours.
+BUSYNESS_POLL_INTERVAL_MIN = int(os.getenv("BUSYNESS_POLL_INTERVAL_MIN", "30"))
+BUSYNESS_POLL_HOUR_START = int(os.getenv("BUSYNESS_POLL_HOUR_START", "14"))  # 14:00 MSK
+BUSYNESS_POLL_HOUR_END = int(os.getenv("BUSYNESS_POLL_HOUR_END", "2"))       # 02:00 MSK next day
+
 # Pack catalog — price / comp / hookah-count — kept in sync with iOS BundleTier.
 BUNDLE_TIERS = {
     "five":     {"hookahs": 5,   "price_rub": 5500,  "comp_rub": 1000, "days": 30, "seats": 1, "title": "Пак 5 кальянов"},
