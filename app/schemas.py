@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr
 
@@ -26,6 +26,10 @@ class MixCreate(BaseModel):
     packing_style: Optional[str] = None
     bowl_image_name: Optional[str] = None
     ingredients: List[IngredientIn]
+    # MARK: Mix Wizard fields (optional, default 'public' on create)
+    status: Optional[Literal["public", "subscribers", "draft"]] = "public"
+    lounge_id: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class MixOut(BaseModel):
@@ -44,9 +48,39 @@ class MixOut(BaseModel):
     likes_count: int
     is_liked: bool
     is_author_followed: bool
+    # MARK: Mix Wizard fields
+    status: str = "public"
+    lounge_id: Optional[str] = None
+    tags: List[str] = []
 
     class Config:
         from_attributes = True
+
+
+# MARK: Mix Wizard — generate (rule-based AI)
+
+class MixGenerateIn(BaseModel):
+    """
+    Brief from the iOS Mix Wizard. Mood drives flavor pool selection,
+    strength drives ingredient count, brands narrows the candidate set.
+    """
+    mood: Literal["berry", "citrus", "fresh", "fruit", "warm", "mint"]
+    strength: int                              # 1-10
+    brands: Optional[List[str]] = None         # selected brand ids; empty/None = AI picks
+    occasion: Optional[str] = None             # free text from chip set
+
+
+class MixGenerateOut(BaseModel):
+    """
+    Generated suggestion. NOT persisted — caller decides whether to POST /mixes
+    with this payload.
+    """
+    name: str
+    description: str
+    ingredients: List[IngredientIn]
+    mood: str
+    intensity: float
+    tags: List[str]
 
 
 class CommentOut(BaseModel):

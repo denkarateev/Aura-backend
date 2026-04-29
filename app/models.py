@@ -92,6 +92,20 @@ class Mix(Base):
     packing_style = Column(String)
     bowl_image_name = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # MARK: Mix Wizard fields (S2026-04-29) — added via startup ALTER TABLE
+    # status: 'public' | 'subscribers' | 'draft'
+    status = Column(
+        String(20),
+        nullable=False,
+        default="public",
+        server_default="public",
+    )
+    # Soft FK to brands.id where category='lounge' (no DB constraint, brands
+    # table is owned by iOS-side seed data — backend just stores the id).
+    lounge_id = Column(String, nullable=True)
+    # JSON-encoded list of strings. Stored as TEXT to keep parity with
+    # LoungeAssets.photo_urls / info_json. JSON parse/dump in API layer.
+    tags = Column(Text, nullable=True, default="[]", server_default="[]")
 
     author = relationship("User", back_populates="mixes")
     ingredients = relationship(

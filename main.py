@@ -12,6 +12,7 @@ from typing import List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from jose import jwt
 from sqlalchemy.orm import Session, joinedload
 
@@ -118,6 +119,8 @@ from app.schemas import (
     MasterWorkHistoryAddOut,
     MasterWorkplaceOut,
     MixCreate,
+    MixGenerateIn,
+    MixGenerateOut,
     MixOut,
     MonthlyFlavorOut,
     ProfileCommentOut,
@@ -239,6 +242,21 @@ def get_admin_user(
     return user
 
 
+def _decode_mix_tags(raw: Optional[str]) -> List[str]:
+    """Mix.tags is stored as a JSON-encoded list (TEXT). Decode defensively
+    so a malformed legacy row never crashes the API."""
+    if not raw:
+        return []
+    import json as _json
+    try:
+        decoded = _json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if item is not None]
+
+
 def mix_to_out(mix: Mix, user: Optional[User], db: Session):
     likes_count = db.query(Favorite)\
         .filter(Favorite.mix_id == mix.id).count()
@@ -273,7 +291,10 @@ def mix_to_out(mix: Mix, user: Optional[User], db: Session):
         ingredients=mix.ingredients,
         likes_count=likes_count,
         is_liked=is_liked,
-        is_author_followed=is_author_followed
+        is_author_followed=is_author_followed,
+        status=(mix.status or "public"),
+        lounge_id=mix.lounge_id,
+        tags=_decode_mix_tags(mix.tags),
     )
 
 
@@ -1420,6 +1441,53 @@ def startup():
             ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN DEFAULT FALSE
             """
         )
+        conn.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_master_reviews_master_user
+            ON master_reviews(master_id, user_id)
+            """
+        )
+        # MARK: Mix Wizard — extend mixes with status / lounge_id / tags (S2026-04-29)
+        # Zero-downtime: idempotent ADD COLUMN IF NOT EXISTS, defaults backfill old rows.
+        # tags stored as TEXT (JSON-encoded list) to match LoungeAssets pattern and
+        # avoid PG vs sqlite JSONB drift.
+        # ALTER TABLE … ADD COLUMN IF NOT EXISTS is PG-only — sqlite doesn't
+        # support the IF NOT EXISTS clause and will raise. On sqlite the local
+        # dev DB is bootstrapped fresh from create_all() above, so the columns
+        # are already present and these ALTERs would be no-ops anyway.
+        if engine.dialect.name == "postgresql":
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE mixes
+                ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'public'
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE mixes
+                ADD COLUMN IF NOT EXISTS lounge_id VARCHAR
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE mixes
+                ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '[]'
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                UPDATE mixes
+                SET status = 'public'
+                WHERE status IS NULL
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                UPDATE mixes
+                SET tags = '[]'
+                WHERE tags IS NULL
+                """
+            )
     db = SessionLocal()
     try:
         sync_admin_allowlist(db)
@@ -2412,9 +2480,16 @@ def create_mix(
             )
         raise HTTPException(403, detail)
 
+    # tags is a List[str] in the schema but TEXT(JSON) in the DB — encode here.
+    import json as _json
+    payload_dict = payload.dict(exclude={"ingredients", "tags"})
+    payload_dict["tags"] = _json.dumps(payload.tags or [], ensure_ascii=False)
+    # Default status to 'public' if caller omitted it.
+    payload_dict["status"] = payload.status or "public"
+
     mix = Mix(
         author_id=user.id,
-        **payload.dict(exclude={"ingredients"})
+        **payload_dict
     )
     db.add(mix)
     db.flush()
@@ -2427,15 +2502,84 @@ def create_mix(
             percentage=ing.percentage
         ))
 
-    award_event(
-        user,
-        "mix_created",
-        db,
-        description=f"Опубликован микс «{mix.name}»"
-    )
+    # Drafts are private and don't count toward progression — no points until
+    # the user explicitly publishes (PUT /mixes/{id} flipping status to public).
+    if mix.status != "draft":
+        award_event(
+            user,
+            "mix_created",
+            db,
+            description=f"Опубликован микс «{mix.name}»"
+        )
     db.commit()
     db.refresh(mix)
     return mix_to_out(mix, user, db)
+
+
+# MARK: Mix Wizard — POST /mixes/generate (rule-based AI, S2026-04-29)
+@app.post("/mixes/generate", response_model=MixGenerateOut)
+def generate_mix_from_brief(
+    payload: MixGenerateIn,
+    user: User = Depends(get_current_user),
+):
+    """
+    Returns a generated mix recipe (name, description, 2-4 ingredients, tags).
+    The recipe is NOT persisted — the iOS client decides whether to call
+    POST /mixes with the same shape to save it.
+
+    Phase 1 implementation is rule-based (see app/services/mix_wizard.py).
+    A future phase will swap _pick_ingredients for an LLM call; the public
+    contract stays stable.
+    """
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+
+    if not (1 <= payload.strength <= 10):
+        raise HTTPException(400, "strength must be in [1, 10]")
+
+    from app.services.mix_wizard import generate_mix
+    try:
+        result = generate_mix(
+            mood=payload.mood,
+            strength=payload.strength,
+            brands=payload.brands,
+            occasion=payload.occasion,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return MixGenerateOut(**result)
+
+
+# MARK: Mix Wizard — GET /users/me/mixes with status filter (S2026-04-29)
+@app.get("/users/me/mixes", response_model=List[MixOut])
+def list_my_mixes(
+    status: Optional[str] = Query(None, description="Filter by status: 'public' | 'subscribers' | 'draft'"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Returns mixes authored by the caller. Default: all statuses (so iOS can
+    show drafts alongside published in the profile). Pass ?status=draft to
+    fetch only drafts (used by the Mix Wizard "saved drafts" tab).
+    """
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+
+    query = db.query(Mix).options(
+        joinedload(Mix.ingredients),
+        joinedload(Mix.author),
+    ).filter(Mix.author_id == user.id)
+
+    if status:
+        if status not in ("public", "subscribers", "draft"):
+            raise HTTPException(400, f"unknown status: {status}")
+        query = query.filter(Mix.status == status)
+
+    mixes = query.order_by(Mix.created_at.desc(), Mix.id.desc()).all()
+    return [mix_to_out(m, user, db) for m in mixes]
+
+
 @app.post("/mixes/{mix_id}/comments", response_model=CommentOut)
 def add_comment(
     mix_id: int,
@@ -2515,7 +2659,17 @@ def update_mix(
     if mix.author_id != user.id:
         raise HTTPException(403, "Forbidden")
 
-    for field, value in payload.dict(exclude={"ingredients"}).items():
+    import json as _json
+    update_fields = payload.dict(exclude={"ingredients", "tags"})
+    # tags arrives as List[str] in the payload, stored as JSON-encoded TEXT in DB.
+    if payload.tags is not None:
+        update_fields["tags"] = _json.dumps(payload.tags, ensure_ascii=False)
+    # MixCreate.status defaults to 'public' on the wire (Pydantic default), so
+    # the iOS client must round-trip the existing status when editing a draft.
+    # That's intentional — the alternative (treating "missing" as "no change")
+    # makes accidental publishes harder to spot.
+
+    for field, value in update_fields.items():
         setattr(mix, field, value)
 
     db.query(MixIngredient).filter(
@@ -4008,7 +4162,11 @@ def create_master_review(
         body=payload.text.strip(),     # production column name is body
     )
     db.add(review)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "You have already reviewed this master")
     _recalc_master_rating(master_id, db)
     db.commit()
     db.refresh(review)
