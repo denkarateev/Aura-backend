@@ -3917,7 +3917,7 @@ def unlink_telegram(
 
 # ── Masters CRUD ─────────────────────────────────────────────────────────────
 
-def _master_to_out(m: Master, current_user_id: Optional[int] = None) -> dict:
+def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optional[Session] = None) -> dict:
     """Convert Master ORM row to MasterOut-compatible dict.
     Adapts production column names (from_date/to_date) to iOS DTO names."""
     wh = []
@@ -3929,6 +3929,13 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None) -> dict:
             "ended_at": datetime.combine(w.to_date, datetime.min.time()) if w.to_date else None,
             "is_current": w.to_date is None,
         })
+    # is_following считаем только если есть current_user + db. Иначе false.
+    is_following = False
+    if current_user_id is not None and db is not None:
+        is_following = db.query(MasterFollower).filter(
+            MasterFollower.master_id == m.id,
+            MasterFollower.user_id == current_user_id,
+        ).first() is not None
     return {
         "id": m.id,
         "handle": m.handle,
@@ -3941,7 +3948,7 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None) -> dict:
         "mixes_count": m.mixes_count or 0,
         "reviews_count": m.reviews_count or 0,
         "is_verified": m.is_verified or False,
-        "is_following": False,  # master_followers-based check (Phase 3 TODO)
+        "is_following": is_following,
         "work_history": wh,
     }
 
@@ -3965,6 +3972,7 @@ def list_masters(
     lounge_id: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """List all masters with optional lounge_id filter. Paginated."""
@@ -3977,7 +3985,7 @@ def list_masters(
              .limit(page_size)\
              .all()
     return MasterListOut(
-        items=[MasterOut(**_master_to_out(m)) for m in items],
+        items=[MasterOut(**_master_to_out(m, user.id if user else None, db)) for m in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -3987,25 +3995,27 @@ def list_masters(
 @app.get("/masters/by-handle/{handle}", response_model=MasterOut)
 def get_master_by_handle(
     handle: str,
+    user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Fetch master profile by @handle."""
     master = db.query(Master).filter(Master.handle == handle).first()
     if not master:
         raise HTTPException(404, f"Master with handle '{handle}' not found")
-    return MasterOut(**_master_to_out(master))
+    return MasterOut(**_master_to_out(master, user.id if user else None, db))
 
 
 @app.get("/masters/{master_id}", response_model=MasterOut)
 def get_master(
     master_id: str,
+    user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Fetch master profile by id."""
     master = db.query(Master).filter(Master.id == master_id).first()
     if not master:
         raise HTTPException(404, "Master not found")
-    return MasterOut(**_master_to_out(master))
+    return MasterOut(**_master_to_out(master, user.id if user else None, db))
 
 
 @app.post("/masters", response_model=MasterOut)
@@ -4213,6 +4223,51 @@ def create_master_shift(
     return MasterShiftOut.model_validate(shift)
 
 
+@app.post("/masters/{master_id}/follow")
+def follow_master(
+    master_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Подписаться на мастера. Идемпотентно — повторный POST не создаёт дубль."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    existing = db.query(MasterFollower).filter(
+        MasterFollower.master_id == master_id,
+        MasterFollower.user_id == current_user.id,
+    ).first()
+    if existing is None:
+        db.add(MasterFollower(master_id=master_id, user_id=current_user.id))
+        # Инкремент счётчика подписчиков мастера.
+        master.followers_count = (master.followers_count or 0) + 1
+        db.commit()
+    return {"status": "followed", "master_id": master_id, "is_following": True}
+
+
+@app.delete("/masters/{master_id}/follow")
+def unfollow_master(
+    master_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Отписаться от мастера. Идемпотентно."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    existing = db.query(MasterFollower).filter(
+        MasterFollower.master_id == master_id,
+        MasterFollower.user_id == current_user.id,
+    ).first()
+    if existing is not None:
+        db.delete(existing)
+        master.followers_count = max(0, (master.followers_count or 0) - 1)
+        db.commit()
+    return {"status": "unfollowed", "master_id": master_id, "is_following": False}
+
+
 @app.delete("/masters/{master_id}/shifts/{shift_id}")
 def delete_master_shift(
     master_id: str,
@@ -4245,7 +4300,9 @@ def list_all_shifts(
     to_date: Optional[datetime] = None,
     lounge_id: Optional[str] = None,
     master_id: Optional[str] = None,
+    followed_only: bool = False,
     limit: int = 100,
+    user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -4266,6 +4323,11 @@ def list_all_shifts(
         q = q.filter(MasterShift.starts_at <= to_date)
     if lounge_id is not None:
         q = q.filter(MasterShift.lounge_id == lounge_id)
+    if followed_only and user is not None:
+        followed_master_ids = db.query(MasterFollower.master_id).filter(
+            MasterFollower.user_id == user.id
+        ).subquery()
+        q = q.filter(MasterShift.master_id.in_(followed_master_ids))
     if master_id is not None:
         q = q.filter(MasterShift.master_id == master_id)
     rows = q.order_by(MasterShift.starts_at.asc()).limit(min(limit, 500)).all()
