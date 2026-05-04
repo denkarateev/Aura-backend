@@ -355,6 +355,7 @@ class LoungeCheckinIn(BaseModel):
     user_id: Optional[int] = None
     username: Optional[str] = None
     display_name: Optional[str] = None
+    master_id: Optional[str] = None
 
 
 class BundleRedemptionOut(BaseModel):
@@ -364,6 +365,7 @@ class BundleRedemptionOut(BaseModel):
     hookah_number: int            # which one it is (1..max) or total for cityPass
     remaining: Optional[int]      # None for cityPass unlimited
     compensation_rub: int
+    master_id: Optional[str] = None
 
 
 class LoungeCheckinOut(BaseModel):
@@ -379,6 +381,35 @@ class BundleRecentVisitOut(BaseModel):
     tier: str
     visited_at: datetime
     compensation_rub: int
+    master_id: Optional[str] = None
+
+
+# MARK: - Lounge events / promos
+
+class EventIn(BaseModel):
+    title: str
+    subtitle: Optional[str] = None
+    kind: str = "promo"
+    mood: str = "warm"
+    lounge_id: Optional[str] = None
+    venue_title: Optional[str] = None
+    starts_at: datetime
+    ends_at: Optional[datetime] = None
+    recurrence: Optional[dict] = None
+    cover_image_url: Optional[str] = None
+    price_text: Optional[str] = None
+    booking_url: Optional[str] = None
+    tags: List[str] = []
+
+
+class EventOut(EventIn):
+    id: str
+    going_count: int = 0
+    is_going: bool = False
+
+
+class EventRSVPIn(BaseModel):
+    going: bool = True
 
 
 class LoungeAnalyticsDayOut(BaseModel):
@@ -721,6 +752,26 @@ class MasterResponseOut(BaseModel):
     master_responded_at: datetime
 
 
+class MasterGuestVisitOut(BaseModel):
+    id: int
+    brand_id: str
+    guest_user_id: int
+    guest_username: str
+    visited_at: datetime
+    bundle_redeemed: bool = False
+    compensation_rub: int = 0
+
+
+class MasterGuestStatsOut(BaseModel):
+    master_id: str
+    total_visits: int
+    unique_guests: int
+    repeat_guests: int
+    bundle_redemptions: int
+    compensation_rub: int
+    recent_visits: List[MasterGuestVisitOut]
+
+
 # MARK: - Master Shifts (расписание смен)
 
 class MasterShiftCreateIn(BaseModel):
@@ -754,3 +805,71 @@ class MasterShiftOut(BaseModel):
 class MasterShiftsListOut(BaseModel):
     items: List[MasterShiftOut]
     total: int
+
+
+# MARK: - Account deletion (App Store 5.1.1(v))
+
+class AccountDeleteOut(BaseModel):
+    status: str
+    user_id: int
+
+
+# MARK: - Master avatar upload
+
+class MasterAvatarUploadIn(BaseModel):
+    """iOS sends the file as base64 in JSON, not multipart. See
+    `MixAPI.uploadMyMasterAvatar` for the reference client."""
+    file_name: Optional[str] = "avatar.jpg"
+    mime_type: Optional[str] = "image/jpeg"
+    data_base64: str
+
+
+# MARK: - Tobacco flavors catalog
+
+class TobaccoFlavorOut(BaseModel):
+    id: int
+    brand: str
+    name: str
+    category: Optional[str] = None
+    strength: Optional[int] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    color: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TobaccoFlavorListOut(BaseModel):
+    items: List[TobaccoFlavorOut]
+    total: int
+    limit: int
+    offset: int
+
+
+# MARK: - Tobacco mix templates
+
+class TobaccoMixTemplateIngredientOut(BaseModel):
+    brand: Optional[str] = None
+    flavor: Optional[str] = None
+    flavor_id: Optional[int] = None
+    percentage: Optional[int] = None
+    position: int
+
+
+class TobaccoMixTemplateOut(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    primary_brand: str
+    mood: Optional[str] = None
+    strength_score: Optional[int] = None
+    image_url: Optional[str] = None
+    ingredients: List[TobaccoMixTemplateIngredientOut]
+
+
+class TobaccoMixTemplateListOut(BaseModel):
+    items: List[TobaccoMixTemplateOut]
+    total: int
+    limit: int
+    offset: int

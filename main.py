@@ -6,13 +6,15 @@ from fastapi import WebSocket, WebSocketDisconnect
 import hashlib
 import bcrypt
 import os
+import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import func
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError
 from jose import jwt
 from sqlalchemy.orm import Session, joinedload
@@ -43,6 +45,8 @@ from app.models import (
     Duel,
     BowlHeatRun,
     Comment,
+    Event,
+    EventRSVP,
     Favorite,
     LoungeAssets,
     LoungeBundle,
@@ -88,6 +92,9 @@ from app.schemas import (
     BundleRecentVisitOut,
     BundleRedemptionOut,
     BundleVisitOut,
+    EventIn,
+    EventOut,
+    EventRSVPIn,
     AppleSignInIn,
     AppleSignInOut,
     DeviceTokenIn,
@@ -116,6 +123,8 @@ from app.schemas import (
     MasterReviewsListOut,
     MasterResponseCreateIn,
     MasterResponseOut,
+    MasterGuestStatsOut,
+    MasterGuestVisitOut,
     MasterShiftCreateIn,
     MasterShiftOut,
     MasterShiftsListOut,
@@ -147,6 +156,13 @@ from app.schemas import (
     LoungeRefreshBusynessIn,
     TelegramLinkCodeOut,
     TelegramLinkStatusOut,
+    AccountDeleteOut,
+    MasterAvatarUploadIn,
+    TobaccoFlavorOut,
+    TobaccoFlavorListOut,
+    TobaccoMixTemplateIngredientOut,
+    TobaccoMixTemplateOut,
+    TobaccoMixTemplateListOut,
 )
 
 # -------------------------------------------------------------------
@@ -251,6 +267,12 @@ def get_current_user(
     if user and user.is_banned:
         detail = user.ban_reason or "Account banned"
         raise HTTPException(403, detail)
+
+    # MARK: App Store 5.1.1(v) — soft-deleted accounts cannot authenticate
+    # for any subsequent request. PII has been scrubbed; treat as logged-out
+    # but with a 403 so the iOS client can handle it like a permanent ban.
+    if user and getattr(user, "is_deleted", False):
+        raise HTTPException(403, "Account deleted")
 
     return user
 
@@ -908,6 +930,7 @@ def record_lounge_event(
     db: Session,
     actor_user_id: Optional[int] = None,
     guest_user_id: Optional[int] = None,
+    master_id: Optional[str] = None,
 ):
     db.add(
         LoungeBusinessEvent(
@@ -915,8 +938,117 @@ def record_lounge_event(
             event_type=event_type,
             actor_user_id=actor_user_id,
             guest_user_id=guest_user_id,
+            master_id=master_id,
         )
     )
+
+
+EVENT_KINDS = {"battle", "promo", "dj", "workshop", "tasting", "holiday", "opening", "charity"}
+
+
+def _clean_event_tags(tags: Optional[list[str]]) -> list[str]:
+    clean = []
+    for tag in tags or []:
+        if not isinstance(tag, str):
+            continue
+        value = tag.strip()
+        if value and value not in clean:
+            clean.append(value)
+    return clean[:12]
+
+
+def _decode_json_text(raw: Optional[str], fallback):
+    if not raw:
+        return fallback
+    try:
+        parsed = json.loads(raw)
+        return parsed if parsed is not None else fallback
+    except Exception:
+        return fallback
+
+
+def _event_to_out(event: Event, current_user_id: Optional[int], db: Session) -> EventOut:
+    going_count = db.query(EventRSVP).filter(
+        EventRSVP.event_id == event.id,
+        EventRSVP.going == True,  # noqa: E712
+    ).count()
+    is_going = False
+    if current_user_id is not None:
+        is_going = db.query(EventRSVP).filter(
+            EventRSVP.event_id == event.id,
+            EventRSVP.user_id == current_user_id,
+            EventRSVP.going == True,  # noqa: E712
+        ).first() is not None
+
+    return EventOut(
+        id=str(event.id),
+        title=event.title,
+        subtitle=event.subtitle,
+        kind=event.kind or "promo",
+        mood=event.mood or "warm",
+        lounge_id=event.lounge_id,
+        venue_title=event.venue_title,
+        starts_at=event.starts_at,
+        ends_at=event.ends_at,
+        recurrence=_decode_json_text(event.recurrence, None),
+        cover_image_url=event.cover_image_url,
+        price_text=event.price_text,
+        booking_url=event.booking_url,
+        tags=_decode_json_text(event.tags, []),
+        going_count=going_count,
+        is_going=is_going,
+    )
+
+
+def _apply_event_payload(event: Event, payload: EventIn, current_user: User):
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(400, "Event title cannot be empty")
+    if payload.ends_at is not None and payload.ends_at <= payload.starts_at:
+        raise HTTPException(400, "ends_at must be after starts_at")
+    kind = (payload.kind or "promo").strip().lower()
+    if kind not in EVENT_KINDS:
+        raise HTTPException(400, f"Unknown event kind '{payload.kind}'")
+
+    event.title = title
+    event.subtitle = (payload.subtitle or "").strip() or None
+    event.kind = kind
+    event.mood = (payload.mood or "warm").strip().lower()
+    event.lounge_id = (payload.lounge_id or "").strip() or None
+    event.venue_title = (payload.venue_title or "").strip() or None
+    event.starts_at = payload.starts_at
+    event.ends_at = payload.ends_at
+    event.recurrence = json.dumps(payload.recurrence, ensure_ascii=False) if payload.recurrence else None
+    event.cover_image_url = (payload.cover_image_url or "").strip() or None
+    event.price_text = (payload.price_text or "").strip() or None
+    event.booking_url = (payload.booking_url or "").strip() or None
+    event.tags = json.dumps(_clean_event_tags(payload.tags), ensure_ascii=False)
+    event.updated_by_user_id = current_user.id
+    event.updated_at = datetime.utcnow()
+
+
+def _resolve_checkin_master(
+    master_id: Optional[str],
+    brand_id: str,
+    db: Session,
+) -> Optional[Master]:
+    if not master_id:
+        return None
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    if master.current_lounge_id == brand_id:
+        return master
+    now = datetime.utcnow()
+    active_shift = db.query(MasterShift).filter(
+        MasterShift.master_id == master_id,
+        MasterShift.lounge_id == brand_id,
+        MasterShift.starts_at <= now,
+        MasterShift.ends_at >= now,
+    ).first()
+    if active_shift:
+        return master
+    raise HTTPException(400, "Master is not working in this lounge now")
 
 
 def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut:
@@ -981,6 +1113,7 @@ def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut
             tier=bundle.tier if bundle else "unknown",
             visited_at=v.visited_at,
             compensation_rub=v.compensation_rub,
+            master_id=v.master_id,
         ))
 
     return LoungeAnalyticsOut(
@@ -1114,6 +1247,21 @@ def delete_user_record(user: User, db: Session):
     db.query(MonthlyVote).filter(
         MonthlyVote.user_id == user.id
     ).delete(synchronize_session=False)
+    db.query(EventRSVP).filter(
+        EventRSVP.user_id == user.id
+    ).delete(synchronize_session=False)
+    db.query(Event).filter(
+        Event.created_by_user_id == user.id
+    ).update(
+        {"created_by_user_id": None},
+        synchronize_session=False
+    )
+    db.query(Event).filter(
+        Event.updated_by_user_id == user.id
+    ).update(
+        {"updated_by_user_id": None},
+        synchronize_session=False
+    )
     db.query(UserFollow).filter(
         UserFollow.follower_id == user.id
     ).delete(synchronize_session=False)
@@ -1309,6 +1457,13 @@ def build_monthly_flavor(db: Session) -> MonthlyFlavorOut:
 # -------------------------------------------------------------------
 app = FastAPI(title="HookahMix API")
 
+# MARK: Static files — uploads (avatars, attachments) live here. The
+# /static directory is created lazily on first upload so this mount is
+# always safe even on a fresh container.
+_STATIC_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+os.makedirs(_STATIC_ROOT, exist_ok=True)
+app.mount("/static", StaticFiles(directory=_STATIC_ROOT), name="static")
+
 
 @app.on_event("startup")
 def startup():
@@ -1421,6 +1576,22 @@ def startup():
             """
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS master_profile_id VARCHAR(40)
+            """
+        )
+        # MARK: account-deletion (App Store 5.1.1(v)) — additive soft-delete flag.
+        # DELETE /users/me toggles this on. All auth dependency checks must
+        # reject deleted accounts.
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            UPDATE users
+            SET is_deleted = FALSE
+            WHERE is_deleted IS NULL
             """
         )
         # Extend existing 'masters' table (created in S192-S194)
@@ -1536,6 +1707,106 @@ def startup():
                 ON master_shifts(master_id, starts_at)
                 """
             )
+            # MARK: Lounge events / promos — real backend for iOS EventStore.
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id VARCHAR PRIMARY KEY,
+                    title VARCHAR NOT NULL,
+                    subtitle TEXT,
+                    kind VARCHAR(40) NOT NULL DEFAULT 'promo',
+                    mood VARCHAR(40) NOT NULL DEFAULT 'warm',
+                    lounge_id VARCHAR,
+                    venue_title VARCHAR,
+                    starts_at TIMESTAMP NOT NULL,
+                    ends_at TIMESTAMP,
+                    recurrence TEXT,
+                    cover_image_url TEXT,
+                    price_text VARCHAR,
+                    booking_url TEXT,
+                    tags TEXT DEFAULT '[]',
+                    created_by_user_id INTEGER REFERENCES users(id),
+                    updated_by_user_id INTEGER REFERENCES users(id),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            for ddl in [
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS subtitle TEXT",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS kind VARCHAR(40) DEFAULT 'promo'",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS mood VARCHAR(40) DEFAULT 'warm'",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS lounge_id VARCHAR",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS venue_title VARCHAR",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP DEFAULT NOW()",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence TEXT",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS cover_image_url TEXT",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS price_text VARCHAR",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS booking_url TEXT",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '[]'",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER REFERENCES users(id)",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_by_user_id INTEGER REFERENCES users(id)",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+            ]:
+                conn.exec_driver_sql(ddl)
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_lounge_starts
+                ON events(lounge_id, starts_at)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS event_rsvps (
+                    id SERIAL PRIMARY KEY,
+                    event_id VARCHAR NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    going BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    UNIQUE(event_id, user_id)
+                )
+                """
+            )
+            for ddl in [
+                "ALTER TABLE event_rsvps ADD COLUMN IF NOT EXISTS event_id VARCHAR REFERENCES events(id) ON DELETE CASCADE",
+                "ALTER TABLE event_rsvps ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)",
+                "ALTER TABLE event_rsvps ADD COLUMN IF NOT EXISTS going BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE event_rsvps ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+            ]:
+                conn.exec_driver_sql(ddl)
+            conn.exec_driver_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_event_rsvps_event_user
+                ON event_rsvps(event_id, user_id)
+                """
+            )
+            # Master attribution for QR check-ins and bundle redemptions.
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE lounge_business_events
+                ADD COLUMN IF NOT EXISTS master_id VARCHAR REFERENCES masters(id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE lounge_bundle_visits
+                ADD COLUMN IF NOT EXISTS master_id VARCHAR REFERENCES masters(id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_business_events_master
+                ON lounge_business_events(master_id, created_at)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_bundle_visits_master
+                ON lounge_bundle_visits(master_id, visited_at)
+                """
+            )
     db = SessionLocal()
     try:
         sync_admin_allowlist(db)
@@ -1637,6 +1908,132 @@ def search_users(
     ).limit(12).all()
 
     return [user_search_to_out(item) for item in users if item.username]
+
+
+# -------------------------------------------------------------------
+# EVENTS / PROMOS
+# -------------------------------------------------------------------
+@app.get("/events", response_model=List[EventOut])
+def list_events(
+    lounge_id: Optional[str] = Query(None),
+    user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Event)
+    if lounge_id:
+        q = q.filter(Event.lounge_id == lounge_id)
+    rows = q.order_by(Event.starts_at.asc(), Event.created_at.desc()).all()
+    current_user_id = user.id if user else None
+    return [_event_to_out(event, current_user_id, db) for event in rows]
+
+
+@app.get("/events/{event_id}", response_model=EventOut)
+def get_event(
+    event_id: str,
+    user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+    return _event_to_out(event, user.id if user else None, db)
+
+
+@app.post("/events", response_model=EventOut)
+def create_event(
+    payload: EventIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    if payload.lounge_id:
+        if not can_manage_brand(current_user, payload.lounge_id):
+            raise HTTPException(403, "Business access required")
+    elif not current_user.is_admin:
+        raise HTTPException(403, "Admin only for non-lounge events")
+
+    event = Event(
+        id=f"evt_{uuid.uuid4().hex[:12]}",
+        title=payload.title.strip(),
+        starts_at=payload.starts_at,
+        created_by_user_id=current_user.id,
+        updated_by_user_id=current_user.id,
+    )
+    _apply_event_payload(event, payload, current_user)
+    event.created_at = datetime.utcnow()
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return _event_to_out(event, current_user.id, db)
+
+
+@app.patch("/events/{event_id}", response_model=EventOut)
+def update_event(
+    event_id: str,
+    payload: EventIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    managed_lounge_id = payload.lounge_id or event.lounge_id
+    if managed_lounge_id:
+        if not can_manage_brand(current_user, managed_lounge_id):
+            raise HTTPException(403, "Business access required")
+    elif not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+
+    _apply_event_payload(event, payload, current_user)
+    db.commit()
+    db.refresh(event)
+    return _event_to_out(event, current_user.id, db)
+
+
+@app.delete("/events/{event_id}", response_model=StatusOut)
+def delete_event(
+    event_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+    if event.lounge_id:
+        if not can_manage_brand(current_user, event.lounge_id):
+            raise HTTPException(403, "Business access required")
+    elif not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    db.delete(event)
+    db.commit()
+    return StatusOut(status="ok", message="Event deleted")
+
+
+@app.post("/events/{event_id}/rsvp", response_model=StatusOut)
+def rsvp_event(
+    event_id: str,
+    payload: EventRSVPIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+    row = db.query(EventRSVP).filter(
+        EventRSVP.event_id == event_id,
+        EventRSVP.user_id == current_user.id,
+    ).first()
+    if row is None:
+        row = EventRSVP(event_id=event_id, user_id=current_user.id)
+        db.add(row)
+    row.going = payload.going
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return StatusOut(status="ok")
 
 
 @app.get("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
@@ -1887,6 +2284,9 @@ def register_lounge_checkin(
     if guest_user is None or not guest_user.username:
         raise HTTPException(404, "Guest user not found")
 
+    served_by_master = _resolve_checkin_master(payload.master_id, brand_id, db)
+    served_by_master_id = served_by_master.id if served_by_master else None
+
     loyalty = db.query(LoungeGuestLoyalty).filter(
         LoungeGuestLoyalty.brand_id == brand_id,
         LoungeGuestLoyalty.user_id == guest_user.id,
@@ -1943,6 +2343,7 @@ def register_lounge_checkin(
         db,
         actor_user_id=current_user.id,
         guest_user_id=guest_user.id,
+        master_id=served_by_master_id,
     )
 
     db.commit()
@@ -1955,7 +2356,7 @@ def register_lounge_checkin(
     )
 
     # Bundle redemption — burn one included hookah if guest has active pack
-    bundle_redeemed_out = _try_redeem_bundle_visit(db, guest_user.id, brand_id)
+    bundle_redeemed_out = _try_redeem_bundle_visit(db, guest_user.id, brand_id, served_by_master_id)
 
 
     # Create pending duel offer for guest
@@ -1971,7 +2372,12 @@ def register_lounge_checkin(
     )
 
 
-def _try_redeem_bundle_visit(db: Session, guest_user_id: int, brand_id: str):
+def _try_redeem_bundle_visit(
+    db: Session,
+    guest_user_id: int,
+    brand_id: str,
+    master_id: Optional[str] = None,
+):
     """Find active bundle of the guest, burn one hookah if available, queue
     a pending payout to the lounge via ledger. Returns BundleRedemptionOut
     or None."""
@@ -1998,6 +2404,7 @@ def _try_redeem_bundle_visit(db: Session, guest_user_id: int, brand_id: str):
         bundle_id=bundle.id,
         user_id=guest_user_id,
         brand_id=brand_id,
+        master_id=master_id,
         compensation_rub=bundle.compensation_per_visit_rub,
         visited_at=now,
     )
@@ -2023,6 +2430,7 @@ def _try_redeem_bundle_visit(db: Session, guest_user_id: int, brand_id: str):
         hookah_number=used + 1,
         remaining=remaining,
         compensation_rub=bundle.compensation_per_visit_rub,
+        master_id=master_id,
     )
 
 
@@ -4349,6 +4757,85 @@ def list_all_shifts(
     return MasterShiftsListOut(items=items, total=len(items))
 
 
+@app.get("/masters/{master_id}/guest-stats", response_model=MasterGuestStatsOut)
+def get_master_guest_stats(
+    master_id: str,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Private stats for visits attributed to a master at QR check-in."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_owner = master.user_id == current_user.id if master.user_id is not None else False
+    username_matches = normalize_key(current_user.username) == normalize_key(master.handle)
+    if not current_user.is_admin and not is_owner and not username_matches:
+        raise HTTPException(403, "Only this master can view guest stats")
+
+    q = db.query(LoungeBusinessEvent).filter(
+        LoungeBusinessEvent.event_type == "qr_checkin",
+        LoungeBusinessEvent.master_id == master_id,
+    )
+    if from_date is not None:
+        q = q.filter(LoungeBusinessEvent.created_at >= from_date)
+    if to_date is not None:
+        q = q.filter(LoungeBusinessEvent.created_at <= to_date)
+
+    visits = q.order_by(LoungeBusinessEvent.created_at.desc()).all()
+    guest_visit_counts = defaultdict(int)
+    for visit in visits:
+        if visit.guest_user_id is not None:
+            guest_visit_counts[visit.guest_user_id] += 1
+
+    bundle_q = db.query(LoungeBundleVisit).filter(
+        LoungeBundleVisit.master_id == master_id,
+    )
+    if from_date is not None:
+        bundle_q = bundle_q.filter(LoungeBundleVisit.visited_at >= from_date)
+    if to_date is not None:
+        bundle_q = bundle_q.filter(LoungeBundleVisit.visited_at <= to_date)
+    bundle_visits = bundle_q.all()
+    bundle_count = len(bundle_visits)
+    compensation = sum(v.compensation_rub for v in bundle_visits)
+
+    recent: list[MasterGuestVisitOut] = []
+    for visit in visits[:12]:
+        if visit.guest_user_id is None:
+            continue
+        guest = db.query(User).filter(User.id == visit.guest_user_id).first()
+        window_start = visit.created_at - timedelta(minutes=5)
+        window_end = visit.created_at + timedelta(minutes=5)
+        bundle = db.query(LoungeBundleVisit).filter(
+            LoungeBundleVisit.master_id == master_id,
+            LoungeBundleVisit.user_id == visit.guest_user_id,
+            LoungeBundleVisit.brand_id == visit.brand_id,
+            LoungeBundleVisit.visited_at >= window_start,
+            LoungeBundleVisit.visited_at <= window_end,
+        ).first()
+        recent.append(MasterGuestVisitOut(
+            id=visit.id,
+            brand_id=visit.brand_id,
+            guest_user_id=visit.guest_user_id,
+            guest_username=(guest.username if guest else None) or f"user_{visit.guest_user_id}",
+            visited_at=visit.created_at,
+            bundle_redeemed=bundle is not None,
+            compensation_rub=bundle.compensation_rub if bundle else 0,
+        ))
+
+    return MasterGuestStatsOut(
+        master_id=master_id,
+        total_visits=len(visits),
+        unique_guests=len(guest_visit_counts),
+        repeat_guests=sum(1 for count in guest_visit_counts.values() if count > 1),
+        bundle_redemptions=bundle_count,
+        compensation_rub=compensation,
+        recent_visits=recent,
+    )
+
+
 # ── Master reviews ────────────────────────────────────────────────────────────
 
 @app.get("/masters/{master_id}/reviews", response_model=MasterReviewsListOut)
@@ -4534,6 +5021,246 @@ def delete_master_response(
     review.master_responded_at = None
     db.commit()
     return StatusOut(status="ok", message="Master response deleted")
+
+
+# ── Account deletion (App Store 5.1.1(v)) ─────────────────────────────────
+# Soft delete: set is_deleted=True and scrub PII so the row is unrecoverable
+# for human readers but cascading FKs (mixes/comments) remain intact so other
+# users' data isn't broken. get_current_user rejects deleted accounts.
+
+@app.delete("/users/me", response_model=AccountDeleteOut)
+def delete_my_account(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """User-initiated account deletion. App Store 5.1.1(v) compliance."""
+    current = get_required_user(user)
+    deleted_id = current.id
+    current.email = f"deleted-{deleted_id}@deleted.local"
+    current.username = f"deleted_{deleted_id}"
+    current.password_hash = ""
+    current.display_name = None
+    current.phone = None
+    current.bio = None
+    current.city = None
+    current.avatar_url = None
+    current.ton_address = None
+    current.is_deleted = True
+    db.commit()
+    return AccountDeleteOut(status="deleted", user_id=deleted_id)
+
+
+# ── Master avatar upload (POST /me/master/avatar) ─────────────────────────
+# iOS sends JSON {file_name, mime_type, data_base64}; we save under
+# /app/static/uploads/avatars/{user_id}/{ts}.jpg and return the public URL.
+# If the user has a master profile, master.avatar_url is also updated.
+
+import base64 as _base64
+
+_AVATAR_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+_AVATAR_MAX_DIM = 1024
+
+
+def _save_avatar_bytes(user_id: int, raw: bytes, mime_type: str) -> str:
+    """Persist raw image bytes to /app/static/uploads/avatars/{user_id}/{ts}.jpg.
+    Resizes to max 1024×1024 if Pillow is available; otherwise saves raw.
+    Returns public URL like /static/uploads/avatars/61/1714867200000.jpg."""
+    if len(raw) > _AVATAR_MAX_BYTES:
+        raise HTTPException(413, "Image too large (max 5 MB)")
+    if not (mime_type or "").lower().startswith("image/"):
+        raise HTTPException(400, "Unsupported file type — image/* required")
+    ext = "jpg"
+    lowered = (mime_type or "").lower()
+    if "png" in lowered:
+        ext = "png"
+    elif "webp" in lowered:
+        ext = "webp"
+    elif "heic" in lowered or "heif" in lowered:
+        ext = "heic"
+    folder = os.path.join(_STATIC_ROOT, "uploads", "avatars", str(user_id))
+    os.makedirs(folder, exist_ok=True)
+    ts = int(datetime.utcnow().timestamp() * 1000)
+    fname = f"{ts}.{ext}"
+    fpath = os.path.join(folder, fname)
+    payload = raw
+    # Best-effort resize (degrades gracefully if Pillow not installed).
+    try:
+        from PIL import Image  # type: ignore
+        from io import BytesIO
+        img = Image.open(BytesIO(raw))
+        img.thumbnail((_AVATAR_MAX_DIM, _AVATAR_MAX_DIM))
+        buf = BytesIO()
+        save_format = "JPEG" if ext in ("jpg", "jpeg", "heic") else (
+            "PNG" if ext == "png" else "WEBP"
+        )
+        if save_format == "JPEG" and img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(buf, format=save_format, quality=85)
+        payload = buf.getvalue()
+        # If we re-encoded heic to jpeg, fix extension/url.
+        if ext == "heic":
+            ext = "jpg"
+            fname = f"{ts}.{ext}"
+            fpath = os.path.join(folder, fname)
+    except Exception as e:
+        # Pillow missing or decode failed — write the raw bytes as-is.
+        print(f"[avatar] pillow fallback: {e}")
+    with open(fpath, "wb") as f:
+        f.write(payload)
+    return f"/static/uploads/avatars/{user_id}/{fname}"
+
+
+@app.post("/me/master/avatar")
+def upload_master_avatar(
+    payload: MasterAvatarUploadIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload an avatar image for the calling user. If they own a Master
+    profile, also updates master.avatar_url. iOS sends base64 JSON, see
+    `MixAPI.uploadMyMasterAvatar`."""
+    current = get_required_user(user)
+    if not payload.data_base64:
+        raise HTTPException(400, "data_base64 is required")
+    try:
+        raw = _base64.b64decode(payload.data_base64, validate=False)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 payload")
+    url = _save_avatar_bytes(current.id, raw, payload.mime_type or "image/jpeg")
+    # Persist to user record.
+    current.avatar_url = url
+    # Also update master if one exists for this user.
+    master = db.query(Master).filter(Master.user_id == current.id).first()
+    if master:
+        master.avatar_url = url
+    db.commit()
+    if master:
+        db.refresh(master)
+        return MasterOut(**_master_to_out(master, current.id, db))
+    return {"url": url, "avatar_url": url}
+
+
+# ── Tobacco flavors catalog (GET /flavors) ────────────────────────────────
+# Filters: brand (substring ILIKE), category (exact), search (ILIKE on name).
+# Backed by tobacco_flavors (276 rows). Raw SQL — no ORM model needed for MVP.
+
+@app.get("/flavors", response_model=TobaccoFlavorListOut)
+def list_tobacco_flavors(
+    brand: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Paginated list of tobacco flavors. Public — no auth required."""
+    where = ["TRUE"]
+    params: dict = {"limit": limit, "offset": offset}
+    if brand:
+        where.append("brand ILIKE :brand")
+        params["brand"] = f"%{brand}%"
+    if category:
+        where.append("category = :category")
+        params["category"] = category
+    if search:
+        where.append("name ILIKE :search")
+        params["search"] = f"%{search}%"
+    clause = " AND ".join(where)
+    total_row = db.execute(
+        sa_text(f"SELECT COUNT(*) FROM tobacco_flavors WHERE {clause}"),
+        params,
+    ).first()
+    total = int(total_row[0]) if total_row else 0
+    rows = db.execute(
+        sa_text(
+            f"SELECT id, brand, name, category, strength, description, image_url, color "
+            f"FROM tobacco_flavors WHERE {clause} "
+            f"ORDER BY brand, name LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    ).mappings().all()
+    items = [TobaccoFlavorOut(**dict(r)) for r in rows]
+    return TobaccoFlavorListOut(items=items, total=total, limit=limit, offset=offset)
+
+
+# ── Tobacco mix templates (GET /mix-templates) ────────────────────────────
+# Returns templates plus their full ingredient list. Filters by primary_brand
+# (substring), mood (exact). Backed by tobacco_mix_templates (396 rows) and
+# tobacco_mix_template_ingredients.
+
+@app.get("/mix-templates", response_model=TobaccoMixTemplateListOut)
+def list_tobacco_mix_templates(
+    brand: Optional[str] = Query(None),
+    mood: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Paginated list of tobacco mix templates with full ingredients."""
+    where = ["TRUE"]
+    params: dict = {"limit": limit, "offset": offset}
+    if brand:
+        where.append("primary_brand ILIKE :brand")
+        params["brand"] = f"%{brand}%"
+    if mood:
+        where.append("mood = :mood")
+        params["mood"] = mood
+    if search:
+        where.append("name ILIKE :search")
+        params["search"] = f"%{search}%"
+    clause = " AND ".join(where)
+    total_row = db.execute(
+        sa_text(f"SELECT COUNT(*) FROM tobacco_mix_templates WHERE {clause}"),
+        params,
+    ).first()
+    total = int(total_row[0]) if total_row else 0
+    template_rows = db.execute(
+        sa_text(
+            f"SELECT id, name, description, primary_brand, mood, strength_score, image_url "
+            f"FROM tobacco_mix_templates WHERE {clause} "
+            f"ORDER BY id LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    ).mappings().all()
+    template_ids = [r["id"] for r in template_rows]
+    ingredients_by_template: dict[int, list[TobaccoMixTemplateIngredientOut]] = {
+        tid: [] for tid in template_ids
+    }
+    if template_ids:
+        ing_rows = db.execute(
+            sa_text(
+                "SELECT template_id, flavor_id, brand, flavor_name, percentage, position "
+                "FROM tobacco_mix_template_ingredients "
+                "WHERE template_id = ANY(:ids) "
+                "ORDER BY template_id, position"
+            ),
+            {"ids": list(template_ids)},
+        ).mappings().all()
+        for r in ing_rows:
+            ingredients_by_template.setdefault(r["template_id"], []).append(
+                TobaccoMixTemplateIngredientOut(
+                    brand=r.get("brand"),
+                    flavor=r.get("flavor_name"),
+                    flavor_id=r.get("flavor_id"),
+                    percentage=r.get("percentage"),
+                    position=r["position"],
+                )
+            )
+    items = [
+        TobaccoMixTemplateOut(
+            id=r["id"],
+            name=r["name"],
+            description=r.get("description"),
+            primary_brand=r["primary_brand"],
+            mood=r.get("mood"),
+            strength_score=r.get("strength_score"),
+            image_url=r.get("image_url"),
+            ingredients=ingredients_by_template.get(r["id"], []),
+        )
+        for r in template_rows
+    ]
+    return TobaccoMixTemplateListOut(items=items, total=total, limit=limit, offset=offset)
 
 
 # ── Duel WebSocket ──────────────────────────────────────────────────────────

@@ -39,6 +39,16 @@ class User(Base):
     account_type = Column(String(20), default="user", nullable=False, server_default="user")
     # FK to master_profiles (set when account_type='master')
     master_profile_id = Column(String, nullable=True)
+    # Optional profile fields (mirror ALTER TABLE migrations on startup).
+    display_name = Column(Text, nullable=True)
+    phone = Column(Text, nullable=True)
+    bio = Column(Text, nullable=True)
+    city = Column(Text, nullable=True)
+    avatar_url = Column(Text, nullable=True)
+    # Soft-delete flag. App Store 5.1.1(v) compliance — DELETE /users/me sets
+    # this to True and scrubs PII on the row. All auth checks reject deleted
+    # accounts at get_current_user.
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default="false")
 
     mixes = relationship("Mix", back_populates="author")
     favorites = relationship("Favorite", back_populates="user")
@@ -295,7 +305,53 @@ class LoungeBusinessEvent(Base):
     event_type = Column(String, nullable=False)
     actor_user_id = Column(Integer, ForeignKey("users.id"))
     guest_user_id = Column(Integer, ForeignKey("users.id"))
+    master_id = Column(String, ForeignKey("masters.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Event(Base):
+    """Public lounge event/promo shown in Events and lounge profiles."""
+    __tablename__ = "events"
+
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    subtitle = Column(Text, nullable=True)
+    kind = Column(String(40), nullable=False, default="promo", server_default="promo")
+    mood = Column(String(40), nullable=False, default="warm", server_default="warm")
+    lounge_id = Column(String, nullable=True, index=True)
+    venue_title = Column(String, nullable=True)
+    starts_at = Column(DateTime, nullable=False, index=True)
+    ends_at = Column(DateTime, nullable=True)
+    recurrence = Column(Text, nullable=True)
+    cover_image_url = Column(Text, nullable=True)
+    price_text = Column(String, nullable=True)
+    booking_url = Column(Text, nullable=True)
+    tags = Column(Text, nullable=True, default="[]", server_default="[]")
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    rsvps = relationship(
+        "EventRSVP",
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
+
+
+class EventRSVP(Base):
+    """Current user's RSVP state for an event."""
+    __tablename__ = "event_rsvps"
+
+    id = Column(Integer, primary_key=True)
+    event_id = Column(String, ForeignKey("events.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    going = Column(Boolean, default=True, nullable=False, server_default="true")
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("event_id", "user_id"),)
+
+    event = relationship("Event", back_populates="rsvps")
 
 
 class Duel(Base):
@@ -361,6 +417,7 @@ class LoungeBundleVisit(Base):
     bundle_id = Column(Integer, ForeignKey("lounge_bundles.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     brand_id = Column(String, nullable=False, index=True)
+    master_id = Column(String, ForeignKey("masters.id"), nullable=True, index=True)
     compensation_rub = Column(Integer, nullable=False)
     visited_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
