@@ -1,3 +1,4 @@
+import re
 import uuid
 import random
 import string
@@ -4545,16 +4546,40 @@ def create_master(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create a new master profile. Admin only."""
+    """Create a new master profile.
+
+    Auth:
+    - Admin может создать мастера для любого лаунжа
+    - Lounge owner может создать мастера ТОЛЬКО для своего лаунжа
+      (payload.current_lounge_id должен быть в его managed brands)
+    """
     current_user = get_required_user(user)
     if not current_user.is_admin:
-        raise HTTPException(403, "Admin only")
-    if db.query(Master).filter(Master.id == payload.id).first():
-        raise HTTPException(409, f"Master id '{payload.id}' already exists")
+        # Не админ — должен быть менеджером целевого лаунжа.
+        if not payload.current_lounge_id:
+            raise HTTPException(
+                403,
+                "Lounge owners must specify current_lounge_id of their own venue",
+            )
+        if not can_manage_brand(current_user, payload.current_lounge_id):
+            raise HTTPException(
+                403,
+                "You can only create masters for lounges you manage",
+            )
+    # Auto-gen id из handle если не передан клиентом.
+    master_id = (payload.id or "").strip()
+    if not master_id:
+        slug = re.sub(r"[^a-z0-9_]+", "_", payload.handle.lower()).strip("_")
+        master_id = f"master_{slug}" if slug else f"master_{uuid.uuid4().hex[:10]}"
+        # На случай коллизии — добавим короткий суффикс.
+        if db.query(Master).filter(Master.id == master_id).first():
+            master_id = f"{master_id}_{uuid.uuid4().hex[:4]}"
+    if db.query(Master).filter(Master.id == master_id).first():
+        raise HTTPException(409, f"Master id '{master_id}' already exists")
     if db.query(Master).filter(Master.handle == payload.handle).first():
         raise HTTPException(409, f"Handle '{payload.handle}' already taken")
     master = Master(
-        id=payload.id,
+        id=master_id,
         handle=payload.handle,
         display_name=payload.display_name,
         bio=payload.bio,

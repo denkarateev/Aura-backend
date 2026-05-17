@@ -680,7 +680,7 @@ class MasterListOut(BaseModel):
 
 
 class MasterCreateIn(BaseModel):
-    id: str                        # e.g. "master_alexey"
+    id: Optional[str] = None       # авто-генерится из handle если не задан
     handle: str
     display_name: str
     bio: Optional[str] = None
