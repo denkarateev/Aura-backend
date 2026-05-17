@@ -602,6 +602,42 @@ class MasterFollower(Base):
     followed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+# MARK: - Leaderboard / user medals (LOOMIX parity, S2026-05-15)
+#
+# Weekly and monthly podiums for top-3 mixes by likes earned in the
+# corresponding period. APScheduler grants medals automatically on
+# Monday 00:00 MSK (weekly) and on day-1 00:00 MSK (monthly). Backend
+# also exposes a leaderboard endpoint for "right now" / period view.
+#
+# medal_type — 'gold' | 'silver' | 'bronze'  (rank 1, 2, 3)
+# period_type — 'week' | 'month'
+# period_start — Monday of the week, or first day of the month (DATE)
+#
+# Unique constraint (user_id, period_type, period_start, medal_type)
+# guarantees idempotency: re-running the grant job inserts nothing new.
+class UserMedal(Base):
+    __tablename__ = "user_medals"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    medal_type = Column(String(10), nullable=False)
+    period_type = Column(String(10), nullable=False)
+    period_start = Column(Date, nullable=False, index=True)
+    mix_id = Column(Integer, ForeignKey("mixes.id"), nullable=True)
+    likes_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "period_type",
+            "period_start",
+            "medal_type",
+            name="uq_user_medals_user_period_medal",
+        ),
+    )
+
+
 class MasterShift(Base):
     """
     Расписание смены мастера. Мастер указывает когда он работает в каком зале —

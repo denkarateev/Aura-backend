@@ -873,3 +873,61 @@ class TobaccoMixTemplateListOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# MARK: - Leaderboard / Medals (LOOMIX parity, S2026-05-15)
+
+class LeaderboardEntryOut(BaseModel):
+    """One row on the Top забивок podium / list."""
+    rank: int
+    medal: Optional[Literal["gold", "silver", "bronze"]] = None
+    mix_id: int
+    mix_name: str
+    mix_cover_url: Optional[str] = None
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    avatar_url: Optional[str] = None
+    likes_count: int
+
+
+class LeaderboardOut(BaseModel):
+    period: Literal["week", "month"]
+    period_start: datetime
+    period_end: datetime
+    category: str = "mixes"
+    entries: List[LeaderboardEntryOut]
+
+
+class MedalCountsOut(BaseModel):
+    gold: int = 0
+    silver: int = 0
+    bronze: int = 0
+
+
+class UserPublicStatsOut(BaseModel):
+    posts_count: int
+    likes_received: int
+    comments_made: int
+    followers_count: int
+    following_count: int
+    medals: MedalCountsOut
+
+
+class UserMedalOut(BaseModel):
+    id: int
+    medal_type: Literal["gold", "silver", "bronze"]
+    period_type: Literal["week", "month"]
+    period_start: datetime
+    likes_count: int
+    mix_id: Optional[int] = None
+    mix_name: Optional[str] = None
+    mix_cover_url: Optional[str] = None
+    created_at: datetime
+
+
+class MedalBackfillOut(BaseModel):
+    period_type: Literal["week", "month"]
+    period_start: datetime
+    granted: int
+    skipped_existing: int
+    entries: List[LeaderboardEntryOut]

@@ -69,6 +69,7 @@ from app.models import (
     User,
     UserActivity,
     UserFollow,
+    UserMedal,
     UserProgress,
 )
 from app.schemas import (
@@ -150,6 +151,12 @@ from app.schemas import (
     UserProgressOut,
     UserUpdate,
     VoteMixOut,
+    LeaderboardEntryOut,
+    LeaderboardOut,
+    MedalBackfillOut,
+    MedalCountsOut,
+    UserMedalOut,
+    UserPublicStatsOut,
     LoungeAssetsIn,
     LoungeAssetsOut,
     LoungeBusynessOut,
@@ -1812,6 +1819,112 @@ def startup():
         sync_admin_allowlist(db)
     finally:
         db.close()
+
+    # MARK: user_medals (LOOMIX parity, S2026-05-15)
+    # Base.metadata.create_all() above already creates the table from the
+    # UserMedal SQLAlchemy model. On production PostgreSQL we additionally
+    # run idempotent raw DDL for the explicit unique + indices so the
+    # constraints survive on environments where the table was created by
+    # a prior partial migration. Sqlite (local dev) is bootstrapped fresh
+    # from create_all() so we skip the raw DDL there — SERIAL / CREATE
+    # UNIQUE INDEX … WHERE syntax differs across dialects.
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS user_medals (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    medal_type VARCHAR(10) NOT NULL,
+                    period_type VARCHAR(10) NOT NULL,
+                    period_start DATE NOT NULL,
+                    mix_id INTEGER REFERENCES mixes(id),
+                    likes_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE user_medals
+                ADD COLUMN IF NOT EXISTS likes_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_user_medals_user_period_medal
+                ON user_medals (user_id, period_type, period_start, medal_type)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_user_medals_user_id
+                ON user_medals (user_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_user_medals_period_start
+                ON user_medals (period_start)
+                """
+            )
+
+    # MARK: APScheduler — weekly + monthly medal grant.
+    # We start a per-worker BackgroundScheduler. With multiple gunicorn
+    # workers the unique constraint on user_medals guarantees idempotency:
+    # only the first worker's INSERTs succeed, the rest hit IntegrityError
+    # and are skipped silently.
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        from app.services import leaderboard as _leaderboard_module
+
+        _medal_scheduler = BackgroundScheduler(timezone="Europe/Moscow")
+
+        def _run_weekly_grant():
+            session = SessionLocal()
+            try:
+                _leaderboard_module.grant_medals_for_period(session, "week")
+            except Exception as exc:  # pragma: no cover — defensive log
+                import logging as _lg
+                _lg.getLogger(__name__).exception("weekly medal grant failed: %s", exc)
+            finally:
+                session.close()
+
+        def _run_monthly_grant():
+            session = SessionLocal()
+            try:
+                _leaderboard_module.grant_medals_for_period(session, "month")
+            except Exception as exc:  # pragma: no cover
+                import logging as _lg
+                _lg.getLogger(__name__).exception("monthly medal grant failed: %s", exc)
+            finally:
+                session.close()
+
+        _medal_scheduler.add_job(
+            _run_weekly_grant,
+            CronTrigger(day_of_week="mon", hour=0, minute=0, timezone="Europe/Moscow"),
+            id="leaderboard_weekly_medal_grant",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        _medal_scheduler.add_job(
+            _run_monthly_grant,
+            CronTrigger(day=1, hour=0, minute=0, timezone="Europe/Moscow"),
+            id="leaderboard_monthly_medal_grant",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        _medal_scheduler.start()
+        # Stash on app.state so tests / future shutdown hook can grab it.
+        app.state.medal_scheduler = _medal_scheduler
+    except Exception as exc:  # pragma: no cover — never block app startup
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "leaderboard scheduler not started: %s", exc
+        )
 
 # -------------------------------------------------------------------
 # AUTH
@@ -5261,6 +5374,146 @@ def list_tobacco_mix_templates(
         for r in template_rows
     ]
     return TobaccoMixTemplateListOut(items=items, total=total, limit=limit, offset=offset)
+
+
+# ── Leaderboard / Medals (LOOMIX parity, S2026-05-15) ───────────────────────
+from app.services import leaderboard as _leaderboard_svc
+
+
+def _user_avatar_url(user: Optional[User]) -> Optional[str]:
+    if not user:
+        return None
+    return user.avatar_url
+
+
+def _ranked_row_to_entry(
+    row: "_leaderboard_svc.RankedRow",
+    rank: int,
+    db: Session,
+) -> LeaderboardEntryOut:
+    medal = _leaderboard_svc.MEDALS_BY_RANK.get(rank)
+    return LeaderboardEntryOut(
+        rank=rank,
+        medal=medal,
+        mix_id=row.mix.id,
+        mix_name=row.mix.name,
+        mix_cover_url=get_mix_cover_url(row.mix, db),
+        user_id=row.mix.author_id,
+        username=row.mix.author.username if row.mix.author else None,
+        avatar_url=_user_avatar_url(row.mix.author),
+        likes_count=row.likes_count,
+    )
+
+
+@app.get("/leaderboard", response_model=LeaderboardOut)
+def get_leaderboard(
+    period: str = Query("week", regex="^(week|month)$"),
+    limit: int = Query(10, ge=1, le=50),
+    category: str = Query("mixes", regex="^(mixes)$"),
+    db: Session = Depends(get_db),
+):
+    """Top mixes podium for the current week or month (MSK)."""
+    start_dt, end_dt, _ = _leaderboard_svc.bounds_for(period)
+    rows = _leaderboard_svc.top_mixes_in_window(db, start_dt, end_dt, limit=limit)
+    entries = [_ranked_row_to_entry(row, idx + 1, db) for idx, row in enumerate(rows)]
+    return LeaderboardOut(
+        period=period,
+        period_start=start_dt,
+        period_end=end_dt,
+        category=category,
+        entries=entries,
+    )
+
+
+@app.get("/users/{user_id}/stats", response_model=UserPublicStatsOut)
+def get_user_public_stats(user_id: int, db: Session = Depends(get_db)):
+    target = db.query(User).filter(User.id == user_id, User.is_deleted.is_(False)).first()
+    if not target:
+        raise HTTPException(404, "Пользователь не найден")
+    payload = _leaderboard_svc.user_public_stats(db, target)
+    return UserPublicStatsOut(
+        posts_count=payload["posts_count"],
+        likes_received=payload["likes_received"],
+        comments_made=payload["comments_made"],
+        followers_count=payload["followers_count"],
+        following_count=payload["following_count"],
+        medals=MedalCountsOut(**payload["medals"]),
+    )
+
+
+@app.get("/users/{user_id}/medals", response_model=List[UserMedalOut])
+def get_user_medals(user_id: int, db: Session = Depends(get_db)):
+    target = db.query(User).filter(User.id == user_id, User.is_deleted.is_(False)).first()
+    if not target:
+        raise HTTPException(404, "Пользователь не найден")
+    rows = (
+        db.query(UserMedal)
+        .filter(UserMedal.user_id == user_id)
+        .order_by(UserMedal.period_start.desc(), UserMedal.created_at.desc())
+        .all()
+    )
+    out: List[UserMedalOut] = []
+    mix_cache: dict[int, Mix] = {}
+    for medal in rows:
+        mix = None
+        if medal.mix_id is not None:
+            mix = mix_cache.get(medal.mix_id)
+            if mix is None:
+                mix = db.query(Mix).filter(Mix.id == medal.mix_id).first()
+                if mix is not None:
+                    mix_cache[mix.id] = mix
+        out.append(
+            UserMedalOut(
+                id=medal.id,
+                medal_type=medal.medal_type,
+                period_type=medal.period_type,
+                period_start=datetime.combine(medal.period_start, datetime.min.time()),
+                likes_count=int(medal.likes_count or 0),
+                mix_id=medal.mix_id,
+                mix_name=mix.name if mix else None,
+                mix_cover_url=get_mix_cover_url(mix, db) if mix else None,
+                created_at=medal.created_at,
+            )
+        )
+    return out
+
+
+@app.post("/admin/medals/backfill", response_model=MedalBackfillOut)
+def admin_medals_backfill(
+    period: str = Query("week", regex="^(week|month)$"),
+    date: Optional[str] = Query(
+        None,
+        description="ISO date (YYYY-MM-DD) inside the period to backfill. "
+                    "Defaults to today MSK (i.e. grants medals for the period "
+                    "that just ended).",
+    ),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+):
+    reference: Optional[datetime] = None
+    if date:
+        try:
+            parsed = datetime.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(400, "date must be YYYY-MM-DD")
+        # Anchor inside the period that contains `date` — the grant
+        # function will then award medals for the period BEFORE it.
+        # So if the caller wants to grant medals for "week ending Sun May 11",
+        # they pass date = anything in week May 12-18 (next week).
+        reference = parsed.replace(tzinfo=_leaderboard_svc.MSK_TZ)
+    summary = _leaderboard_svc.grant_medals_for_period(db, period, reference)
+    # Rebuild leaderboard entries for response (so iOS/admin can show the
+    # podium that was just awarded).
+    start_dt, end_dt, _ = _leaderboard_svc.prev_bounds_for(period, reference)
+    rows = _leaderboard_svc.top_mixes_in_window(db, start_dt, end_dt, limit=3)
+    entries = [_ranked_row_to_entry(row, idx + 1, db) for idx, row in enumerate(rows)]
+    return MedalBackfillOut(
+        period_type=period,
+        period_start=datetime.combine(summary["period_start"], datetime.min.time()),
+        granted=summary["granted"],
+        skipped_existing=summary["skipped"],
+        entries=entries,
+    )
 
 
 # ── Duel WebSocket ──────────────────────────────────────────────────────────
