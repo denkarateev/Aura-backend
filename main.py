@@ -1002,7 +1002,7 @@ def _event_to_out(event: Event, current_user_id: Optional[int], db: Session) -> 
         cover_image_url=event.cover_image_url,
         price_text=event.price_text,
         booking_url=event.booking_url,
-        tags=_decode_json_text(event.tags, []),
+        tags=list(event.tags or []),
         going_count=going_count,
         is_going=is_going,
     )
@@ -1030,7 +1030,7 @@ def _apply_event_payload(event: Event, payload: EventIn, current_user: User):
     event.cover_image_url = (payload.cover_image_url or "").strip() or None
     event.price_text = (payload.price_text or "").strip() or None
     event.booking_url = (payload.booking_url or "").strip() or None
-    event.tags = json.dumps(_clean_event_tags(payload.tags), ensure_ascii=False)
+    event.tags = _clean_event_tags(payload.tags)  # Python list → text[] на проде
     event.updated_by_user_id = current_user.id
     event.updated_at = datetime.utcnow()
 

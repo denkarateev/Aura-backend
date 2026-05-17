@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -148,6 +149,10 @@ class Favorite(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     mix_id = Column(Integer, ForeignKey("mixes.id"))
+    # Когда лайк поставили — нужно для leaderboard «топ забивок недели»
+    # (считаем лайки полученные в период). Бэкфилл NULL→utcnow при
+    # первом деплое: scripts/add_favorites_created_at.sql.
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     __table_args__ = (UniqueConstraint("user_id", "mix_id"),)
 
@@ -326,7 +331,10 @@ class Event(Base):
     cover_image_url = Column(Text, nullable=True)
     price_text = Column(String, nullable=True)
     booking_url = Column(Text, nullable=True)
-    tags = Column(Text, nullable=True, default="[]", server_default="[]")
+    # Прод хранит как PostgreSQL ARRAY(Text). Передаём питон-list,
+    # SQLAlchemy сам соберёт в `{a,b}` синтаксис. JSON-обёртка убрана
+    # (раньше пытались писать '[]' в text[] и получали InvalidTextRepresentation).
+    tags = Column(ARRAY(Text), nullable=False, default=list, server_default="{}")
     created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -340,16 +348,18 @@ class Event(Base):
 
 
 class EventRSVP(Base):
-    """Current user's RSVP state for an event."""
+    """Current user's RSVP state for an event.
+
+    Прод-схема: composite PK (event_id, user_id) — без отдельного id.
+    Колонка `going_at` (timestamptz) хранит timestamp подтверждения.
+    """
     __tablename__ = "event_rsvps"
 
-    id = Column(Integer, primary_key=True)
-    event_id = Column(String, ForeignKey("events.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    going = Column(Boolean, default=True, nullable=False, server_default="true")
-    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    __table_args__ = (UniqueConstraint("event_id", "user_id"),)
+    event_id = Column(String, ForeignKey("events.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, index=True)
+    going_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    going = Column(Boolean, default=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
     event = relationship("Event", back_populates="rsvps")
 

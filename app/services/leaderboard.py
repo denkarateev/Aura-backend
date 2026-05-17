@@ -128,31 +128,42 @@ def top_mixes_in_window(
     end_dt: datetime,
     limit: int = 10,
 ) -> List[RankedRow]:
-    """Mixes that were CREATED in [start_dt, end_dt) ordered by total
-    likes received (all-time on that mix). LOOMIX uses "likes received
-    in period" — we use "created in period" because it is the simpler,
-    more deterministic version and matches what users intuitively call
-    «лучшие забивки недели». Mixes created later have less time to
-    accumulate likes, which is acceptable for a weekly podium that
-    refreshes every Monday.
+    """Mixes ranked by number of LIKES RECEIVED in [start_dt, end_dt).
+
+    Это LOOMIX-style ranking: «топ забивок недели» = миксы которым ставят
+    лайки именно в этот период. Микс может быть создан год назад — если
+    его лайкают на этой неделе, он попадёт в подиум. Это интуитивнее
+    чем «миксы созданные за неделю» (старая версия) и даёт работающий
+    leaderboard даже когда новых миксов мало.
 
     Both naive (UTC) and tz-aware datetimes are accepted — we strip
-    tzinfo so the comparison works against Mix.created_at which the
-    project stores as naive UTC (default=datetime.utcnow).
+    tzinfo so the comparison works against Favorite.created_at which is
+    stored as naive UTC (default=datetime.utcnow).
     """
     if start_dt.tzinfo is not None:
+        # MSK -> naive UTC (MSK = UTC+3, no DST).
         start_dt = start_dt.astimezone(MSK_TZ).replace(tzinfo=None) - timedelta(hours=3)
-        # Convert MSK -> naive UTC by subtracting 3h (since MSK = UTC+3, no DST).
     if end_dt.tzinfo is not None:
         end_dt = end_dt.astimezone(MSK_TZ).replace(tzinfo=None) - timedelta(hours=3)
 
+    # Период-фильтр на Favorite.created_at (а не Mix.created_at).
+    # Используем sum(case when in_period) — так INNER JOIN отсекает
+    # миксы без единого лайка в окне, что нам и нужно для «топ недели».
+    period_likes = (
+        db.query(
+            Favorite.mix_id.label("mid"),
+            func.count(Favorite.id).label("likes_in_period"),
+        )
+        .filter(Favorite.created_at >= start_dt, Favorite.created_at < end_dt)
+        .group_by(Favorite.mix_id)
+        .subquery()
+    )
+
     rows = (
-        db.query(Mix, func.count(Favorite.id).label("likes_count"))
-        .outerjoin(Favorite, Favorite.mix_id == Mix.id)
-        .filter(Mix.created_at >= start_dt, Mix.created_at < end_dt)
+        db.query(Mix, period_likes.c.likes_in_period)
+        .join(period_likes, period_likes.c.mid == Mix.id)
         .filter((Mix.status == "public") | (Mix.status.is_(None)))
-        .group_by(Mix.id)
-        .order_by(func.count(Favorite.id).desc(), Mix.created_at.asc(), Mix.id.asc())
+        .order_by(period_likes.c.likes_in_period.desc(), Mix.created_at.desc(), Mix.id.asc())
         .limit(limit)
         .all()
     )
