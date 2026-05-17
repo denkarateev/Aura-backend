@@ -1955,9 +1955,14 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
 
 @app.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User)\
-        .filter(User.email == payload.email)\
+    # Принимаем email ИЛИ username (для lounge-owner аккаунтов вроде
+    # gallery_secret_lounge у которых email = служебный).
+    identifier = (payload.email or "").strip()
+    user = (
+        db.query(User)
+        .filter((User.email == identifier) | (User.username == identifier))
         .first()
+    )
 
     if not user or not verify_password(
         payload.password,

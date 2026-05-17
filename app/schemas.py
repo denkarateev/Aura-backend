@@ -199,7 +199,10 @@ class SignupRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    # Принимаем email ИЛИ username — backend (main.py:login) сам ищет
+    # юзера по обоим полям. EmailStr убран ради username-логина для
+    # lounge-owner аккаунтов (gallery_secret_lounge, и т.п.).
+    email: str
     password: str
 
 
