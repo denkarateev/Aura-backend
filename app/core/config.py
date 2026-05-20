@@ -110,6 +110,7 @@ DEFAULT_UNLIMITED_MIX_USERNAMES = {
 
 DEFAULT_BRAND_MANAGER_USERNAMES = {
     "hookahplace_mars": {"hookahplacemars"},
+    "secret_yauza": {"gallery_secret_lounge", "secretloungeyauza"},
     "secret_lounge_yauza": {"gallery_secret_lounge", "secretloungeyauza"},
     "must_have": {"musthave"},
     "darkside": {"darkside"},
@@ -135,6 +136,7 @@ DEFAULT_BRAND_MANAGER_USERNAMES = {
     "lemonade_fresh_bar": {"lemonade_bar"},
     "cran_cunade_night": {"cran_cunade"},
     "garnet_gum_premium": {"garnet_gum"},
+    "garden_lounge_korolev": {"garden_lounge_korolev"},
 }
 
 
