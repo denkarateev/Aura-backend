@@ -580,6 +580,22 @@ class MasterWorkHistory(Base):
     master = relationship("Master", back_populates="work_history")
 
 
+class MasterLoungeRequest(Base):
+    """Pending request from a master to be attached to a lounge."""
+    __tablename__ = "master_lounge_requests"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    lounge_id = Column(Text, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    decided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    decided_at = Column(DateTime, nullable=True)
+
+    master = relationship("Master")
+
+
 class MasterReview(Base):
     """
     A user's review of a master.

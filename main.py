@@ -61,6 +61,7 @@ from app.models import (
     ManagerTelegramLink,
     Master,
     MasterFollower,
+    MasterLoungeRequest,
     MasterReview,
     MasterShift,
     MasterWorkHistory,
@@ -97,6 +98,7 @@ from app.schemas import (
     EventIn,
     EventOut,
     EventRSVPIn,
+    EventRSVPOut,
     AppleSignInIn,
     AppleSignInOut,
     DeviceTokenIn,
@@ -119,6 +121,8 @@ from app.schemas import (
     LoungeTierOut,
     MasterCreateIn,
     MasterListOut,
+    MasterLoungeRequestIn,
+    MasterLoungeRequestOut,
     MasterOut,
     MasterReviewCreateIn,
     MasterReviewOut,
@@ -763,6 +767,10 @@ def user_to_out(profile_user: User, viewer: Optional[User], db: Session) -> User
 
 
 BRAND_MANAGER_USERNAMES = load_brand_manager_usernames()
+BRAND_MANAGER_ALIASES = {
+    "secret_yauza": {"secret_lounge_yauza"},
+    "secret_lounge_yauza": {"secret_yauza"},
+}
 
 
 def normalize_key(value: Optional[str]) -> str:
@@ -831,10 +839,12 @@ def user_search_to_out(user: User) -> UserSearchOut:
 
 
 def resolve_brand_managers(brand_id: str) -> set[str]:
-    if brand_id in BRAND_MANAGER_USERNAMES:
-        return BRAND_MANAGER_USERNAMES[brand_id]
-    defaults = DEFAULT_BRAND_MANAGER_USERNAMES.get(brand_id, set())
-    return {username.lower() for username in defaults}
+    candidates = {brand_id, *BRAND_MANAGER_ALIASES.get(brand_id, set())}
+    managers: set[str] = set()
+    for candidate in candidates:
+        managers.update(BRAND_MANAGER_USERNAMES.get(candidate, set()))
+        managers.update(DEFAULT_BRAND_MANAGER_USERNAMES.get(candidate, set()))
+    return {username.lower() for username in managers}
 
 
 def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
@@ -1268,6 +1278,18 @@ def delete_user_record(user: User, db: Session):
         Event.updated_by_user_id == user.id
     ).update(
         {"updated_by_user_id": None},
+        synchronize_session=False
+    )
+    db.query(MasterLoungeRequest).filter(
+        MasterLoungeRequest.requested_by == user.id
+    ).update(
+        {"requested_by": None},
+        synchronize_session=False
+    )
+    db.query(MasterLoungeRequest).filter(
+        MasterLoungeRequest.decided_by == user.id
+    ).update(
+        {"decided_by": None},
         synchronize_session=False
     )
     db.query(UserFollow).filter(
@@ -1715,6 +1737,33 @@ def startup():
                 ON master_shifts(master_id, starts_at)
                 """
             )
+            # MARK: Master lounge requests — master asks venue owner to approve attachment.
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS master_lounge_requests (
+                    id SERIAL PRIMARY KEY,
+                    master_id VARCHAR NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+                    lounge_id TEXT NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    requested_by INTEGER REFERENCES users(id),
+                    decided_by INTEGER REFERENCES users(id),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    decided_at TIMESTAMP
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_master_lounge_requests_lounge_status
+                ON master_lounge_requests(lounge_id, status, created_at)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_master_lounge_requests_master_status
+                ON master_lounge_requests(master_id, status)
+                """
+            )
             # MARK: Lounge events / promos — real backend for iOS EventStore.
             conn.exec_driver_sql(
                 """
@@ -2131,7 +2180,7 @@ def delete_event(
     return StatusOut(status="ok", message="Event deleted")
 
 
-@app.post("/events/{event_id}/rsvp", response_model=StatusOut)
+@app.post("/events/{event_id}/rsvp", response_model=EventRSVPOut)
 def rsvp_event(
     event_id: str,
     payload: EventRSVPIn,
@@ -2152,7 +2201,11 @@ def rsvp_event(
     row.going = payload.going
     row.updated_at = datetime.utcnow()
     db.commit()
-    return StatusOut(status="ok")
+    going_count = db.query(EventRSVP).filter(
+        EventRSVP.event_id == event_id,
+        EventRSVP.going == True,  # noqa: E712
+    ).count()
+    return EventRSVPOut(status="ok", going=row.going, going_count=going_count)
 
 
 @app.get("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
@@ -4480,6 +4533,54 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optiona
     }
 
 
+def _is_master_owner(master: Master, user: User) -> bool:
+    username = normalize_key(user.username)
+    return (
+        (master.user_id is not None and master.user_id == user.id)
+        or normalize_key(getattr(user, "master_profile_id", None)) == normalize_key(master.id)
+        or (username != "" and username == normalize_key(master.handle))
+    )
+
+
+def _master_lounge_request_to_out(request: MasterLoungeRequest) -> MasterLoungeRequestOut:
+    master = request.master
+    if master is None:
+        raise HTTPException(404, "Master not found")
+    return MasterLoungeRequestOut(
+        id=request.id,
+        master_id=request.master_id,
+        master_display_name=master.display_name,
+        master_handle=master.handle,
+        master_avatar_url=master.avatar_url,
+        lounge_id=request.lounge_id,
+        status=request.status,
+        requested_by=request.requested_by,
+        created_at=request.created_at,
+        decided_at=request.decided_at,
+    )
+
+
+def _attach_master_to_lounge(master: Master, lounge_id: str, db: Session):
+    from datetime import date as date_type
+
+    today = date_type.today()
+    open_entries = db.query(MasterWorkHistory).filter(
+        MasterWorkHistory.master_id == master.id,
+        MasterWorkHistory.to_date == None,  # noqa: E711
+    ).all()
+    has_current_same_lounge = any(entry.lounge_id == lounge_id for entry in open_entries)
+    for entry in open_entries:
+        if entry.lounge_id != lounge_id:
+            entry.to_date = today
+    if not has_current_same_lounge:
+        db.add(MasterWorkHistory(
+            master_id=master.id,
+            lounge_id=lounge_id,
+            from_date=today,
+        ))
+    master.current_lounge_id = lounge_id
+
+
 def _recalc_master_rating(master_id: str, db: Session):
     """Recompute rating and reviews_count on masters from master_reviews."""
     rows = db.query(MasterReview).filter(
@@ -4626,6 +4727,126 @@ def update_master(
     db.commit()
     db.refresh(master)
     return MasterOut(**_master_to_out(master))
+
+
+# ── Master lounge approval requests ───────────────────────────────────────────
+
+@app.post("/masters/{master_id}/lounge-requests", response_model=MasterLoungeRequestOut)
+def request_master_lounge_access(
+    master_id: str,
+    payload: MasterLoungeRequestIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    if not _is_master_owner(master, current_user) and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized")
+    lounge_id = (payload.lounge_id or "").strip()
+    if not lounge_id:
+        raise HTTPException(400, "lounge_id is required")
+
+    existing = db.query(MasterLoungeRequest).filter(
+        MasterLoungeRequest.master_id == master_id,
+        MasterLoungeRequest.lounge_id == lounge_id,
+        MasterLoungeRequest.status == "pending",
+    ).first()
+    if existing:
+        return _master_lounge_request_to_out(existing)
+
+    request_row = MasterLoungeRequest(
+        master_id=master_id,
+        lounge_id=lounge_id,
+        status="pending",
+        requested_by=current_user.id,
+    )
+    db.add(request_row)
+    db.commit()
+    db.refresh(request_row)
+    return _master_lounge_request_to_out(request_row)
+
+
+@app.get("/lounges/{lounge_id}/master-requests", response_model=List[MasterLoungeRequestOut])
+def get_lounge_master_requests(
+    lounge_id: str,
+    status: str = Query("pending"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, lounge_id):
+        raise HTTPException(403, "Business access required")
+    q = db.query(MasterLoungeRequest).filter(MasterLoungeRequest.lounge_id == lounge_id)
+    if status:
+        q = q.filter(MasterLoungeRequest.status == status)
+    rows = q.order_by(MasterLoungeRequest.created_at.desc()).all()
+    return [_master_lounge_request_to_out(row) for row in rows]
+
+
+def _decide_lounge_master_request(
+    lounge_id: str,
+    request_id: int,
+    status: str,
+    user: User,
+    db: Session,
+) -> MasterLoungeRequestOut:
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, lounge_id):
+        raise HTTPException(403, "Business access required")
+    request_row = db.query(MasterLoungeRequest).filter(
+        MasterLoungeRequest.id == request_id,
+        MasterLoungeRequest.lounge_id == lounge_id,
+    ).first()
+    if not request_row:
+        raise HTTPException(404, "Request not found")
+    if request_row.status != "pending":
+        return _master_lounge_request_to_out(request_row)
+
+    request_row.status = status
+    request_row.decided_by = current_user.id
+    request_row.decided_at = datetime.utcnow()
+    if status == "approved":
+        master = db.query(Master).filter(Master.id == request_row.master_id).first()
+        if not master:
+            raise HTTPException(404, "Master not found")
+        _attach_master_to_lounge(master, lounge_id, db)
+        db.query(MasterLoungeRequest).filter(
+            MasterLoungeRequest.master_id == request_row.master_id,
+            MasterLoungeRequest.status == "pending",
+            MasterLoungeRequest.id != request_row.id,
+        ).update(
+            {
+                "status": "rejected",
+                "decided_by": current_user.id,
+                "decided_at": datetime.utcnow(),
+            },
+            synchronize_session=False,
+        )
+    db.commit()
+    db.refresh(request_row)
+    return _master_lounge_request_to_out(request_row)
+
+
+@app.post("/lounges/{lounge_id}/master-requests/{request_id}/approve", response_model=MasterLoungeRequestOut)
+def approve_lounge_master_request(
+    lounge_id: str,
+    request_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return _decide_lounge_master_request(lounge_id, request_id, "approved", user, db)
+
+
+@app.post("/lounges/{lounge_id}/master-requests/{request_id}/reject", response_model=MasterLoungeRequestOut)
+def reject_lounge_master_request(
+    lounge_id: str,
+    request_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return _decide_lounge_master_request(lounge_id, request_id, "rejected", user, db)
 
 
 # ── Master work history ───────────────────────────────────────────────────────

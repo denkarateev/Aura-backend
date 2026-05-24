@@ -415,6 +415,12 @@ class EventRSVPIn(BaseModel):
     going: bool = True
 
 
+class EventRSVPOut(BaseModel):
+    status: str = "ok"
+    going: bool
+    going_count: int
+
+
 class LoungeAnalyticsDayOut(BaseModel):
     day_key: str
     profile_views: int
@@ -712,6 +718,23 @@ class MasterWorkHistoryAddOut(BaseModel):
     id: int
     master_id: str
     lounge_id: str
+
+
+class MasterLoungeRequestIn(BaseModel):
+    lounge_id: str
+
+
+class MasterLoungeRequestOut(BaseModel):
+    id: int
+    master_id: str
+    master_display_name: str
+    master_handle: str
+    master_avatar_url: Optional[str] = None
+    lounge_id: str
+    status: str
+    requested_by: Optional[int] = None
+    created_at: datetime
+    decided_at: Optional[datetime] = None
 
 
 # Reviews

@@ -78,6 +78,7 @@ DEFAULT_UNLIMITED_MIX_USERNAMES = {
 
 DEFAULT_BRAND_MANAGER_USERNAMES = {
     "hookahplace_mars": {"hookahplacemars"},
+    "secret_yauza": {"gallery_secret_lounge", "secretloungeyauza"},
     "secret_lounge_yauza": {"gallery_secret_lounge", "secretloungeyauza"},
     "must_have": {"musthave"},
     "darkside": {"darkside"},
