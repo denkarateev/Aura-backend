@@ -4,7 +4,7 @@ sqlalchemy
 psycopg2-binary
 python-jose[cryptography]
 pyjwt[crypto]
-httpx
+httpx[http2]
 pydantic
 email-validator
 yookassa

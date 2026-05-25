@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import relationship
@@ -628,6 +629,8 @@ class MasterFollower(Base):
     followed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+
+
 # MARK: - Leaderboard / user medals (LOOMIX parity, S2026-05-15)
 #
 # Weekly and monthly podiums for top-3 mixes by likes earned in the
@@ -662,6 +665,32 @@ class UserMedal(Base):
             name="uq_user_medals_user_period_medal",
         ),
     )
+
+
+class LoungeSubscription(Base):
+    """
+    Per-topic push subscription for a user to a lounge brand.
+    Replaces the client-side UserDefaults approach — backend now knows who
+    subscribed to what and can fan-out selectively.
+
+    topic_events   — new events / promos created by the lounge
+    topic_new_mix  — new mix published by the lounge or its masters
+    topic_discounts — flash sales / personal offers
+    topic_news     — general news (off by default — less urgent)
+    """
+    __tablename__ = "lounge_subscriptions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    brand_id = Column(String(128), nullable=False, index=True)  # matches BrandProfile.id (slug)
+    topic_events = Column(Boolean, default=True, nullable=False)
+    topic_new_mix = Column(Boolean, default=True, nullable=False)
+    topic_discounts = Column(Boolean, default=True, nullable=False)
+    topic_news = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("user_id", "brand_id", name="uq_user_brand_sub"),)
 
 
 class MasterShift(Base):

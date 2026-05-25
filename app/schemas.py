@@ -839,6 +839,30 @@ class MasterShiftsListOut(BaseModel):
     total: int
 
 
+# MARK: - Lounge push subscriptions (per-topic)
+
+class LoungeSubscriptionIn(BaseModel):
+    """Body for PUT /lounges/{brand_id}/subscription.
+    All fields are optional — omitted fields keep their current value on upsert.
+    Default values mirror the iOS BrandSubscriptionSheet defaults.
+    """
+    topic_events: Optional[bool] = True
+    topic_new_mix: Optional[bool] = True
+    topic_discounts: Optional[bool] = True
+    topic_news: Optional[bool] = False
+
+
+class LoungeSubscriptionDTO(BaseModel):
+    brand_id: str
+    topic_events: bool = True
+    topic_new_mix: bool = True
+    topic_discounts: bool = True
+    topic_news: bool = False
+
+    class Config:
+        from_attributes = True
+
+
 # MARK: - Account deletion (App Store 5.1.1(v))
 
 class AccountDeleteOut(BaseModel):

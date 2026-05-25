@@ -55,6 +55,7 @@ from app.models import (
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
+    LoungeSubscription,
     DeviceToken,
     LoungeLedgerEntry,
     LoungeProgram,
@@ -176,6 +177,8 @@ from app.schemas import (
     TobaccoMixTemplateIngredientOut,
     TobaccoMixTemplateOut,
     TobaccoMixTemplateListOut,
+    LoungeSubscriptionIn,
+    LoungeSubscriptionDTO,
 )
 
 # -------------------------------------------------------------------
@@ -1920,6 +1923,38 @@ def startup():
                 """
             )
 
+    # MARK: lounge_subscriptions — per-topic push subscription table (2026-05-25)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    brand_id VARCHAR(128) NOT NULL,
+                    topic_events BOOLEAN NOT NULL DEFAULT TRUE,
+                    topic_new_mix BOOLEAN NOT NULL DEFAULT TRUE,
+                    topic_discounts BOOLEAN NOT NULL DEFAULT TRUE,
+                    topic_news BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    CONSTRAINT uq_user_brand_sub UNIQUE (user_id, brand_id)
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_lounge_subscriptions_user_id
+                ON lounge_subscriptions (user_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_lounge_subscriptions_brand_id
+                ON lounge_subscriptions (brand_id)
+                """
+            )
+
     # MARK: APScheduler — weekly + monthly medal grant.
     # We start a per-worker BackgroundScheduler. With multiple gunicorn
     # workers the unique constraint on user_medals guarantees idempotency:
@@ -2180,6 +2215,29 @@ def create_event(
     db.add(event)
     db.commit()
     db.refresh(event)
+
+    # APNs: push гостям у которых есть хотя бы один чекин в этом лаунже
+    # (LoungeGuestLoyalty — proxy «активный гость»).
+    # Per-topic фильтрацию (topic_events) backend применит в следующей итерации
+    # когда iOS начнёт синхронизировать настройки через PUT /lounges/{id}/subscription.
+    try:
+        from app.push import send_push_to_user
+        guest_ids = db.query(LoungeGuestLoyalty.user_id).filter(
+            LoungeGuestLoyalty.brand_id == event.lounge_id
+        ).distinct().limit(500).all() if event.lounge_id else []
+        title = "Новый эвент"
+        body = f"{event.title} — {event.starts_at.strftime('%d.%m %H:%M')}"
+        push_payload = {
+            "type": "event",
+            "event_id": event.id,
+            "lounge_id": event.lounge_id or "",
+        }
+        for (uid,) in guest_ids:
+            if uid != current_user.id:
+                send_push_to_user(db, uid, title, body, payload=push_payload)
+    except Exception as e:
+        print(f"[push] event-create notify failed: {e}")
+
     return _event_to_out(event, current_user.id, db)
 
 
@@ -3340,6 +3398,30 @@ def create_mix(
         )
     db.commit()
     db.refresh(mix)
+
+    # APNs: notify lounge subscribers (topic_new_mix) when the mix is linked
+    # to a lounge and published. Draft mixes skip the push.
+    if mix.lounge_id and mix.status != "draft":
+        try:
+            from app.push import send_push_to_user
+            subs = db.query(LoungeSubscription).filter(
+                LoungeSubscription.brand_id == mix.lounge_id,
+                LoungeSubscription.topic_new_mix == True,  # noqa: E712
+            ).limit(2000).all()
+            push_title = "Новый микс"
+            push_body = f"{mix.name}"
+            push_payload = {
+                "type": "mix",
+                "mix_id": mix.id,
+                "author_id": user.id,
+                "lounge_id": mix.lounge_id,
+            }
+            for s in subs:
+                if s.user_id != user.id:
+                    send_push_to_user(db, s.user_id, push_title, push_body, payload=push_payload)
+        except Exception as _e:
+            print(f"[push] mix-create notify failed: {_e}")
+
     return mix_to_out(mix, user, db)
 
 
@@ -4175,6 +4257,110 @@ async def yookassa_bundle_webhook_async(
 
     db.commit()
     return {"status": "ok", "bundle_id": bundle.id}
+
+
+# ===============================================================
+# LOUNGE SUBSCRIPTIONS — per-topic push settings
+# ===============================================================
+
+@app.put(
+    "/lounges/{brand_id}/subscription",
+    response_model=LoungeSubscriptionDTO,
+    summary="Upsert per-topic push subscription for a lounge",
+)
+def upsert_lounge_subscription(
+    brand_id: str,
+    payload: LoungeSubscriptionIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Subscribe or update topic toggles for a lounge.
+    Omitted boolean fields keep the row's current value (or the default on first
+    call). The row is identified by (user_id, brand_id).
+    """
+    current_user = get_required_user(user)
+    sub = db.query(LoungeSubscription).filter(
+        LoungeSubscription.user_id == current_user.id,
+        LoungeSubscription.brand_id == brand_id,
+    ).first()
+
+    if sub is None:
+        sub = LoungeSubscription(
+            user_id=current_user.id,
+            brand_id=brand_id,
+            topic_events=payload.topic_events if payload.topic_events is not None else True,
+            topic_new_mix=payload.topic_new_mix if payload.topic_new_mix is not None else True,
+            topic_discounts=payload.topic_discounts if payload.topic_discounts is not None else True,
+            topic_news=payload.topic_news if payload.topic_news is not None else False,
+        )
+        db.add(sub)
+    else:
+        if payload.topic_events is not None:
+            sub.topic_events = payload.topic_events
+        if payload.topic_new_mix is not None:
+            sub.topic_new_mix = payload.topic_new_mix
+        if payload.topic_discounts is not None:
+            sub.topic_discounts = payload.topic_discounts
+        if payload.topic_news is not None:
+            sub.topic_news = payload.topic_news
+
+    db.commit()
+    db.refresh(sub)
+    return LoungeSubscriptionDTO(
+        brand_id=sub.brand_id,
+        topic_events=sub.topic_events,
+        topic_new_mix=sub.topic_new_mix,
+        topic_discounts=sub.topic_discounts,
+        topic_news=sub.topic_news,
+    )
+
+
+@app.delete(
+    "/lounges/{brand_id}/subscription",
+    response_model=StatusOut,
+    summary="Unsubscribe from all push notifications for a lounge",
+)
+def delete_lounge_subscription(
+    brand_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove the subscription row entirely. Equivalent to turning all topics off."""
+    current_user = get_required_user(user)
+    sub = db.query(LoungeSubscription).filter(
+        LoungeSubscription.user_id == current_user.id,
+        LoungeSubscription.brand_id == brand_id,
+    ).first()
+    if sub:
+        db.delete(sub)
+        db.commit()
+    return StatusOut(status="ok", message="unsubscribed")
+
+
+@app.get(
+    "/users/me/subscriptions",
+    response_model=List[LoungeSubscriptionDTO],
+    summary="List all lounge push subscriptions for the current user",
+)
+def list_my_subscriptions(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns every lounge the user has explicitly subscribed to (via PUT endpoint)."""
+    current_user = get_required_user(user)
+    subs = db.query(LoungeSubscription).filter(
+        LoungeSubscription.user_id == current_user.id,
+    ).order_by(LoungeSubscription.brand_id).all()
+    return [
+        LoungeSubscriptionDTO(
+            brand_id=s.brand_id,
+            topic_events=s.topic_events,
+            topic_new_mix=s.topic_new_mix,
+            topic_discounts=s.topic_discounts,
+            topic_news=s.topic_news,
+        )
+        for s in subs
+    ]
 
 
 # ===============================================================
