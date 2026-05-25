@@ -5305,20 +5305,40 @@ def update_master(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update master profile. Auth: only the master owner or admin."""
+    """Update master profile.
+
+    Auth:
+      • Сам мастер (`master.user_id == current_user.id`) — может править свой профиль
+      • Админ — может всё
+      • Владелец лаунжа — может ТОЛЬКО изменить `current_lounge_id` (прикрепить
+        чужого мастера к своему заведению). Раньше получал 403, и юзер видел
+        «Не удалось прикрепить» в iOS attachExistingMaster.
+    """
     current_user = get_required_user(user)
     master = db.query(Master).filter(Master.id == master_id).first()
     if not master:
         raise HTTPException(404, "Master not found")
     is_own = (master.user_id is not None and master.user_id == current_user.id)
-    if not is_own and not current_user.is_admin:
+    is_admin = bool(current_user.is_admin)
+    # Владелец заведения, к которому прикрепляют мастера, тоже допустим.
+    # Проверяем что новый current_lounge_id принадлежит current_user.
+    is_lounge_owner_attaching = (
+        not is_own
+        and not is_admin
+        and payload.current_lounge_id is not None
+        and can_manage_brand(current_user, payload.current_lounge_id)
+    )
+    if not is_own and not is_admin and not is_lounge_owner_attaching:
         raise HTTPException(403, "Not authorized to edit this master profile")
-    if payload.display_name is not None:
-        master.display_name = payload.display_name
-    if payload.bio is not None:
-        master.bio = payload.bio
-    if payload.avatar_url is not None:
-        master.avatar_url = payload.avatar_url
+    # Lounge-owner ветка — позволяем менять ТОЛЬКО current_lounge_id,
+    # остальные поля игнорируем (нельзя редактировать чужой bio/avatar).
+    if is_own or is_admin:
+        if payload.display_name is not None:
+            master.display_name = payload.display_name
+        if payload.bio is not None:
+            master.bio = payload.bio
+        if payload.avatar_url is not None:
+            master.avatar_url = payload.avatar_url
     if payload.current_lounge_id is not None:
         master.current_lounge_id = payload.current_lounge_id
     db.commit()
