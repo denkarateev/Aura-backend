@@ -949,6 +949,26 @@ class TobaccoFlavorListOut(BaseModel):
     offset: int
 
 
+# MARK: - Tobacco brands catalog
+
+class TobaccoBrandOut(BaseModel):
+    brand: str
+    category: str
+    flavor_count: int
+
+
+class TobaccoBrandListOut(BaseModel):
+    items: List[TobaccoBrandOut]
+    total: int
+
+
+class TobaccoBrandFlavorsOut(BaseModel):
+    brand: str
+    category: str
+    flavors: List[str]
+    total: int
+
+
 # MARK: - Tobacco mix templates
 
 class TobaccoMixTemplateIngredientOut(BaseModel):

@@ -175,6 +175,9 @@ from app.schemas import (
     LoungeImageUploadIn,
     TobaccoFlavorOut,
     TobaccoFlavorListOut,
+    TobaccoBrandOut,
+    TobaccoBrandListOut,
+    TobaccoBrandFlavorsOut,
     TobaccoMixTemplateIngredientOut,
     TobaccoMixTemplateOut,
     TobaccoMixTemplateListOut,
@@ -6124,6 +6127,61 @@ def list_tobacco_flavors(
     ).mappings().all()
     items = [TobaccoFlavorOut(**dict(r)) for r in rows]
     return TobaccoFlavorListOut(items=items, total=total, limit=limit, offset=offset)
+
+
+# ── Tobacco brands catalog (GET /tobacco/brands) ─────────────────────────
+# Returns distinct brands grouped from tobacco_flavors with flavor count.
+# category filter: 'tobacco' | 'liquid'
+
+@app.get("/tobacco/brands", response_model=TobaccoBrandListOut)
+def list_tobacco_brands(
+    category: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Distinct brands list with flavor counts. Public — no auth required."""
+    where = ["TRUE"]
+    params: dict = {}
+    if category:
+        where.append("category = :category")
+        params["category"] = category
+    clause = " AND ".join(where)
+    rows = db.execute(
+        sa_text(
+            f"SELECT brand, COALESCE(category, 'tobacco') as category, COUNT(*) as flavor_count "
+            f"FROM tobacco_flavors WHERE {clause} "
+            f"GROUP BY brand, category ORDER BY brand"
+        ),
+        params,
+    ).mappings().all()
+    items = [TobaccoBrandOut(**dict(r)) for r in rows]
+    return TobaccoBrandListOut(items=items, total=len(items))
+
+
+@app.get("/tobacco/brands/{brand_name}/flavors", response_model=TobaccoBrandFlavorsOut)
+def list_brand_flavors(
+    brand_name: str,
+    db: Session = Depends(get_db),
+):
+    """All flavor names for a specific brand. Public — no auth required.
+    brand_name is the brand label (e.g. 'Morpheus', 'TNG', 'TROFIMOFF\"S').
+    """
+    row = db.execute(
+        sa_text(
+            "SELECT brand, COALESCE(category, 'tobacco') as category, "
+            "ARRAY_AGG(name ORDER BY name) as flavors, COUNT(*) as total "
+            "FROM tobacco_flavors WHERE brand ILIKE :brand GROUP BY brand, category"
+        ),
+        {"brand": brand_name},
+    ).first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Brand not found")
+    return TobaccoBrandFlavorsOut(
+        brand=row[0],
+        category=row[1],
+        flavors=list(row[2]),
+        total=int(row[3]),
+    )
 
 
 # ── Tobacco mix templates (GET /mix-templates) ────────────────────────────
