@@ -1,0 +1,17 @@
+[Unit]
+Description=Ember Feedback Listener (TG long-poll collector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/root/ember_autopost.env
+ExecStart=/usr/bin/python3 /root/ember_feedback_listener.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

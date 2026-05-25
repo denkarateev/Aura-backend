@@ -196,6 +196,9 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str
     username: Optional[str]
+    display_name: Optional[str] = None
+    phone: Optional[str] = None
+    referrer_code: Optional[str] = None  # ON-8: referral reward (200 угольков приглашающему)
 
 
 class LoginRequest(BaseModel):

@@ -1982,9 +1982,33 @@ def startup():
 # -------------------------------------------------------------------
 @app.post("/signup", response_model=LoginResponse)
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+    # Pre-check на дубликаты — иначе db.commit падает IntegrityError → 500
+    # → iOS показывает generic «На сервере что-то сломалось». Юзер не понимает
+    # что именно надо исправить.
+    email_norm = (payload.email or "").strip().lower()
+    username_norm = (payload.username or "").strip()
+
+    if not email_norm:
+        raise HTTPException(400, "Введи email — без него регистрация невозможна.")
+    if len(payload.password or "") < 6:
+        raise HTTPException(400, "Пароль должен быть минимум 6 символов.")
+    if username_norm and len(username_norm) < 3:
+        raise HTTPException(400, "Username должен быть минимум 3 символа.")
+    if username_norm and not re.fullmatch(r"[a-zA-Z0-9_]+", username_norm):
+        raise HTTPException(400, "Username может содержать только латиницу, цифры и _.")
+
+    existing_email = db.query(User).filter(User.email == email_norm).first()
+    if existing_email:
+        raise HTTPException(400, "Этот email уже зарегистрирован. Войди или восстанови пароль.")
+
+    if username_norm:
+        existing_username = db.query(User).filter(User.username == username_norm).first()
+        if existing_username:
+            raise HTTPException(400, f"Username «{username_norm}» уже занят. Выбери другой.")
+
     user = User(
-        email=payload.email,
-        username=payload.username,
+        email=email_norm,
+        username=username_norm or None,
         password_hash=hash_password(payload.password),
         is_admin=False
     )
@@ -1993,6 +2017,29 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     db.add(user)
     db.flush()
     track_daily_login(user, db)
+
+    # ON-8: Referral reward — 200 ugolki to the referrer on successful signup.
+    # referrer_code is the username of the inviter. Silent — never blocks signup.
+    if payload.referrer_code:
+        referrer = (
+            db.query(User)
+            .filter(User.username == payload.referrer_code)
+            .first()
+        )
+        if referrer and referrer.id != user.id:
+            try:
+                record_progress_event(
+                    user=referrer,
+                    db=db,
+                    event_type="referral_reward",
+                    title="Реферал",
+                    description=f"{user.username or user.email} зарегистрировался по твоей ссылке",
+                    points_delta=200,
+                    rating_delta=0,
+                )
+            except Exception as e:
+                print(f"[referral] reward failed for {referrer.id}: {e}")
+
     db.commit()
     db.refresh(user)
 
