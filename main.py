@@ -170,6 +170,7 @@ from app.schemas import (
     TelegramLinkStatusOut,
     AccountDeleteOut,
     MasterAvatarUploadIn,
+    LoungeImageUploadIn,
     TobaccoFlavorOut,
     TobaccoFlavorListOut,
     TobaccoMixTemplateIngredientOut,
@@ -2325,6 +2326,152 @@ def update_lounge_assets(
     db.commit()
     db.refresh(assets)
     return _parse_lounge_assets(assets, brand_id)
+
+
+# ── Lounge cover / avatar image upload (owner-only) ──────────────────────
+# Pattern mirrors POST /me/master/avatar: iOS sends base64 JSON, we decode
+# via Pillow, resize, save to /app/static/lounges/, then upsert the URL into
+# lounge_assets.cover_url (or .avatar_url). LoungeAssetsOut is returned so the
+# client can refresh its cache in a single round-trip.
+
+import base64 as _b64_for_lounge
+
+_LOUNGE_IMG_MAX_BYTES = 8 * 1024 * 1024  # 8 MB — covers are larger than avatars
+_LOUNGE_COVER_SIZE = (1200, 675)         # 16:9 hero
+_LOUNGE_AVATAR_SIZE = (400, 400)         # square logo
+
+
+def _save_lounge_image(
+    brand_id: str,
+    raw: bytes,
+    target_size: tuple[int, int],
+    file_suffix: str,
+    crop_mode: str,
+) -> str:
+    """Decode raw bytes, center-crop+resize to `target_size`, save as JPEG.
+    `crop_mode` is "cover" (16:9 cover) or "square" (avatar). Returns a public
+    URL like /static/lounges/<brand>_cover.jpg (relative — iOS resolves via
+    BackendEnvironment.baseURL)."""
+    if len(raw) > _LOUNGE_IMG_MAX_BYTES:
+        raise HTTPException(413, "Image too large (max 8 MB)")
+    try:
+        from PIL import Image  # type: ignore
+        from io import BytesIO
+    except Exception as e:
+        # Pillow is required — covers must be normalised so the UI doesn't
+        # show stretched 4:3 photos in a 16:9 frame.
+        raise HTTPException(500, f"Image processing unavailable: {e}")
+
+    try:
+        img = Image.open(BytesIO(raw))
+        img.load()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot decode image: {e}")
+
+    # Center-crop to the target aspect ratio, then resize. This keeps faces /
+    # signage centered and avoids the "крекий" stretched look.
+    tw, th = target_size
+    target_ratio = tw / th
+    sw, sh = img.size
+    src_ratio = sw / sh
+    if src_ratio > target_ratio:
+        # Source is wider — crop the sides.
+        new_w = int(sh * target_ratio)
+        x0 = (sw - new_w) // 2
+        img = img.crop((x0, 0, x0 + new_w, sh))
+    elif src_ratio < target_ratio:
+        # Source is taller — crop top/bottom.
+        new_h = int(sw / target_ratio)
+        y0 = (sh - new_h) // 2
+        img = img.crop((0, y0, sw, y0 + new_h))
+
+    img = img.resize(target_size, Image.LANCZOS)
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    folder = os.path.join(_STATIC_ROOT, "lounges")
+    os.makedirs(folder, exist_ok=True)
+    # Safe filename — brand_id is owner-controlled but used as a path segment,
+    # so strip anything that isn't alnum/dash/underscore.
+    safe_brand = "".join(ch for ch in brand_id if ch.isalnum() or ch in ("-", "_"))
+    if not safe_brand:
+        raise HTTPException(400, "Invalid brand_id")
+    fname = f"{safe_brand}_{file_suffix}.jpg"
+    fpath = os.path.join(folder, fname)
+
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    with open(fpath, "wb") as f:
+        f.write(buf.getvalue())
+
+    # Append a cache-buster so iOS AsyncImage picks up the new file even when
+    # the URL string is identical to the previous upload.
+    ts = int(datetime.utcnow().timestamp())
+    return f"/static/lounges/{fname}?v={ts}"
+
+
+def _upload_lounge_image(
+    brand_id: str,
+    payload: LoungeImageUploadIn,
+    field: str,                # "cover_url" or "avatar_url"
+    target_size: tuple[int, int],
+    file_suffix: str,           # "cover" or "avatar"
+    user: User,
+    db: Session,
+) -> LoungeAssetsOut:
+    """Shared handler for cover + avatar uploads. Auth + DB upsert + response."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    b64 = payload.payload_b64
+    if not b64:
+        raise HTTPException(400, "image_base64 (or data_base64) is required")
+    try:
+        raw = _b64_for_lounge.b64decode(b64, validate=False)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 payload")
+
+    url = _save_lounge_image(brand_id, raw, target_size, file_suffix, "cover")
+
+    assets = db.query(LoungeAssets).filter(LoungeAssets.brand_id == brand_id).first()
+    if assets is None:
+        assets = LoungeAssets(brand_id=brand_id, photo_urls="[]", info_json="{}")
+        db.add(assets)
+    setattr(assets, field, url)
+    assets.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(assets)
+    return _parse_lounge_assets(assets, brand_id)
+
+
+@app.post("/lounges/{brand_id}/cover", response_model=LoungeAssetsOut)
+def upload_lounge_cover(
+    brand_id: str,
+    payload: LoungeImageUploadIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Upload a lounge cover photo. Owner / admin only. Image is center-cropped
+    to 16:9 (1200×675) JPEG. Returns the updated LoungeAssetsOut so iOS can
+    refresh `LoungeAssetsStore` in one round-trip."""
+    return _upload_lounge_image(
+        brand_id, payload, "cover_url", _LOUNGE_COVER_SIZE, "cover", user, db
+    )
+
+
+@app.post("/lounges/{brand_id}/avatar", response_model=LoungeAssetsOut)
+def upload_lounge_avatar(
+    brand_id: str,
+    payload: LoungeImageUploadIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Upload a lounge logo / avatar. Owner / admin only. Image is square-
+    cropped to 400×400 JPEG."""
+    return _upload_lounge_image(
+        brand_id, payload, "avatar_url", _LOUNGE_AVATAR_SIZE, "avatar", user, db
+    )
 
 
 @app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)

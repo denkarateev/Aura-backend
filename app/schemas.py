@@ -850,6 +850,24 @@ class MasterAvatarUploadIn(BaseModel):
     data_base64: str
 
 
+# MARK: - Lounge cover / avatar upload (owner-only)
+
+class LoungeImageUploadIn(BaseModel):
+    """Payload for POST /lounges/{brand_id}/cover and /avatar.
+    iOS posts a base64-encoded JPEG/PNG; backend decodes via Pillow, resizes,
+    and stores under /app/static/lounges/."""
+    file_name: Optional[str] = "lounge.jpg"
+    mime_type: Optional[str] = "image/jpeg"
+    # Accept both `image_base64` (per spec) and `data_base64` (matches the
+    # master-avatar contract) so the iOS team can pick whichever they prefer.
+    image_base64: Optional[str] = None
+    data_base64: Optional[str] = None
+
+    @property
+    def payload_b64(self) -> Optional[str]:
+        return self.image_base64 or self.data_base64
+
+
 # MARK: - Tobacco flavors catalog
 
 class TobaccoFlavorOut(BaseModel):
