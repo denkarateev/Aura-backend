@@ -58,6 +58,7 @@ from app.models import (
     LoungeSubscription,
     DeviceToken,
     LoungeLedgerEntry,
+    LoungeLoyaltyProgram,
     LoungeProgram,
     ManagerTelegramLink,
     Master,
@@ -179,6 +180,8 @@ from app.schemas import (
     TobaccoMixTemplateListOut,
     LoungeSubscriptionIn,
     LoungeSubscriptionDTO,
+    LoungeLoyaltyProgramIn,
+    LoungeLoyaltyProgramOut,
 )
 
 # -------------------------------------------------------------------
@@ -1955,6 +1958,35 @@ def startup():
                 """
             )
 
+    # MARK: lounge_loyalty_programs — per-venue configurable loyalty (2026-05-25)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_loyalty_programs (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL UNIQUE,
+                    mode VARCHAR(32) NOT NULL DEFAULT 'percent_of_bill',
+                    bill_percent INTEGER NOT NULL DEFAULT 5,
+                    first_visit_bonus INTEGER NOT NULL DEFAULT 0,
+                    per_visit_bonus INTEGER NOT NULL DEFAULT 0,
+                    referral_bonus INTEGER NOT NULL DEFAULT 0,
+                    birthday_multiplier INTEGER NOT NULL DEFAULT 2,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            # Seed для secret_yauza — сохраняем исторические fixed-правила
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_loyalty_programs
+                    (brand_id, mode, first_visit_bonus, per_visit_bonus,
+                     referral_bonus, birthday_multiplier, bill_percent)
+                VALUES ('secret_yauza', 'fixed', 1000, 50, 200, 2, 0)
+                ON CONFLICT (brand_id) DO NOTHING
+                """
+            )
+
     # MARK: APScheduler — weekly + monthly medal grant.
     # We start a per-worker BackgroundScheduler. With multiple gunicorn
     # workers the unique constraint on user_medals guarantees idempotency:
@@ -2221,10 +2253,11 @@ def create_event(
     # Per-topic фильтрацию (topic_events) backend применит в следующей итерации
     # когда iOS начнёт синхронизировать настройки через PUT /lounges/{id}/subscription.
     try:
-        from app.push import send_push_to_user
+        import asyncio as _asyncio
+        from app.push import send_push_fanout_async
         guest_ids = db.query(LoungeGuestLoyalty.user_id).filter(
             LoungeGuestLoyalty.brand_id == event.lounge_id
-        ).distinct().limit(500).all() if event.lounge_id else []
+        ).distinct().limit(5000).all() if event.lounge_id else []
         title = "Новый эвент"
         body = f"{event.title} — {event.starts_at.strftime('%d.%m %H:%M')}"
         push_payload = {
@@ -2232,9 +2265,9 @@ def create_event(
             "event_id": event.id,
             "lounge_id": event.lounge_id or "",
         }
-        for (uid,) in guest_ids:
-            if uid != current_user.id:
-                send_push_to_user(db, uid, title, body, payload=push_payload)
+        uid_list = [uid for (uid,) in guest_ids if uid != current_user.id]
+        if uid_list:
+            _asyncio.run(send_push_fanout_async(db, uid_list, title, body, payload=push_payload))
     except Exception as e:
         print(f"[push] event-create notify failed: {e}")
 
@@ -2349,6 +2382,126 @@ def update_lounge_program(
     db.commit()
     db.refresh(program)
     return lounge_program_to_out(program, brand_id)
+
+
+# -------------------------------------------------------------------
+# LOUNGE LOYALTY PROGRAM  (per-venue configurable, 2026-05-25)
+# -------------------------------------------------------------------
+
+_LOYALTY_DEFAULTS = dict(
+    mode="percent_of_bill",
+    bill_percent=5,
+    first_visit_bonus=0,
+    per_visit_bonus=0,
+    referral_bonus=0,
+    birthday_multiplier=2,
+)
+
+
+def _loyalty_row_to_out(row: "LoungeLoyaltyProgram") -> LoungeLoyaltyProgramOut:
+    return LoungeLoyaltyProgramOut(
+        brand_id=row.brand_id,
+        mode=row.mode,
+        bill_percent=row.bill_percent,
+        first_visit_bonus=row.first_visit_bonus,
+        per_visit_bonus=row.per_visit_bonus,
+        referral_bonus=row.referral_bonus,
+        birthday_multiplier=row.birthday_multiplier,
+    )
+
+
+@app.get("/lounges/{brand_id}/loyalty", response_model=LoungeLoyaltyProgramOut)
+def get_lounge_loyalty(brand_id: str, db: Session = Depends(get_db)):
+    """
+    Public — no auth required.
+    Returns the per-venue loyalty config. If no row exists, returns defaults
+    without writing to the DB (lazy initialisation).
+    """
+    row = db.query(LoungeLoyaltyProgram).filter(
+        LoungeLoyaltyProgram.brand_id == brand_id
+    ).first()
+    if row is None:
+        return LoungeLoyaltyProgramOut(brand_id=brand_id, **_LOYALTY_DEFAULTS)
+    return _loyalty_row_to_out(row)
+
+
+@app.put("/lounges/{brand_id}/loyalty", response_model=LoungeLoyaltyProgramOut)
+def update_lounge_loyalty(
+    brand_id: str,
+    payload: LoungeLoyaltyProgramIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Owner-only upsert for the per-venue loyalty config.
+    Access: brand manager (can_manage_brand) or admin.
+    Validates mode, bill_percent (0-100), bonuses (>=0), birthday_multiplier (1-10).
+    """
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Only the lounge owner can edit loyalty settings")
+
+    if payload.mode not in ("percent_of_bill", "fixed"):
+        raise HTTPException(422, "mode must be 'percent_of_bill' or 'fixed'")
+    if payload.bill_percent is not None and not (0 <= payload.bill_percent <= 100):
+        raise HTTPException(422, "bill_percent must be 0-100")
+    for field_name, val in [
+        ("first_visit_bonus", payload.first_visit_bonus),
+        ("per_visit_bonus", payload.per_visit_bonus),
+        ("referral_bonus", payload.referral_bonus),
+    ]:
+        if val is not None and val < 0:
+            raise HTTPException(422, f"{field_name} must be >= 0")
+    if payload.birthday_multiplier is not None and not (1 <= payload.birthday_multiplier <= 10):
+        raise HTTPException(422, "birthday_multiplier must be 1-10")
+
+    row = db.query(LoungeLoyaltyProgram).filter(
+        LoungeLoyaltyProgram.brand_id == brand_id
+    ).first()
+    if row is None:
+        row = LoungeLoyaltyProgram(brand_id=brand_id, **_LOYALTY_DEFAULTS)
+        db.add(row)
+
+    row.mode = payload.mode
+    if payload.bill_percent is not None:
+        row.bill_percent = payload.bill_percent
+    if payload.first_visit_bonus is not None:
+        row.first_visit_bonus = payload.first_visit_bonus
+    if payload.per_visit_bonus is not None:
+        row.per_visit_bonus = payload.per_visit_bonus
+    if payload.referral_bonus is not None:
+        row.referral_bonus = payload.referral_bonus
+    if payload.birthday_multiplier is not None:
+        row.birthday_multiplier = payload.birthday_multiplier
+
+    db.commit()
+    db.refresh(row)
+    return _loyalty_row_to_out(row)
+
+
+@app.get("/lounges/loyalty/batch", response_model=List[LoungeLoyaltyProgramOut])
+def get_lounge_loyalty_batch(
+    ids: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Public — no auth required.
+    Batch fetch for multiple brand IDs (comma-separated).
+    Returns list; missing brands get default values.
+    Usage: GET /lounges/loyalty/batch?ids=secret_yauza,garden_lounge_korolev
+    """
+    brand_ids = [b.strip() for b in ids.split(",") if b.strip()][:50]
+    rows = db.query(LoungeLoyaltyProgram).filter(
+        LoungeLoyaltyProgram.brand_id.in_(brand_ids)
+    ).all()
+    row_map = {r.brand_id: _loyalty_row_to_out(r) for r in rows}
+    result = []
+    for bid in brand_ids:
+        if bid in row_map:
+            result.append(row_map[bid])
+        else:
+            result.append(LoungeLoyaltyProgramOut(brand_id=bid, **_LOYALTY_DEFAULTS))
+    return result
 
 
 # -------------------------------------------------------------------
@@ -3403,11 +3556,12 @@ def create_mix(
     # to a lounge and published. Draft mixes skip the push.
     if mix.lounge_id and mix.status != "draft":
         try:
-            from app.push import send_push_to_user
+            import asyncio as _asyncio
+            from app.push import send_push_fanout_async
             subs = db.query(LoungeSubscription).filter(
                 LoungeSubscription.brand_id == mix.lounge_id,
                 LoungeSubscription.topic_new_mix == True,  # noqa: E712
-            ).limit(2000).all()
+            ).limit(5000).all()
             push_title = "Новый микс"
             push_body = f"{mix.name}"
             push_payload = {
@@ -3416,9 +3570,9 @@ def create_mix(
                 "author_id": user.id,
                 "lounge_id": mix.lounge_id,
             }
-            for s in subs:
-                if s.user_id != user.id:
-                    send_push_to_user(db, s.user_id, push_title, push_body, payload=push_payload)
+            uid_list = [s.user_id for s in subs if s.user_id != user.id]
+            if uid_list:
+                _asyncio.run(send_push_fanout_async(db, uid_list, push_title, push_body, payload=push_payload))
         except Exception as _e:
             print(f"[push] mix-create notify failed: {_e}")
 

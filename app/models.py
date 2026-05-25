@@ -693,6 +693,27 @@ class LoungeSubscription(Base):
     __table_args__ = (UniqueConstraint("user_id", "brand_id", name="uq_user_brand_sub"),)
 
 
+class LoungeLoyaltyProgram(Base):
+    """
+    Per-venue loyalty config. One row per brand_id (slug). Created lazily —
+    GET /lounges/{id}/loyalty returns defaults if no row exists, so backfill
+    is not required.
+
+    mode='percent_of_bill' → bill_percent of every receipt enters wallet
+    mode='fixed' → flat bonuses for first/repeat visits + referral/birthday
+    """
+    __tablename__ = "lounge_loyalty_programs"
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, unique=True, index=True)
+    mode = Column(String(32), nullable=False, default="percent_of_bill")
+    bill_percent = Column(Integer, nullable=False, default=5)
+    first_visit_bonus = Column(Integer, nullable=False, default=0)
+    per_visit_bonus = Column(Integer, nullable=False, default=0)
+    referral_bonus = Column(Integer, nullable=False, default=0)
+    birthday_multiplier = Column(Integer, nullable=False, default=2)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class MasterShift(Base):
     """
     Расписание смены мастера. Мастер указывает когда он работает в каком зале —

@@ -863,6 +863,30 @@ class LoungeSubscriptionDTO(BaseModel):
         from_attributes = True
 
 
+# MARK: - Per-venue loyalty program (configurable by lounge owner)
+
+class LoungeLoyaltyProgramOut(BaseModel):
+    brand_id: str
+    mode: str               # "percent_of_bill" | "fixed"
+    bill_percent: int = 5
+    first_visit_bonus: int = 0
+    per_visit_bonus: int = 0
+    referral_bonus: int = 0
+    birthday_multiplier: int = 2
+
+    class Config:
+        from_attributes = True
+
+
+class LoungeLoyaltyProgramIn(BaseModel):
+    mode: str               # required, "percent_of_bill" | "fixed"
+    bill_percent: Optional[int] = None       # 0-100
+    first_visit_bonus: Optional[int] = None  # >=0
+    per_visit_bonus: Optional[int] = None    # >=0
+    referral_bonus: Optional[int] = None     # >=0
+    birthday_multiplier: Optional[int] = None  # 1-10
+
+
 # MARK: - Account deletion (App Store 5.1.1(v))
 
 class AccountDeleteOut(BaseModel):
