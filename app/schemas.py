@@ -193,9 +193,12 @@ class UserOut(BaseModel):
 
 
 class SignupRequest(BaseModel):
-    email: EmailStr
+    # email теперь str (а не EmailStr) — позволяет iOS показать
+    # человеческий «введи валидный email» через нашу backend-валидацию,
+    # а не неинформативный 422 от pydantic. Backend сам проверяет формат.
+    email: str
     password: str
-    username: Optional[str]
+    username: Optional[str] = None  # default добавлен — раньше Optional без = None требовал поле
     display_name: Optional[str] = None
     phone: Optional[str] = None
     referrer_code: Optional[str] = None  # ON-8: referral reward (200 угольков приглашающему)
