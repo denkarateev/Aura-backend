@@ -13,6 +13,9 @@ from collections import defaultdict
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, text as sa_text
@@ -1497,6 +1500,13 @@ def build_monthly_flavor(db: Session) -> MonthlyFlavorOut:
 # -------------------------------------------------------------------
 app = FastAPI(title="HookahMix API")
 
+# -------------------------------------------------------------------
+# RATE LIMITING (slowapi)
+# -------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute", "30/second"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # MARK: Static files — uploads (avatars, attachments) live here. The
 # /static directory is created lazily on first upload so this mount is
 # always safe even on a fresh container.
@@ -2200,7 +2210,9 @@ def search_users(
 # EVENTS / PROMOS
 # -------------------------------------------------------------------
 @app.get("/events", response_model=List[EventOut])
+@limiter.limit("30/minute")
 def list_events(
+    request: Request,
     lounge_id: Optional[str] = Query(None),
     user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -2414,7 +2426,8 @@ def _loyalty_row_to_out(row: "LoungeLoyaltyProgram") -> LoungeLoyaltyProgramOut:
 
 
 @app.get("/lounges/{brand_id}/loyalty", response_model=LoungeLoyaltyProgramOut)
-def get_lounge_loyalty(brand_id: str, db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def get_lounge_loyalty(request: Request, brand_id: str, db: Session = Depends(get_db)):
     """
     Public — no auth required.
     Returns the per-venue loyalty config. If no row exists, returns defaults
@@ -2736,7 +2749,9 @@ def upload_lounge_avatar(
 
 
 @app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)
+@limiter.limit("60/minute")
 def get_my_lounge_loyalty(
+    request: Request,
     brand_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -6134,7 +6149,9 @@ def list_tobacco_flavors(
 # category filter: 'tobacco' | 'liquid'
 
 @app.get("/tobacco/brands", response_model=TobaccoBrandListOut)
+@limiter.limit("60/minute")
 def list_tobacco_brands(
+    request: Request,
     category: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -6158,7 +6175,9 @@ def list_tobacco_brands(
 
 
 @app.get("/tobacco/brands/{brand_name}/flavors", response_model=TobaccoBrandFlavorsOut)
+@limiter.limit("60/minute")
 def list_brand_flavors(
+    request: Request,
     brand_name: str,
     db: Session = Depends(get_db),
 ):
@@ -6190,7 +6209,9 @@ def list_brand_flavors(
 # tobacco_mix_template_ingredients.
 
 @app.get("/mix-templates", response_model=TobaccoMixTemplateListOut)
+@limiter.limit("60/minute")
 def list_tobacco_mix_templates(
+    request: Request,
     brand: Optional[str] = Query(None),
     mood: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
