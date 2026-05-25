@@ -6194,11 +6194,18 @@ def list_tobacco_mix_templates(
     brand: Optional[str] = Query(None),
     mood: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),  # community | scraped | etc.
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Paginated list of tobacco mix templates with full ingredients."""
+    """Paginated list of tobacco mix templates with full ingredients.
+
+    Use `source=community` to get only curated community presets seeded
+    via seed_mix_templates_2026_05_25.py (12 entries) — these are what the
+    wizard «Из шаблона» step shows. Without filter you get every template
+    including scraped/imported ones (~400 rows).
+    """
     where = ["TRUE"]
     params: dict = {"limit": limit, "offset": offset}
     if brand:
@@ -6210,6 +6217,9 @@ def list_tobacco_mix_templates(
     if search:
         where.append("name ILIKE :search")
         params["search"] = f"%{search}%"
+    if source:
+        where.append("source = :source")
+        params["source"] = source
     clause = " AND ".join(where)
     total_row = db.execute(
         sa_text(f"SELECT COUNT(*) FROM tobacco_mix_templates WHERE {clause}"),
