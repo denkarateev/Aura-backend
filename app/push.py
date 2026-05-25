@@ -13,15 +13,28 @@ Env vars (loaded once on import):
 Token caching: JWT is valid 60 minutes (Apple's hard limit). We refresh
 every 50 minutes proactively so a request never sees an expired token.
 
+Async design:
+- A single httpx.AsyncClient (HTTP/2) is reused across all pushes — one
+  TCP/TLS connection to APNs, multiplexed via HTTP/2 streams.
+- send_push_async()          — single device, async
+- send_push()                — sync wrapper (asyncio.run) for legacy callers
+- send_push_to_user_async()  — fan-out to all tokens of one user, async
+- send_push_to_user()        — sync wrapper for per-user fan-out
+- send_push_fanout_async()   — fan-out to a list of user_ids via gather, async
+
 Usage:
-    from app.push import send_push
+    from app.push import send_push, send_push_to_user, send_push_fanout_async
+    # legacy sync
     send_push(device_token="...", title="Новый микс", body="...")
+    # batch async (call from asyncio.run(...))
+    count = await send_push_fanout_async(db, [uid1, uid2, ...], "Title", "Body")
 """
 
-import os
+import asyncio
 import json
-import time
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -42,8 +55,24 @@ APNS_HOST = (
     else "https://api.sandbox.push.apple.com"
 )
 
-_jwt_cache = {"token": None, "issued_at": 0}
+_jwt_cache: dict = {"token": None, "issued_at": 0}
 
+# ---------------------------------------------------------------------------
+# Persistent async HTTP/2 client — reused across all push calls in process.
+# ---------------------------------------------------------------------------
+_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(http2=True, timeout=10.0)
+    return _client
+
+
+# ---------------------------------------------------------------------------
+# JWT helpers (unchanged — sync, cheap)
+# ---------------------------------------------------------------------------
 
 def _is_configured() -> bool:
     return bool(APNS_KEY_ID and APNS_TEAM_ID and APNS_BUNDLE_ID and Path(APNS_KEY_PATH).exists())
@@ -82,6 +111,71 @@ def _get_jwt() -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Core async send — one device token
+# ---------------------------------------------------------------------------
+
+async def send_push_async(
+    device_token: str,
+    title: str,
+    body: str,
+    *,
+    badge: Optional[int] = None,
+    sound: str = "default",
+    category: Optional[str] = None,
+    payload: Optional[dict] = None,
+    priority: int = 10,
+    apns_topic: Optional[str] = None,
+) -> bool:
+    """Send APNs push to a single device token. Never raises — returns False on error."""
+    if not _is_configured():
+        logger.warning("APNs not configured; skipping push to %s", device_token[:12])
+        return False
+    token = _get_jwt()
+    if not token:
+        return False
+
+    aps_body: dict = {
+        "aps": {
+            "alert": {"title": title, "body": body},
+            "sound": sound,
+        }
+    }
+    if badge is not None:
+        aps_body["aps"]["badge"] = badge
+    if category:
+        aps_body["aps"]["category"] = category
+    if payload:
+        # Custom keys go alongside "aps", not inside.
+        aps_body.update(payload)
+
+    headers = {
+        "authorization": f"bearer {token}",
+        "apns-topic": apns_topic or APNS_BUNDLE_ID,
+        "apns-priority": str(priority),
+        "apns-push-type": "alert",
+    }
+    url = f"{APNS_HOST}/3/device/{device_token}"
+
+    try:
+        client = _get_client()
+        resp = await client.post(url, headers=headers, content=json.dumps(aps_body))
+        if resp.status_code == 200:
+            return True
+        logger.warning(
+            "APNs %s for %s: %s",
+            resp.status_code, device_token[:12], resp.text[:200],
+        )
+        return False
+    except Exception as e:
+        logger.error("APNs request failed for %s: %s", device_token[:12], e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Sync wrapper — legacy callers (single push)
+# ---------------------------------------------------------------------------
+
 def send_push(
     device_token: str,
     title: str,
@@ -94,67 +188,72 @@ def send_push(
     priority: int = 10,
     apns_topic: Optional[str] = None,
 ) -> bool:
-    """Single-device APNs push via HTTP/2.
-
-    Returns True on success (apns-id received), False otherwise. Never raises —
-    logs and returns False so caller's logic (e.g. fan-out across followers)
-    keeps going on a single failure.
-    """
-    if not _is_configured():
-        logger.warning("APNs not configured; skipping push to %s", device_token[:12])
-        return False
-    token = _get_jwt()
-    if not token:
-        return False
-
-    aps_body = {
-        "aps": {
-            "alert": {"title": title, "body": body},
-            "sound": sound,
-        }
-    }
-    if badge is not None:
-        aps_body["aps"]["badge"] = badge
-    if category:
-        aps_body["aps"]["category"] = category
-    if payload:
-        # Custom keys go alongside the "aps" key, not inside.
-        aps_body.update(payload)
-
-    headers = {
-        "authorization": f"bearer {token}",
-        "apns-topic": apns_topic or APNS_BUNDLE_ID,
-        "apns-priority": str(priority),
-        "apns-push-type": "alert",
-    }
-
-    url = f"{APNS_HOST}/3/device/{device_token}"
-
-    try:
-        with httpx.Client(http2=True, timeout=10.0) as client:
-            resp = client.post(url, headers=headers, content=json.dumps(aps_body))
-        if resp.status_code == 200:
-            return True
-        logger.warning(
-            "APNs %s for %s: %s",
-            resp.status_code, device_token[:12], resp.text[:200],
+    """Sync wrapper for legacy callers. For batch use send_push_fanout_async."""
+    return asyncio.run(
+        send_push_async(
+            device_token, title, body,
+            badge=badge, sound=sound, category=category,
+            payload=payload, priority=priority, apns_topic=apns_topic,
         )
-        return False
-    except Exception as e:
-        logger.error("APNs request failed: %s", e)
-        return False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fan-out: all tokens of one user
+# ---------------------------------------------------------------------------
+
+async def send_push_to_user_async(
+    db,
+    user_id: int,
+    title: str,
+    body: str,
+    **kwargs,
+) -> int:
+    """Send push to every device token belonging to user_id. Returns success count."""
+    from app.models import DeviceToken  # local import to avoid cycle on cold start
+
+    rows = db.query(DeviceToken).filter(DeviceToken.user_id == user_id).all()
+    if not rows:
+        return 0
+    tasks = [send_push_async(r.token, title, body, **kwargs) for r in rows]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return sum(1 for r in results if r is True)
 
 
 def send_push_to_user(db, user_id: int, title: str, body: str, **kwargs) -> int:
-    """Fanout: looks up all device_tokens for `user_id` and sends to each.
+    """Sync wrapper — fan-out to all tokens of one user."""
+    return asyncio.run(send_push_to_user_async(db, user_id, title, body, **kwargs))
 
-    Returns count of successful deliveries. Cleans up token rows that APNs
-    explicitly rejects with 410 Unregistered (TODO when we wire response).
+
+# ---------------------------------------------------------------------------
+# Fan-out: list of user_ids — single asyncio.gather across ALL tokens
+# ---------------------------------------------------------------------------
+
+async def send_push_fanout_async(
+    db,
+    user_ids: list,
+    title: str,
+    body: str,
+    **kwargs,
+) -> int:
+    """Fan-out push to all device tokens for a list of user_ids.
+
+    Fires all HTTP/2 requests concurrently via asyncio.gather — single
+    persistent connection to APNs, multiplexed streams.
+    Returns total success count.
     """
-    from app.models import DeviceToken  # local import to avoid cycle on cold start
-    sent = 0
-    rows = db.query(DeviceToken).filter(DeviceToken.user_id == user_id).all()
-    for row in rows:
-        if send_push(row.token, title, body, **kwargs):
-            sent += 1
-    return sent
+    from app.models import DeviceToken  # local import to avoid cycle
+
+    if not user_ids:
+        return 0
+    rows = (
+        db.query(DeviceToken)
+        .filter(DeviceToken.user_id.in_(user_ids))
+        .limit(5000)
+        .all()
+    )
+    if not rows:
+        return 0
+    tasks = [send_push_async(r.token, title, body, **kwargs) for r in rows]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return sum(1 for r in results if r is True)

@@ -2877,9 +2877,16 @@ def register_lounge_checkin(
         db.add(loyalty)
         db.flush()
 
-    today = datetime.utcnow().date()
-    # Unlimited visits for dorfden (user_id=1)
+    now_utc = datetime.utcnow()
+    today = now_utc.date()
+    # 4-hour cooldown between checkins per guest per venue (unlimited for dorfden user_id=1)
     is_unlimited_user = (guest_user.id == 1)
+    if loyalty.last_visit_at and not is_unlimited_user:
+        hours_since = (now_utc - loyalty.last_visit_at).total_seconds() / 3600
+        if hours_since < 4:
+            mins_left = int((4 - hours_since) * 60)
+            raise HTTPException(429, f"Подожди 4 часа между чек-инами. Осталось {mins_left} мин.")
+    # Legacy per-day limit (kept for safety, but 4h cooldown makes it redundant)
     if loyalty.last_visit_at and loyalty.last_visit_at.date() == today and not is_unlimited_user:
         cnt = loyalty.today_visit_count or 0
         if cnt >= 3:
@@ -2888,9 +2895,12 @@ def register_lounge_checkin(
     else:
         loyalty.today_visit_count = (loyalty.today_visit_count or 0) + 1 if (loyalty.last_visit_at and loyalty.last_visit_at.date() == today) else 1
 
+    # Determine first-visit status before incrementing
+    is_first_visit = (loyalty.visit_count == 0)
+
     previous_tier = lounge_tier_for_visits(loyalty.visit_count)
     loyalty.visit_count += 1
-    loyalty.last_visit_at = datetime.utcnow()
+    loyalty.last_visit_at = now_utc
 
     personalization = db.query(LoungeGuestPersonalization).filter(
         LoungeGuestPersonalization.brand_id == brand_id,
@@ -2898,6 +2908,38 @@ def register_lounge_checkin(
     ).first()
     program = get_lounge_program(brand_id, db)
     program_out = lounge_program_to_out(program, brand_id)
+
+    # --- Bonus accrual via LoungeLoyaltyProgram ---
+    loyalty_prog = db.query(LoungeLoyaltyProgram).filter(
+        LoungeLoyaltyProgram.brand_id == brand_id
+    ).first()
+    lp_mode = loyalty_prog.mode if loyalty_prog else "percent_of_bill"
+    lp_bill_percent = loyalty_prog.bill_percent if loyalty_prog else 5
+    lp_first_bonus = loyalty_prog.first_visit_bonus if loyalty_prog else 0
+    lp_per_bonus = loyalty_prog.per_visit_bonus if loyalty_prog else 0
+
+    if lp_mode == "fixed":
+        checkin_bonus = lp_first_bonus if is_first_visit else lp_per_bonus
+    elif lp_mode == "percent_of_bill":
+        if not payload.bill_amount or payload.bill_amount <= 0:
+            raise HTTPException(400, "Сумма чека обязательна для этого заведения")
+        checkin_bonus = int(payload.bill_amount * lp_bill_percent / 100)
+    else:
+        checkin_bonus = 0
+
+    if checkin_bonus > 0:
+        record_progress_event(
+            user=guest_user,
+            db=db,
+            event_type="lounge_checkin_bonus",
+            title=f"Бонусы за визит в {display_title_from_brand_id(brand_id)}",
+            description=f"+{checkin_bonus} угольков за {'первый визит' if is_first_visit else 'визит'}" + (
+                f" (чек {int(payload.bill_amount)} ₽)" if lp_mode == "percent_of_bill" and payload.bill_amount else ""
+            ),
+            points_delta=checkin_bonus,
+            rating_delta=0,
+        )
+    # --- end bonus accrual ---
     if not personalization:
         personalization = LoungeGuestPersonalization(
             brand_id=brand_id,
@@ -2946,6 +2988,9 @@ def register_lounge_checkin(
         is_level_up=is_level_up,
         message=message,
         bundle_redeemed=bundle_redeemed_out,
+        bonus=checkin_bonus,
+        is_first_visit=is_first_visit,
+        mode=lp_mode,
     )
 
 
