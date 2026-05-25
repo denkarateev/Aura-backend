@@ -365,6 +365,7 @@ class LoungeCheckinIn(BaseModel):
     username: Optional[str] = None
     display_name: Optional[str] = None
     master_id: Optional[str] = None
+    bill_amount: Optional[float] = None  # rubles — required only for percent_of_bill mode
 
 
 class BundleRedemptionOut(BaseModel):
@@ -383,6 +384,9 @@ class LoungeCheckinOut(BaseModel):
     is_level_up: bool
     message: str
     bundle_redeemed: Optional[BundleRedemptionOut] = None
+    bonus: int = 0              # points accrued this checkin
+    is_first_visit: bool = False
+    mode: str = "percent_of_bill"  # loyalty program mode used
 
 
 class BundleRecentVisitOut(BaseModel):
