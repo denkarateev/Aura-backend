@@ -2219,6 +2219,23 @@ def startup():
                 """
             )
 
+    # MARK: Hot-path FK indexes (perf audit 2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            for _ix_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_mixes_author_id ON mixes(author_id)",
+                "CREATE INDEX IF NOT EXISTS ix_mix_ingredients_mix_id ON mix_ingredients(mix_id)",
+                "CREATE INDEX IF NOT EXISTS ix_comments_mix_id ON comments(mix_id)",
+                "CREATE INDEX IF NOT EXISTS ix_comments_user_id ON comments(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_monthly_votes_mix_id ON monthly_votes(mix_id)",
+                "CREATE INDEX IF NOT EXISTS ix_monthly_votes_user_id ON monthly_votes(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_user_activities_user_id ON user_activities(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_bowl_heat_runs_user_id ON bowl_heat_runs(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_user_follows_follower_id ON user_follows(follower_id)",
+                "CREATE INDEX IF NOT EXISTS ix_user_follows_following_id ON user_follows(following_id)",
+            ):
+                conn.exec_driver_sql(_ix_sql)
+
     # MARK: APScheduler — weekly + monthly medal grant.
     # We start a per-worker BackgroundScheduler. With multiple gunicorn
     # workers the unique constraint on user_medals guarantees idempotency:
