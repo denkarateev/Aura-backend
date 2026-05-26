@@ -9,6 +9,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -861,3 +862,25 @@ class LoungePromotedSlot(Base):
     ends_at = Column(DateTime(timezone=True), nullable=False)
     region = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# MARK: - Admin CRM meta for lounges (2026-05-26)
+
+class LoungeAdminMeta(Base):
+    """
+    Admin-managed tier and badges for a lounge brand.
+    One row per brand_id. Created lazily via PATCH endpoint.
+
+    tier   — start | lite | pro | network | partner
+    badges — JSON list: ["verified", "featured", "mix_partner", "exclusive", "top_rated"]
+    notes  — internal admin note, never exposed to public endpoints
+    """
+    __tablename__ = "lounge_admin_meta"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, unique=True, index=True)
+    tier = Column(String(32), nullable=False, default="start", server_default="start")
+    badges = Column(JSON, nullable=False, default=list, server_default="[]")
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

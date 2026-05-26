@@ -60,6 +60,7 @@ from app.models import (
     Event,
     EventRSVP,
     Favorite,
+    LoungeAdminMeta,
     LoungeAssets,
     LoungeBundle,
     LoungeBundleVisit,
@@ -226,6 +227,12 @@ from app.schemas import (
     BrandAnalyticsOut,
     LoungeMyBonusItemOut,
     LoungeMyBonusesOut,
+    LoungeAdminMetaOut,
+    LoungeAdminMetaIn,
+    LoungeAdminListItemOut,
+    LoungePublicMetaOut,
+    VALID_LOUNGE_TIERS,
+    VALID_LOUNGE_BADGES,
 )
 
 # -------------------------------------------------------------------
@@ -365,6 +372,17 @@ def _decode_mix_tags(raw: Optional[str]) -> List[str]:
     return [str(item) for item in decoded if item is not None]
 
 
+def is_mix_partner(brand_id: Optional[str], db: Session) -> bool:
+    """Return True when the lounge brand has the 'mix_partner' badge in lounge_admin_meta."""
+    if not brand_id:
+        return False
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if not meta:
+        return False
+    badges = meta.badges if isinstance(meta.badges, list) else []
+    return "mix_partner" in badges
+
+
 def mix_to_out(mix: Mix, user: Optional[User], db: Session):
     likes_count = db.query(Favorite)\
         .filter(Favorite.mix_id == mix.id).count()
@@ -407,6 +425,7 @@ def mix_to_out(mix: Mix, user: Optional[User], db: Session):
         status=(mix.status or "public"),
         lounge_id=mix.lounge_id,
         tags=_decode_mix_tags(mix.tags),
+        lounge_partner_badge=is_mix_partner(mix.lounge_id, db),
     )
 
 
@@ -2261,6 +2280,37 @@ def startup():
                     NOW() + INTERVAL '7 days',
                     'moscow'
                 )
+                ON CONFLICT (brand_id) DO NOTHING
+                """
+            )
+
+    # MARK: lounge_admin_meta — admin CRM tier + badges (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_admin_meta (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL UNIQUE,
+                    tier VARCHAR(32) NOT NULL DEFAULT 'start',
+                    badges JSONB NOT NULL DEFAULT '[]',
+                    notes TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_lounge_admin_meta_brand_id
+                ON lounge_admin_meta (brand_id)
+                """
+            )
+            # Seed: garden_lounge_korolev as partner with verified + mix_partner + featured
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_admin_meta (brand_id, tier, badges)
+                VALUES ('garden_lounge_korolev', 'partner', '["verified","mix_partner","featured"]')
                 ON CONFLICT (brand_id) DO NOTHING
                 """
             )
@@ -7927,4 +7977,197 @@ def get_brand_analytics(
         top_flavors=top_flavors,
         growth_30d=growth_30d,
         region_split=region_split,
+    )
+
+
+# -------------------------------------------------------------------
+# ADMIN CRM — Lounge tier + badges management (2026-05-26)
+# All mutating endpoints require is_admin == True.
+# -------------------------------------------------------------------
+
+def _meta_for_brand(brand_id: str, db: Session) -> LoungeAdminMeta:
+    """Return existing LoungeAdminMeta row or a transient default (not flushed)."""
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta is None:
+        meta = LoungeAdminMeta(brand_id=brand_id, tier="start", badges=[])
+    return meta
+
+
+def _list_item_for_brand(brand_id: str, db: Session) -> LoungeAdminListItemOut:
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    tier = meta.tier if meta else "start"
+    badges = (meta.badges if isinstance(meta.badges, list) else []) if meta else []
+
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    visits_last_30d = db.query(func.count(LoungeVisit.id)).filter(
+        LoungeVisit.brand_id == brand_id,
+        LoungeVisit.created_at >= cutoff,
+    ).scalar() or 0
+
+    bonus_outstanding = db.query(func.coalesce(func.sum(LoungeGuestLoyalty.bonus_balance), 0)).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+    ).scalar() or 0
+
+    promos_active = db.query(func.count(LoungePromo.id)).filter(
+        LoungePromo.brand_id == brand_id,
+        LoungePromo.active == True,
+    ).scalar() or 0
+
+    return LoungeAdminListItemOut(
+        brand_id=brand_id,
+        tier=tier,
+        badges=badges,
+        visits_last_30d=visits_last_30d,
+        bonus_outstanding=int(bonus_outstanding),
+        promos_active=promos_active,
+    )
+
+
+@app.get("/admin/lounges", response_model=List[LoungeAdminListItemOut], tags=["admin"])
+def admin_list_lounges(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """List all known lounge brand_ids with tier, badges and aggregate stats."""
+    brand_ids: set = set()
+    for row in db.query(LoungeLoyaltyProgram.brand_id).all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeVisit.brand_id).distinct().all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeGuestLoyalty.brand_id).distinct().all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeAdminMeta.brand_id).all():
+        brand_ids.add(row.brand_id)
+
+    result = [_list_item_for_brand(bid, db) for bid in sorted(brand_ids)]
+    return result
+
+
+@app.get("/admin/lounges/{brand_id}", response_model=LoungeAdminMetaOut, tags=["admin"])
+def admin_get_lounge(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Return full admin meta (including notes) for a single lounge."""
+    meta = _meta_for_brand(brand_id, db)
+    return LoungeAdminMetaOut(
+        brand_id=brand_id,
+        tier=meta.tier,
+        badges=meta.badges if isinstance(meta.badges, list) else [],
+        notes=meta.notes,
+    )
+
+
+@app.patch("/admin/lounges/{brand_id}", response_model=LoungeAdminMetaOut, tags=["admin"])
+def admin_patch_lounge(
+    brand_id: str,
+    payload: LoungeAdminMetaIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Update tier / badges / notes for a lounge. Creates the row if absent."""
+    if payload.tier is not None and payload.tier not in VALID_LOUNGE_TIERS:
+        raise HTTPException(status_code=422, detail=f"Invalid tier. Valid values: {sorted(VALID_LOUNGE_TIERS)}")
+    if payload.badges is not None:
+        invalid = set(payload.badges) - VALID_LOUNGE_BADGES
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid badges: {invalid}. Valid: {sorted(VALID_LOUNGE_BADGES)}")
+
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta is None:
+        meta = LoungeAdminMeta(brand_id=brand_id, tier="start", badges=[])
+        db.add(meta)
+
+    if payload.tier is not None:
+        meta.tier = payload.tier
+    if payload.badges is not None:
+        meta.badges = list(payload.badges)
+    if payload.notes is not None:
+        meta.notes = payload.notes
+    meta.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(meta)
+
+    return LoungeAdminMetaOut(
+        brand_id=meta.brand_id,
+        tier=meta.tier,
+        badges=meta.badges if isinstance(meta.badges, list) else [],
+        notes=meta.notes,
+    )
+
+
+@app.post("/admin/lounges/{brand_id}/badge/{badge_name}", response_model=LoungeAdminMetaOut, tags=["admin"])
+def admin_add_badge(
+    brand_id: str,
+    badge_name: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Idempotently add a single badge to a lounge."""
+    if badge_name not in VALID_LOUNGE_BADGES:
+        raise HTTPException(status_code=422, detail=f"Invalid badge. Valid values: {sorted(VALID_LOUNGE_BADGES)}")
+
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta is None:
+        meta = LoungeAdminMeta(brand_id=brand_id, tier="start", badges=[])
+        db.add(meta)
+
+    current = meta.badges if isinstance(meta.badges, list) else []
+    if badge_name not in current:
+        meta.badges = current + [badge_name]
+        meta.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(meta)
+
+    return LoungeAdminMetaOut(
+        brand_id=meta.brand_id,
+        tier=meta.tier,
+        badges=meta.badges if isinstance(meta.badges, list) else [],
+        notes=meta.notes,
+    )
+
+
+@app.delete("/admin/lounges/{brand_id}/badge/{badge_name}", response_model=LoungeAdminMetaOut, tags=["admin"])
+def admin_remove_badge(
+    brand_id: str,
+    badge_name: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Remove a badge from a lounge (no-op if badge not present)."""
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Lounge not found in admin meta")
+
+    current = meta.badges if isinstance(meta.badges, list) else []
+    updated = [b for b in current if b != badge_name]
+    if len(updated) != len(current):
+        meta.badges = updated
+        meta.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(meta)
+
+    return LoungeAdminMetaOut(
+        brand_id=meta.brand_id,
+        tier=meta.tier,
+        badges=meta.badges if isinstance(meta.badges, list) else [],
+        notes=meta.notes,
+    )
+
+
+# -------------------------------------------------------------------
+# PUBLIC — lounge admin-meta (no auth, for MixCard / lounge profile)
+# -------------------------------------------------------------------
+
+@app.get("/lounges/{brand_id}/admin-meta", response_model=LoungePublicMetaOut, tags=["lounges"])
+def get_lounge_public_meta(brand_id: str, db: Session = Depends(get_db)):
+    """Public endpoint: returns tier and badges for a lounge. No auth required."""
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta is None:
+        return LoungePublicMetaOut(brand_id=brand_id, tier="start", badges=[])
+    return LoungePublicMetaOut(
+        brand_id=meta.brand_id,
+        tier=meta.tier,
+        badges=meta.badges if isinstance(meta.badges, list) else [],
     )

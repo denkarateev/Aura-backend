@@ -53,6 +53,8 @@ class MixOut(BaseModel):
     status: str = "public"
     lounge_id: Optional[str] = None
     tags: List[str] = []
+    # True when lounge_id has mix_partner badge (admin CRM)
+    lounge_partner_badge: bool = False
 
     class Config:
         from_attributes = True
@@ -1284,3 +1286,38 @@ class BrandAnalyticsOut(BaseModel):
     top_flavors: List[FlavorPopularity]
     growth_30d: float
     region_split: List[RegionBucket]
+
+
+# MARK: - Admin CRM lounge management (2026-05-26)
+
+VALID_LOUNGE_TIERS = {"start", "lite", "pro", "network", "partner"}
+VALID_LOUNGE_BADGES = {"verified", "featured", "mix_partner", "exclusive", "top_rated"}
+
+
+class LoungeAdminMetaOut(BaseModel):
+    brand_id: str
+    tier: str
+    badges: List[str]
+    notes: Optional[str] = None
+
+
+class LoungeAdminMetaIn(BaseModel):
+    tier: Optional[str] = None       # one of VALID_LOUNGE_TIERS; None = keep current
+    badges: Optional[List[str]] = None  # full replace; None = keep current
+    notes: Optional[str] = None
+
+
+class LoungeAdminListItemOut(BaseModel):
+    brand_id: str
+    tier: str
+    badges: List[str]
+    visits_last_30d: int
+    bonus_outstanding: int    # SUM lounge_guest_loyalties.bonus_balance
+    promos_active: int
+
+
+# Public (no auth) — subset without notes
+class LoungePublicMetaOut(BaseModel):
+    brand_id: str
+    tier: str
+    badges: List[str]
