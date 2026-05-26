@@ -51,6 +51,9 @@ class User(Base):
     # this to True and scrubs PII on the row. All auth checks reject deleted
     # accounts at get_current_user.
     is_deleted = Column(Boolean, default=False, nullable=False, server_default="false")
+    # Legal consent — timestamp when user accepted Terms of Use & Privacy Policy.
+    # Required at signup (152-FZ / App Store legal compliance).
+    accepted_terms_at = Column(DateTime(timezone=True), nullable=True)
 
     mixes = relationship("Mix", back_populates="author")
     favorites = relationship("Favorite", back_populates="user")

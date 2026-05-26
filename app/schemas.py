@@ -202,6 +202,7 @@ class SignupRequest(BaseModel):
     display_name: Optional[str] = None
     phone: Optional[str] = None
     referrer_code: Optional[str] = None  # ON-8: referral reward (200 угольков приглашающему)
+    accepted_terms: bool = False  # 152-FZ / App Store: user must accept ToU + Privacy Policy
 
 
 class LoginRequest(BaseModel):

@@ -18,6 +18,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError
 from jose import jwt
@@ -1649,6 +1650,13 @@ def startup():
             WHERE is_deleted IS NULL
             """
         )
+        # Legal consent timestamp — 152-FZ / App Store compliance (2026-05-26)
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS accepted_terms_at TIMESTAMPTZ
+            """
+        )
         # Extend existing 'masters' table (created in S192-S194)
         # with additional columns needed for Phase 1+2
         conn.exec_driver_sql(
@@ -2121,6 +2129,24 @@ def startup():
         )
 
 # -------------------------------------------------------------------
+# LEGAL — Privacy Policy & Terms of Use (152-FZ / App Store compliance)
+# No auth required. Served as HTML for WKWebView / Safari.
+# -------------------------------------------------------------------
+@app.get("/legal/privacy", response_class=HTMLResponse, tags=["legal"])
+def get_privacy_policy():
+    _legal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "legal", "privacy.html")
+    with open(_legal_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
+
+
+@app.get("/legal/terms", response_class=HTMLResponse, tags=["legal"])
+def get_terms_of_use():
+    _legal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "legal", "terms.html")
+    with open(_legal_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
+
+
+# -------------------------------------------------------------------
 # AUTH
 # -------------------------------------------------------------------
 @app.post("/signup", response_model=LoginResponse)
@@ -2130,6 +2156,13 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     # что именно надо исправить.
     email_norm = (payload.email or "").strip().lower()
     username_norm = (payload.username or "").strip()
+
+    # 152-FZ / App Store: user must explicitly accept Terms of Use and Privacy Policy
+    if not payload.accepted_terms:
+        raise HTTPException(
+            400,
+            "Необходимо принять Условия использования и Политику конфиденциальности"
+        )
 
     if not email_norm:
         raise HTTPException(400, "Введи email — без него регистрация невозможна.")
@@ -2153,7 +2186,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
         email=email_norm,
         username=username_norm or None,
         password_hash=hash_password(payload.password),
-        is_admin=False
+        is_admin=False,
+        accepted_terms_at=datetime.utcnow()  # 152-FZ: record consent timestamp
     )
     if user_matches_admin_allowlist(user):
         user.is_admin = True
