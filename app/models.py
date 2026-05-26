@@ -54,6 +54,9 @@ class User(Base):
     # Legal consent — timestamp when user accepted Terms of Use & Privacy Policy.
     # Required at signup (152-FZ / App Store legal compliance).
     accepted_terms_at = Column(DateTime(timezone=True), nullable=True)
+    # CRM privacy — allow lounge owners to see guest's tobacco flavor preferences.
+    # Default TRUE for backward compat. Added via startup ALTER TABLE.
+    share_flavors = Column(Boolean, default=True, nullable=False, server_default="true")
 
     mixes = relationship("Mix", back_populates="author")
     favorites = relationship("Favorite", back_populates="user")
@@ -763,3 +766,53 @@ class MasterShift(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     master = relationship("Master")
+
+
+# MARK: - JWT Refresh Tokens (Phase 2, 2026-05-26)
+
+class RefreshToken(Base):
+    """
+    Revocable refresh token store. One row per issued refresh token.
+
+    token_hash  — SHA-256 hex of the raw token. Raw token is never stored.
+    revoked_at  — set on logout or rotation. NULL means token is still valid.
+    ip / user_agent — audit trail for session management.
+
+    Rotation policy: on each /auth/refresh call the old token is revoked
+    (revoked_at = now) and a new token is issued + inserted.
+    """
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    issued_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    ip = Column(String(45), nullable=True)
+
+
+# MARK: - CRM visit ledger (2026-05-26)
+
+class LoungeVisit(Base):
+    """
+    One check-in record written by the owner QR-scanner.
+    Stores financial summary for CRM analytics: bill amount, bonus awarded.
+    Written in /lounges/{id}/checkin alongside LoungeGuestLoyalty update.
+
+    brand_id     — lounge slug (same as LoungeGuestLoyalty.brand_id)
+    user_id      — guest user FK
+    bill_amount  — receipt total in rubles (0 if not provided / fixed-bonus mode)
+    bonus_awarded — ugolki points accrued this visit
+    """
+    __tablename__ = "lounge_visits"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    bill_amount = Column(Integer, nullable=False, default=0)   # rubles (int, kopecks not used)
+    bonus_awarded = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    guest = relationship("User", foreign_keys=[user_id])

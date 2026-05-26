@@ -217,6 +217,24 @@ class LoginResponse(BaseModel):
     user_id: int
     token: str
     username: Optional[str]
+    # Refresh token fields — present for clients that support rotation.
+    # Omitted (None) only on very old code paths; new clients always get them.
+    refresh_token: Optional[str] = None
+    access_expires_in: Optional[int] = None  # seconds
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenRefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    access_expires_in: int  # seconds
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: Optional[str] = None  # invalidate specific session; None = current
 
 
 class CommentIn(BaseModel):
@@ -1098,3 +1116,67 @@ class LoungePromoUpdateIn(BaseModel):
 class LoungePromoListOut(BaseModel):
     items: List[LoungePromoOut]
     total: int
+
+
+# MARK: - CRM schemas (2026-05-26)
+
+class HourBucket(BaseModel):
+    hour: int
+    count: int
+
+
+class WeekdayBucket(BaseModel):
+    weekday: int   # 0=Mon, 6=Sun (ISO)
+    count: int
+
+
+class LoungeCrmStatsOut(BaseModel):
+    period: str
+    visits_count: int
+    unique_guests: int
+    total_revenue: int
+    avg_bill: int
+    repeat_rate: float
+    new_guests: int
+    top_hours: List[HourBucket]
+    top_weekdays: List[WeekdayBucket]
+
+
+class LoungeCrmRegularOut(BaseModel):
+    user_id: int
+    username: str
+    avatar_url: Optional[str] = None
+    visits_count: int
+    total_spent: int
+    last_visit_at: datetime
+    avg_bill: int
+    bonus_balance: int
+
+
+class LoungeCrmRegularsOut(BaseModel):
+    items: List[LoungeCrmRegularOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class GuestVisitRowOut(BaseModel):
+    id: int
+    bill_amount: int
+    bonus_awarded: int
+    created_at: datetime
+
+
+class LoungeCrmGuestCardOut(BaseModel):
+    user_id: int
+    username: str
+    avatar_url: Optional[str] = None
+    first_visit_at: datetime
+    last_visit_at: datetime
+    visits_count: int
+    total_spent: int
+    avg_bill: int
+    bonus_balance: int
+    favorite_brands: Optional[List[str]] = None
+    last_mixes: List[dict] = []
+    recent_visits: List[GuestVisitRowOut] = []

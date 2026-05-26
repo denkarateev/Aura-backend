@@ -45,7 +45,13 @@ from app.core.config import (
     load_brand_manager_usernames,
 )
 from app.core.database import Base, SessionLocal, engine
-from app.core.security import create_access_token, security
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    hash_refresh_token,
+    security,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 from app.models import (
     Duel,
     BowlHeatRun,
@@ -61,6 +67,7 @@ from app.models import (
     LoungeGuestPersonalization,
     LoungePromo,
     LoungeSubscription,
+    LoungeVisit,
     DeviceToken,
     LoungeLedgerEntry,
     LoungeLoyaltyProgram,
@@ -80,6 +87,7 @@ from app.models import (
     UserFollow,
     UserMedal,
     UserProgress,
+    RefreshToken,
 )
 from app.schemas import (
     DuelCreateIn,
@@ -194,6 +202,16 @@ from app.schemas import (
     LoungePromoOut,
     LoungePromoUpdateIn,
     LoungePromoListOut,
+    TokenRefreshRequest,
+    TokenRefreshResponse,
+    LogoutRequest,
+    HourBucket,
+    WeekdayBucket,
+    LoungeCrmStatsOut,
+    LoungeCrmRegularOut,
+    LoungeCrmRegularsOut,
+    GuestVisitRowOut,
+    LoungeCrmGuestCardOut,
 )
 
 # -------------------------------------------------------------------
@@ -2071,6 +2089,40 @@ def startup():
                 """
             )
 
+    # MARK: lounge_visits — CRM visit ledger (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_visits (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    bill_amount INTEGER NOT NULL DEFAULT 0,
+                    bonus_awarded INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_visits_brand_created
+                ON lounge_visits (brand_id, created_at DESC)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_visits_brand_user
+                ON lounge_visits (brand_id, user_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS share_flavors BOOLEAN NOT NULL DEFAULT TRUE
+                """
+            )
+
     # MARK: APScheduler — weekly + monthly medal grant.
     # We start a per-worker BackgroundScheduler. With multiple gunicorn
     # workers the unique constraint on user_medals guarantees idempotency:
@@ -3195,6 +3247,15 @@ def register_lounge_checkin(
         guest_user_id=guest_user.id,
         master_id=served_by_master_id,
     )
+
+    # CRM visit record — written every checkin for analytics
+    visit_bill = int(payload.bill_amount) if payload.bill_amount and payload.bill_amount > 0 else 0
+    db.add(LoungeVisit(
+        brand_id=brand_id,
+        user_id=guest_user.id,
+        bill_amount=visit_bill,
+        bonus_awarded=checkin_bonus,
+    ))
 
     db.commit()
 
@@ -6771,6 +6832,251 @@ class DuelConnectionManager:
 
 
 duel_manager = DuelConnectionManager()
+
+
+# -------------------------------------------------------------------
+# MARK: CRM endpoints — owner analytics (2026-05-26)
+# -------------------------------------------------------------------
+
+@app.get("/lounges/{brand_id}/crm/stats", response_model=LoungeCrmStatsOut, tags=["crm"])
+@limiter.limit("60/minute")
+def lounge_crm_stats(
+    request: Request,
+    brand_id: str,
+    period: str = Query("month", regex="^(week|month|all)$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Aggregate CRM stats for a lounge. Owner-only."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    now = datetime.utcnow()
+    if period == "week":
+        since = now - timedelta(days=7)
+    elif period == "month":
+        since = now - timedelta(days=30)
+    else:
+        since = None
+
+    base_q = db.query(LoungeVisit).filter(LoungeVisit.brand_id == brand_id)
+    if since:
+        base_q = base_q.filter(LoungeVisit.created_at >= since)
+
+    visits = base_q.all()
+
+    visits_count = len(visits)
+    if visits_count == 0:
+        return LoungeCrmStatsOut(
+            period=period,
+            visits_count=0,
+            unique_guests=0,
+            total_revenue=0,
+            avg_bill=0,
+            repeat_rate=0.0,
+            new_guests=0,
+            top_hours=[],
+            top_weekdays=[],
+        )
+
+    total_revenue = sum(v.bill_amount for v in visits)
+    avg_bill = total_revenue // visits_count if visits_count else 0
+
+    # Unique guests in period
+    guest_ids_in_period = {v.user_id for v in visits}
+    unique_guests = len(guest_ids_in_period)
+
+    # Repeat rate — % guests with >= 2 visits in period
+    from collections import Counter as _Counter
+    user_visit_counts = _Counter(v.user_id for v in visits)
+    repeat_guests = sum(1 for c in user_visit_counts.values() if c >= 2)
+    repeat_rate = round(repeat_guests / unique_guests * 100, 1) if unique_guests else 0.0
+
+    # New guests — users whose FIRST visit ever at this brand falls in period
+    if since:
+        # For each guest in period, find their earliest visit ever
+        new_guests = 0
+        for uid in guest_ids_in_period:
+            earliest = db.query(func.min(LoungeVisit.created_at)).filter(
+                LoungeVisit.brand_id == brand_id,
+                LoungeVisit.user_id == uid,
+            ).scalar()
+            if earliest and earliest >= since:
+                new_guests += 1
+    else:
+        new_guests = unique_guests  # all = all are "new" in all-time context
+
+    # Top hours (24 buckets, return top 5)
+    hour_counts: dict = {}
+    for v in visits:
+        h = v.created_at.hour
+        hour_counts[h] = hour_counts.get(h, 0) + 1
+    top_hours_raw = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_hours = [HourBucket(hour=h, count=c) for h, c in sorted(top_hours_raw, key=lambda x: x[1], reverse=True)]
+
+    # Weekdays (0=Mon ISO — Python weekday() already gives 0=Mon)
+    weekday_counts: dict = {}
+    for v in visits:
+        wd = v.created_at.weekday()
+        weekday_counts[wd] = weekday_counts.get(wd, 0) + 1
+    top_weekdays = [WeekdayBucket(weekday=wd, count=c) for wd, c in sorted(weekday_counts.items(), key=lambda x: x[0])]
+
+    return LoungeCrmStatsOut(
+        period=period,
+        visits_count=visits_count,
+        unique_guests=unique_guests,
+        total_revenue=total_revenue,
+        avg_bill=avg_bill,
+        repeat_rate=repeat_rate,
+        new_guests=new_guests,
+        top_hours=top_hours,
+        top_weekdays=top_weekdays,
+    )
+
+
+@app.get("/lounges/{brand_id}/crm/regulars", response_model=LoungeCrmRegularsOut, tags=["crm"])
+@limiter.limit("60/minute")
+def lounge_crm_regulars(
+    request: Request,
+    brand_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Top guests by visit count. Owner-only."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    # Aggregate per user
+    from sqlalchemy import func as _func
+
+    agg = (
+        db.query(
+            LoungeVisit.user_id,
+            _func.count(LoungeVisit.id).label("visits_count"),
+            _func.sum(LoungeVisit.bill_amount).label("total_spent"),
+            _func.max(LoungeVisit.created_at).label("last_visit_at"),
+        )
+        .filter(LoungeVisit.brand_id == brand_id)
+        .group_by(LoungeVisit.user_id)
+        .order_by(_func.count(LoungeVisit.id).desc())
+    )
+    total = agg.count()
+    rows = agg.offset(offset).limit(limit).all()
+
+    items = []
+    for row in rows:
+        guest = db.query(User).filter(User.id == row.user_id).first()
+        if not guest:
+            continue
+        progress = db.query(UserProgress).filter(UserProgress.user_id == row.user_id).first()
+        bonus_balance = progress.points if progress else 0
+        avg_bill = (row.total_spent // row.visits_count) if row.visits_count else 0
+        items.append(LoungeCrmRegularOut(
+            user_id=row.user_id,
+            username=guest.username or f"user_{row.user_id}",
+            avatar_url=guest.avatar_url,
+            visits_count=row.visits_count,
+            total_spent=row.total_spent or 0,
+            last_visit_at=row.last_visit_at,
+            avg_bill=avg_bill,
+            bonus_balance=bonus_balance,
+        ))
+
+    return LoungeCrmRegularsOut(items=items, total=total, limit=limit, offset=offset)
+
+
+@app.get("/lounges/{brand_id}/crm/guests/{guest_user_id}", response_model=LoungeCrmGuestCardOut, tags=["crm"])
+@limiter.limit("60/minute")
+def lounge_crm_guest_card(
+    request: Request,
+    brand_id: str,
+    guest_user_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Full guest card with visit history. Owner-only."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    guest = db.query(User).filter(User.id == guest_user_id).first()
+    if not guest:
+        raise HTTPException(404, "Guest not found")
+
+    visits = (
+        db.query(LoungeVisit)
+        .filter(LoungeVisit.brand_id == brand_id, LoungeVisit.user_id == guest_user_id)
+        .order_by(LoungeVisit.created_at.desc())
+        .all()
+    )
+
+    if not visits:
+        raise HTTPException(404, "No visits found for this guest at this lounge")
+
+    visits_count = len(visits)
+    total_spent = sum(v.bill_amount for v in visits)
+    avg_bill = total_spent // visits_count if visits_count else 0
+    last_visit_at = visits[0].created_at
+    first_visit_at = visits[-1].created_at
+
+    progress = db.query(UserProgress).filter(UserProgress.user_id == guest_user_id).first()
+    bonus_balance = progress.points if progress else 0
+
+    recent_visits = [
+        GuestVisitRowOut(
+            id=v.id,
+            bill_amount=v.bill_amount,
+            bonus_awarded=v.bonus_awarded,
+            created_at=v.created_at,
+        )
+        for v in visits[:20]
+    ]
+
+    # Privacy: flavor preferences only if share_flavors=True
+    share_ok = getattr(guest, "share_flavors", True)
+    favorite_brands: Optional[List[str]] = None
+    if share_ok:
+        ingredients = (
+            db.query(MixIngredient.brand)
+            .join(Mix, Mix.id == MixIngredient.mix_id)
+            .filter(Mix.author_id == guest_user_id, MixIngredient.brand.isnot(None))
+            .all()
+        )
+        from collections import Counter as _BrandCounter
+        brand_counts = _BrandCounter(row.brand for row in ingredients if row.brand)
+        favorite_brands = [b for b, _ in brand_counts.most_common(5)] if brand_counts else []
+
+    # Last 3 mixes by this guest tagged to this lounge
+    last_mixes_q = (
+        db.query(Mix)
+        .filter(Mix.author_id == guest_user_id, Mix.lounge_id == brand_id)
+        .order_by(Mix.created_at.desc())
+        .limit(3)
+        .all()
+    )
+    last_mixes = [
+        {"id": m.id, "name": m.name, "created_at": m.created_at.isoformat() if m.created_at else None}
+        for m in last_mixes_q
+    ]
+
+    return LoungeCrmGuestCardOut(
+        user_id=guest_user_id,
+        username=guest.username or f"user_{guest_user_id}",
+        avatar_url=guest.avatar_url,
+        first_visit_at=first_visit_at,
+        last_visit_at=last_visit_at,
+        visits_count=visits_count,
+        total_spent=total_spent,
+        avg_bill=avg_bill,
+        bonus_balance=bonus_balance,
+        favorite_brands=favorite_brands,
+        last_mixes=last_mixes,
+        recent_visits=recent_visits,
+    )
 
 
 @app.websocket("/ws/duel/{duel_id}")
