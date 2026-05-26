@@ -2404,11 +2404,18 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     track_daily_login(user, db)
 
     # ON-8: Referral reward — 200 ugolki to the referrer on successful signup.
-    # referrer_code is the username of the inviter. Silent — never blocks signup.
+    # Юзер: «garden_lounge_korolev приглашал других и код вставлял» но БД
+    # показывала 0 referral_reward. ReferralView в iOS формирует код как
+    # «HOOKA3-USERNAME», юзер вставлял его целиком → backend искал по
+    # точному username → ничего не находил → silent skip.
+    # Нормализуем: lowercase + strip префикс «HOOKA3-» если есть.
     if payload.referrer_code:
+        normalized_code = payload.referrer_code.strip()
+        if normalized_code.upper().startswith("HOOKA3-"):
+            normalized_code = normalized_code[7:]
         referrer = (
             db.query(User)
-            .filter(User.username == payload.referrer_code)
+            .filter(func.lower(User.username) == normalized_code.lower())
             .first()
         )
         if referrer and referrer.id != user.id:
