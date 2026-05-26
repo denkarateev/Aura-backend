@@ -714,6 +714,32 @@ class LoungeLoyaltyProgram(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class LoungePromo(Base):
+    """Static / recurring promotional offer for a lounge.
+
+    Examples: Happy Hour -25% weekdays before 18:00, -10% for review,
+    -15% on birthday. Not a calendar event — this is a standing offer
+    that applies permanently or by a recurrence rule.
+    """
+    __tablename__ = "lounge_promos"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    title = Column(String(256), nullable=False)
+    description = Column(Text, nullable=True)
+    discount_percent = Column(Integer, nullable=True)       # optional 0-100
+    discount_text = Column(String(64), nullable=True)       # e.g. "-25%", "+bonus"
+    icon_name = Column(String(64), nullable=True)           # SF Symbol: "clock.fill", "star.fill", "gift.fill"
+    active = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("brand_id", "title", name="uq_lounge_promos_brand_title"),
+    )
+
+
 class MasterShift(Base):
     """
     Расписание смены мастера. Мастер указывает когда он работает в каком зале —

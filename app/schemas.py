@@ -1053,3 +1053,47 @@ class MedalBackfillOut(BaseModel):
     granted: int
     skipped_existing: int
     entries: List[LeaderboardEntryOut]
+
+
+# MARK: - Lounge promos (afisha / aktsii)
+
+class LoungePromoOut(BaseModel):
+    id: int
+    brand_id: str
+    title: str
+    description: Optional[str] = None
+    discount_percent: Optional[int] = None
+    discount_text: Optional[str] = None
+    icon_name: Optional[str] = None
+    active: bool
+    sort_order: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LoungePromoIn(BaseModel):
+    title: str
+    description: Optional[str] = None
+    discount_percent: Optional[int] = None
+    discount_text: Optional[str] = None
+    icon_name: Optional[str] = None
+    active: bool = True
+    sort_order: int = 0
+
+
+class LoungePromoUpdateIn(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    discount_percent: Optional[int] = None
+    discount_text: Optional[str] = None
+    icon_name: Optional[str] = None
+    active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class LoungePromoListOut(BaseModel):
+    items: List[LoungePromoOut]
+    total: int

@@ -58,6 +58,7 @@ from app.models import (
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
+    LoungePromo,
     LoungeSubscription,
     DeviceToken,
     LoungeLedgerEntry,
@@ -188,6 +189,10 @@ from app.schemas import (
     LoungeSubscriptionDTO,
     LoungeLoyaltyProgramIn,
     LoungeLoyaltyProgramOut,
+    LoungePromoIn,
+    LoungePromoOut,
+    LoungePromoUpdateIn,
+    LoungePromoListOut,
 )
 
 # -------------------------------------------------------------------
@@ -2000,6 +2005,64 @@ def startup():
                 """
             )
 
+    # MARK: lounge_promos — static/recurring promotional offers (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_promos (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL,
+                    title VARCHAR(256) NOT NULL,
+                    description TEXT,
+                    discount_percent INTEGER,
+                    discount_text VARCHAR(64),
+                    icon_name VARCHAR(64),
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_lounge_promos_brand_id
+                ON lounge_promos (brand_id)
+                """
+            )
+            # Unique constraint on (brand_id, title) — makes seed idempotent
+            # across gunicorn workers and restarts.
+            conn.exec_driver_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_lounge_promos_brand_title
+                ON lounge_promos (brand_id, title)
+                """
+            )
+            # Seed — Garden Lounge 3 promos from design
+            # Note: %% because exec_driver_sql uses % as param placeholder
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_promos
+                    (brand_id, title, description, discount_percent, discount_text,
+                     icon_name, sort_order, active)
+                VALUES
+                  ('garden_lounge_korolev',
+                   'Счастливые часы',
+                   'Посетите заведение в будни до 18:00 и получите привилегию -25%%.',
+                   25, '-25%%', 'clock.fill', 0, TRUE),
+                  ('garden_lounge_korolev',
+                   '-10%% за отзыв',
+                   'Дарим скидку 10%% за отзыв — нам важно ваше мнение и мы хотим становиться лучше.',
+                   10, '-10%%', 'star.fill', 1, TRUE),
+                  ('garden_lounge_korolev',
+                   '-15%% в день рождения',
+                   'Дарим скидку 15%% в ваш День рождения. Предложение действует 7 дней до и 7 дней после вашего Дня рождения.',
+                   15, '-15%%', 'gift.fill', 2, TRUE)
+                ON CONFLICT (brand_id, title) DO NOTHING
+                """
+            )
+
     # MARK: APScheduler — weekly + monthly medal grant.
     # We start a per-worker BackgroundScheduler. With multiple gunicorn
     # workers the unique constraint on user_medals guarantees idempotency:
@@ -2397,6 +2460,122 @@ def update_lounge_program(
     db.commit()
     db.refresh(program)
     return lounge_program_to_out(program, brand_id)
+
+
+# -------------------------------------------------------------------
+# LOUNGE PROMOS  (static / recurring offers, 2026-05-26)
+# -------------------------------------------------------------------
+
+@app.get("/lounges/{brand_id}/promos", response_model=LoungePromoListOut)
+@limiter.limit("60/minute")
+def list_lounge_promos(
+    request: Request,
+    brand_id: str,
+    include_inactive: bool = Query(False),
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    """Public endpoint. Returns active promos by default.
+    Pass ?include_inactive=true to see all (owner only)."""
+    if include_inactive:
+        # Only lounge owner/admin can see inactive promos
+        current_user = get_required_user(user)
+        if not can_manage_brand(current_user, brand_id):
+            raise HTTPException(403, "Business access required")
+        rows = (
+            db.query(LoungePromo)
+            .filter(LoungePromo.brand_id == brand_id)
+            .order_by(LoungePromo.sort_order.asc(), LoungePromo.id.asc())
+            .all()
+        )
+    else:
+        rows = (
+            db.query(LoungePromo)
+            .filter(LoungePromo.brand_id == brand_id, LoungePromo.active.is_(True))
+            .order_by(LoungePromo.sort_order.asc(), LoungePromo.id.asc())
+            .all()
+        )
+    return LoungePromoListOut(
+        items=[LoungePromoOut.from_orm(r) for r in rows],
+        total=len(rows),
+    )
+
+
+@app.post("/lounges/{brand_id}/promos", response_model=LoungePromoOut, status_code=201)
+@limiter.limit("60/minute")
+def create_lounge_promo(
+    request: Request,
+    brand_id: str,
+    payload: LoungePromoIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Create a new promo for a lounge. Owner / admin only."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    promo = LoungePromo(
+        brand_id=brand_id,
+        title=payload.title.strip(),
+        description=payload.description,
+        discount_percent=payload.discount_percent,
+        discount_text=payload.discount_text,
+        icon_name=payload.icon_name,
+        active=payload.active,
+        sort_order=payload.sort_order,
+    )
+    db.add(promo)
+    db.commit()
+    db.refresh(promo)
+    return LoungePromoOut.from_orm(promo)
+
+
+@app.patch("/promos/{promo_id}", response_model=LoungePromoOut)
+@limiter.limit("60/minute")
+def update_lounge_promo(
+    request: Request,
+    promo_id: int,
+    payload: LoungePromoUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Update promo fields. Only owner of the lounge that owns this promo."""
+    current_user = get_required_user(user)
+    promo = db.query(LoungePromo).filter(LoungePromo.id == promo_id).first()
+    if not promo:
+        raise HTTPException(404, "Promo not found")
+    if not can_manage_brand(current_user, promo.brand_id):
+        raise HTTPException(403, "Business access required")
+
+    update_data = payload.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(promo, field, value)
+
+    db.commit()
+    db.refresh(promo)
+    return LoungePromoOut.from_orm(promo)
+
+
+@app.delete("/promos/{promo_id}", response_model=StatusOut)
+@limiter.limit("60/minute")
+def delete_lounge_promo(
+    request: Request,
+    promo_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Hard delete a promo. Only owner of the lounge that owns this promo."""
+    current_user = get_required_user(user)
+    promo = db.query(LoungePromo).filter(LoungePromo.id == promo_id).first()
+    if not promo:
+        raise HTTPException(404, "Promo not found")
+    if not can_manage_brand(current_user, promo.brand_id):
+        raise HTTPException(403, "Business access required")
+
+    db.delete(promo)
+    db.commit()
+    return StatusOut(status="ok", message=f"Promo {promo_id} deleted")
 
 
 # -------------------------------------------------------------------
