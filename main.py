@@ -1166,7 +1166,9 @@ def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut
         )
 
     # Bundle redemption stats — pack visits at this lounge
-    bundle_visits = db.query(LoungeBundleVisit).filter(
+    bundle_visits = db.query(LoungeBundleVisit).options(
+        joinedload(LoungeBundleVisit.bundle)
+    ).filter(
         LoungeBundleVisit.brand_id == brand_id
     ).order_by(LoungeBundleVisit.visited_at.desc()).all()
 
@@ -1185,10 +1187,9 @@ def build_lounge_analytics_out(brand_id: str, db: Session) -> LoungeAnalyticsOut
 
     recent_bundle_visits = []
     for v in bundle_visits[:10]:
-        bundle = db.query(LoungeBundle).filter(LoungeBundle.id == v.bundle_id).first()
         recent_bundle_visits.append(BundleRecentVisitOut(
             id=v.id,
-            tier=bundle.tier if bundle else "unknown",
+            tier=v.bundle.tier if v.bundle else "unknown",
             visited_at=v.visited_at,
             compensation_rub=v.compensation_rub,
             master_id=v.master_id,
