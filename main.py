@@ -3301,7 +3301,14 @@ def register_lounge_checkin(
     elif lp_mode == "percent_of_bill":
         if not payload.bill_amount or payload.bill_amount <= 0:
             raise HTTPException(400, "Сумма чека обязательна для этого заведения")
-        checkin_bonus = int(payload.bill_amount * lp_bill_percent / 100)
+        # Юзер: «начисление бонусов или первое посещение не работает».
+        # Раньше first_visit_bonus игнорировался в percent_of_bill режиме —
+        # лаунж настраивал «+500 за первый визит, +5% за каждый», но
+        # первый визит получал только процент. Теперь складываем процент
+        # + first_visit_bonus (если это правда первый визит).
+        base = int(payload.bill_amount * lp_bill_percent / 100)
+        bonus_first = lp_first_bonus if is_first_visit else 0
+        checkin_bonus = base + bonus_first
     else:
         checkin_bonus = 0
 
