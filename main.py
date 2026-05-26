@@ -2169,6 +2169,26 @@ def startup():
                 WHERE bonus_balance = 0 AND visit_count > 0
                 """
             )
+            # Юзер: «регуляры/гости не показываются а они есть».
+            # До коммита 0431d67 CRM-таблицы lounge_visits ещё не было,
+            # checkin писал только в lounge_guest_loyalties. Backfill:
+            # для каждого гостя с visit_count > 0 создаём минимум одну
+            # синтетическую lounge_visits-запись (visit_count раз, чтобы
+            # GROUP BY count(*) дал правильное число регуляров), если
+            # уже нет совсем своих записей для пары brand_id+user_id.
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_visits (brand_id, user_id, bill_amount, bonus_awarded, created_at)
+                SELECT lgl.brand_id, lgl.user_id, 0, 0,
+                       COALESCE(lgl.last_visit_at, NOW())
+                FROM lounge_guest_loyalties lgl
+                WHERE lgl.visit_count > 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM lounge_visits lv
+                    WHERE lv.brand_id = lgl.brand_id AND lv.user_id = lgl.user_id
+                  )
+                """
+            )
 
     # MARK: bonus_redemptions — owner-initiated bonus write-off (2026-05-26)
     if engine.dialect.name == "postgresql":
@@ -7281,18 +7301,21 @@ def lounge_crm_stats(
     else:
         new_guests = unique_guests  # all = all are "new" in all-time context
 
-    # Top hours (24 buckets, return top 5)
+    # Top hours (24 buckets, return top 5). Сдвигаем UTC → tz клиента.
+    tz_delta = timedelta(minutes=tz_offset_min)
     hour_counts: dict = {}
     for v in visits:
-        h = v.created_at.hour
+        local_dt = v.created_at + tz_delta
+        h = local_dt.hour
         hour_counts[h] = hour_counts.get(h, 0) + 1
     top_hours_raw = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     top_hours = [HourBucket(hour=h, count=c) for h, c in sorted(top_hours_raw, key=lambda x: x[1], reverse=True)]
 
-    # Weekdays (0=Mon ISO — Python weekday() already gives 0=Mon)
+    # Weekdays (0=Mon ISO — Python weekday() already gives 0=Mon). Тоже сдвигаем.
     weekday_counts: dict = {}
     for v in visits:
-        wd = v.created_at.weekday()
+        local_dt = v.created_at + tz_delta
+        wd = local_dt.weekday()
         weekday_counts[wd] = weekday_counts.get(wd, 0) + 1
     top_weekdays = [WeekdayBucket(weekday=wd, count=c) for wd, c in sorted(weekday_counts.items(), key=lambda x: x[0])]
 
