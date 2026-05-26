@@ -3154,25 +3154,31 @@ def _save_lounge_image(
     if img.mode in ("RGBA", "P", "LA"):
         img = img.convert("RGB")
 
-    folder = os.path.join(_STATIC_ROOT, "lounges")
-    os.makedirs(folder, exist_ok=True)
     # Safe filename — brand_id is owner-controlled but used as a path segment,
     # so strip anything that isn't alnum/dash/underscore.
     safe_brand = "".join(ch for ch in brand_id if ch.isalnum() or ch in ("-", "_"))
     if not safe_brand:
         raise HTTPException(400, "Invalid brand_id")
     fname = f"{safe_brand}_{file_suffix}.jpg"
-    fpath = os.path.join(folder, fname)
 
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
-    with open(fpath, "wb") as f:
-        f.write(buf.getvalue())
+    image_bytes = buf.getvalue()
+
+    # Upload via storage abstraction (local or S3 depending on ENV).
+    from app.services.storage import get_storage as _get_storage
+    storage = _get_storage()
+    key = f"lounges/{fname}"
+    url = storage.upload(key, image_bytes, "image/jpeg")
 
     # Append a cache-buster so iOS AsyncImage picks up the new file even when
     # the URL string is identical to the previous upload.
     ts = int(datetime.utcnow().timestamp())
-    return f"/static/lounges/{fname}?v={ts}"
+    # For local storage the url is relative (/static/lounges/...), for S3 it's absolute.
+    # The cache-buster is appended only for local (S3 objects are immutable by key).
+    if not url.startswith("http"):
+        url = f"{url}?v={ts}"
+    return url
 
 
 def _upload_lounge_image(
