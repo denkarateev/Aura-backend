@@ -994,6 +994,7 @@ def build_lounge_loyalty_out(
     if personalization:
         personalization_out = lounge_personalization_to_out(personalization, guest_user)
 
+    bonus_balance = (loyalty.bonus_balance or 0) if loyalty else 0
     return LoungeMyLoyaltyOut(
         brand_id=brand_id,
         visit_count=visit_count,
@@ -1001,6 +1002,8 @@ def build_lounge_loyalty_out(
         tier=tier,
         program=program_out,
         personalization=personalization_out,
+        bonus_balance=bonus_balance,
+        bonus_rub=bonus_balance // 10,
     )
 
 

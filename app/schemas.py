@@ -377,6 +377,12 @@ class LoungeMyLoyaltyOut(BaseModel):
     tier: LoungeTierOut
     program: LoungeProgramOut
     personalization: Optional[LoungeGuestRecordOut] = None
+    # Юзер: «сколько бонусов в заведении не пишется только визит».
+    # Per-lounge баланс уже хранится в lounge_guest_loyalties.bonus_balance
+    # (рефактор 3950f5c). Добавлен в response чтобы iOS показывал реальные
+    # цифры рядом с числом визитов.
+    bonus_balance: int = 0
+    bonus_rub: int = 0   # bonus_balance // 10 для удобства UI
 
 
 class LoungeCheckinIn(BaseModel):
