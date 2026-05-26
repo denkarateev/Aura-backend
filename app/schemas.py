@@ -1240,6 +1240,23 @@ class PromotedSlotIn(BaseModel):
     region: Optional[str] = None
 
 
+# MARK: - Per-lounge bonus balances for current user (2026-05-26)
+
+class LoungeMyBonusItemOut(BaseModel):
+    brand_id: str
+    brand_title: str
+    bonus_balance: int
+    rub_equivalent: int
+    visit_count: int
+    last_visit_at: Optional[datetime] = None
+
+
+class LoungeMyBonusesOut(BaseModel):
+    items: List[LoungeMyBonusItemOut]
+    total_balance: int
+    total_rub: int
+
+
 # MARK: - Brand Analytics (2026-05-26)
 
 class FlavorPopularity(BaseModel):

@@ -284,6 +284,9 @@ class LoungeGuestLoyalty(Base):
     # Added in prod via manual ALTER for "≤3 visits/day per guest" rule.
     today_visit_count = Column(Integer, default=0)
     today_date = Column(Date)
+    # Per-lounge bonus balance (separate from общие угольки in UserProgress.points).
+    # Added 2026-05-26: ALTER TABLE lounge_guest_loyalty ADD COLUMN IF NOT EXISTS bonus_balance.
+    bonus_balance = Column(Integer, nullable=False, default=0, server_default="0")
 
     __table_args__ = (UniqueConstraint("brand_id", "user_id"),)
 

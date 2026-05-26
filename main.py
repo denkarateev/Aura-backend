@@ -224,6 +224,8 @@ from app.schemas import (
     FlavorPopularity,
     RegionBucket,
     BrandAnalyticsOut,
+    LoungeMyBonusItemOut,
+    LoungeMyBonusesOut,
 )
 
 # -------------------------------------------------------------------
@@ -2147,6 +2149,27 @@ def startup():
                 """
             )
 
+    # MARK: lounge_guest_loyalty.bonus_balance — per-lounge bonus wallet (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                ALTER TABLE lounge_guest_loyalties
+                ADD COLUMN IF NOT EXISTS bonus_balance INTEGER NOT NULL DEFAULT 0
+                """
+            )
+            # Backfill: approximate historical balance as visit_count * 50 pts.
+            # Only touches rows where bonus_balance is still 0 and guest has visits.
+            # Safe to re-run: condition "bonus_balance = 0 AND visit_count > 0"
+            # prevents overwriting rows already updated by the new logic.
+            conn.exec_driver_sql(
+                """
+                UPDATE lounge_guest_loyalties
+                SET bonus_balance = visit_count * 50
+                WHERE bonus_balance = 0 AND visit_count > 0
+                """
+            )
+
     # MARK: bonus_redemptions — owner-initiated bonus write-off (2026-05-26)
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
@@ -3468,15 +3491,31 @@ def register_lounge_checkin(
         checkin_bonus = 0
 
     if checkin_bonus > 0:
+        # Бонусы лаунжа — per-lounge кошелёк, НЕ общие угольки.
+        loyalty.bonus_balance = (loyalty.bonus_balance or 0) + checkin_bonus
+        # Audit-trail в UserActivity: points_delta=0, чтобы НЕ менять общий
+        # баланс угольков (UserProgress.points). Запись нужна только для
+        # истории событий в ленте гостя.
+        db.add(UserActivity(
+            user_id=guest_user.id,
+            event_type="lounge_checkin_bonus",
+            title=f"Бонусы в {display_title_from_brand_id(brand_id)}",
+            description=f"+{checkin_bonus} бонусов в этом заведении" + (
+                f" (чек {int(payload.bill_amount)} ₽)" if lp_mode == "percent_of_bill" and payload.bill_amount else ""
+            ),
+            points_delta=0,   # не в общие угольки
+            rating_delta=0,
+        ))
+
+    # Первый визит → 50 общих угольков как мотивация посещать новые заведения.
+    if is_first_visit:
         record_progress_event(
             user=guest_user,
             db=db,
-            event_type="lounge_checkin_bonus",
-            title=f"Бонусы за визит в {display_title_from_brand_id(brand_id)}",
-            description=f"+{checkin_bonus} угольков за {'первый визит' if is_first_visit else 'визит'}" + (
-                f" (чек {int(payload.bill_amount)} ₽)" if lp_mode == "percent_of_bill" and payload.bill_amount else ""
-            ),
-            points_delta=checkin_bonus,
+            event_type="lounge_first_visit",
+            title=f"Первый визит в {display_title_from_brand_id(brand_id)}",
+            description="+50 угольков за знакомство с новым заведением",
+            points_delta=50,
             rating_delta=0,
         )
     # --- end bonus accrual ---
@@ -4905,6 +4944,42 @@ def list_my_bundles(
     return BundleListOut(
         active=[bundle_to_out(b) for b in active],
         past=[bundle_to_out(b) for b in past],
+    )
+
+
+@app.get("/users/me/lounge-bonuses", response_model=LoungeMyBonusesOut, tags=["loyalty"])
+def my_lounge_bonuses(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Список заведений, где у текущего юзера есть ненулевой бонусный баланс.
+    Угольки — отдельно (GET /me). Это per-lounge бонусы, полученные на чек-инах.
+    """
+    current_user = get_required_user(user)
+    rows = (
+        db.query(LoungeGuestLoyalty)
+        .filter(
+            LoungeGuestLoyalty.user_id == current_user.id,
+            LoungeGuestLoyalty.bonus_balance > 0,
+        )
+        .order_by(LoungeGuestLoyalty.bonus_balance.desc())
+        .all()
+    )
+    items = [
+        LoungeMyBonusItemOut(
+            brand_id=r.brand_id,
+            brand_title=display_title_from_brand_id(r.brand_id),
+            bonus_balance=r.bonus_balance,
+            rub_equivalent=r.bonus_balance // 10,
+            visit_count=r.visit_count,
+            last_visit_at=r.last_visit_at,
+        )
+        for r in rows
+    ]
+    return LoungeMyBonusesOut(
+        items=items,
+        total_balance=sum(r.bonus_balance for r in rows),
+        total_rub=sum(r.bonus_balance // 10 for r in rows),
     )
 
 
@@ -7138,6 +7213,11 @@ def lounge_crm_stats(
     request: Request,
     brand_id: str,
     period: str = Query("month", regex="^(week|month|all)$"),
+    # Юзер: «пиковые часы не правильно показываются по GMT устройства должно
+    # смотреть». iOS передаёт TimeZone.current.secondsFromGMT()/60 — для
+    # Москвы это +180. Сдвигаем UTC-created_at на это смещение перед
+    # вычислением hour/weekday.
+    tz_offset_min: int = Query(0, ge=-720, le=840),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -7266,8 +7346,11 @@ def lounge_crm_regulars(
         guest = db.query(User).filter(User.id == row.user_id).first()
         if not guest:
             continue
-        progress = db.query(UserProgress).filter(UserProgress.user_id == row.user_id).first()
-        bonus_balance = progress.points if progress else 0
+        loyalty_row = db.query(LoungeGuestLoyalty).filter(
+            LoungeGuestLoyalty.brand_id == brand_id,
+            LoungeGuestLoyalty.user_id == row.user_id,
+        ).first()
+        bonus_balance = (loyalty_row.bonus_balance or 0) if loyalty_row else 0
         avg_bill = (row.total_spent // row.visits_count) if row.visits_count else 0
         items.append(LoungeCrmRegularOut(
             user_id=row.user_id,
@@ -7317,8 +7400,11 @@ def lounge_crm_guest_card(
     last_visit_at = visits[0].created_at
     first_visit_at = visits[-1].created_at
 
-    progress = db.query(UserProgress).filter(UserProgress.user_id == guest_user_id).first()
-    bonus_balance = progress.points if progress else 0
+    loyalty_card = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == guest_user_id,
+    ).first()
+    bonus_balance = (loyalty_card.bonus_balance or 0) if loyalty_card else 0
 
     recent_visits = [
         GuestVisitRowOut(
@@ -7422,7 +7508,21 @@ async def duel_websocket(duel_id: str, websocket: WebSocket, token: str = None, 
 # ===================================================================
 
 def _compute_guest_balance(db: Session, brand_id: str, guest_user_id: int) -> dict:
-    """Return aggregate bonus stats for a guest at a given lounge."""
+    """Return per-lounge bonus stats for a guest.
+
+    Source of truth: LoungeGuestLoyalty.bonus_balance (per-lounge wallet).
+    total_earned / total_redeemed are audit aggregates for display only and
+    are NOT used for balance decisions or validation.
+    """
+    loyalty = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == guest_user_id,
+    ).first()
+
+    bonus_balance = (loyalty.bonus_balance or 0) if loyalty else 0
+    last_visit_at = loyalty.last_visit_at if loyalty else None
+
+    # Audit aggregates (display only — not authoritative).
     total_earned = db.query(
         func.coalesce(func.sum(LoungeVisit.bonus_awarded), 0)
     ).filter(
@@ -7436,14 +7536,6 @@ def _compute_guest_balance(db: Session, brand_id: str, guest_user_id: int) -> di
         BonusRedemption.brand_id == brand_id,
         BonusRedemption.guest_user_id == guest_user_id,
     ).scalar() or 0
-
-    bonus_balance = max(total_earned - total_redeemed, 0)
-
-    last_loyalty = db.query(LoungeGuestLoyalty).filter(
-        LoungeGuestLoyalty.brand_id == brand_id,
-        LoungeGuestLoyalty.user_id == guest_user_id,
-    ).first()
-    last_visit_at = last_loyalty.last_visit_at if last_loyalty else None
 
     return {
         "total_earned": total_earned,
@@ -7511,8 +7603,12 @@ def redeem_bonus(
     if not guest:
         raise HTTPException(404, "Гость не найден")
 
-    stats = _compute_guest_balance(db, brand_id, payload.guest_user_id)
-    bonus_balance = stats["bonus_balance"]
+    # Load loyalty row — source of truth for per-lounge balance.
+    loyalty = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == payload.guest_user_id,
+    ).first()
+    bonus_balance = (loyalty.bonus_balance or 0) if loyalty else 0
     points_needed = payload.amount_rub * 10
 
     if bonus_balance < points_needed:
@@ -7523,6 +7619,10 @@ def redeem_bonus(
         )
 
     balance_after = bonus_balance - points_needed
+
+    # Deduct from the per-lounge wallet.
+    if loyalty:
+        loyalty.bonus_balance = balance_after
 
     redemption = BonusRedemption(
         brand_id=brand_id,
@@ -7536,6 +7636,8 @@ def redeem_bonus(
     db.add(redemption)
     db.commit()
 
+    # Audit aggregates for the response (display only).
+    stats = _compute_guest_balance(db, brand_id, payload.guest_user_id)
     return GuestBalanceOut(
         user_id=guest.id,
         username=guest.username or guest.display_name or f"user_{guest.id}",
@@ -7543,7 +7645,7 @@ def redeem_bonus(
         bonus_balance=balance_after,
         rub_equivalent=balance_after // 10,
         total_earned=stats["total_earned"],
-        total_redeemed=stats["total_redeemed"] + points_needed,
+        total_redeemed=stats["total_redeemed"],
         last_visit_at=stats["last_visit_at"],
     )
 
