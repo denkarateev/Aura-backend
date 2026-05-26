@@ -14,7 +14,9 @@ DATABASE_URL = os.getenv(
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+# Legacy constant — kept for any code that imports it directly.
+# New code should use app.core.security.ACCESS_TOKEN_EXPIRE_MINUTES (15 min).
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
 
 # YooKassa — pack purchases. Secret key must NEVER be logged / returned to client.
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")

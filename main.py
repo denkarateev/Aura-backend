@@ -2361,16 +2361,44 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
                     points_delta=200,
                     rating_delta=0,
                 )
+                # Юзер: «не пришёл push что по моей ссылке создали аккаунт».
+                # Шлём push реферреру синхронно — внутри try/except чтобы
+                # не блокировать signup при сбое APNs.
+                try:
+                    from app.push import send_push_fanout_async
+                    import asyncio as _asyncio
+                    invited_name = user.username or user.email or "новый юзер"
+                    _asyncio.run(send_push_fanout_async(
+                        db,
+                        [referrer.id],
+                        "🎉 У тебя новый реферал!",
+                        f"{invited_name} зарегистрировался по твоей ссылке. +200 угольков на баланс.",
+                        payload={"type": "referral", "new_user_id": user.id},
+                    ))
+                except Exception as push_e:
+                    print(f"[referral] push failed for {referrer.id}: {push_e}")
             except Exception as e:
                 print(f"[referral] reward failed for {referrer.id}: {e}")
 
     db.commit()
     db.refresh(user)
 
+    # Issue refresh token for new clients
+    raw_rt, rt_hash, rt_expires = create_refresh_token()
+    db.add(RefreshToken(
+        user_id=user.id,
+        token_hash=rt_hash,
+        issued_at=datetime.utcnow(),
+        expires_at=rt_expires,
+    ))
+    db.commit()
+
     return LoginResponse(
         user_id=user.id,
         token=create_access_token({"sub": str(user.id)}),
-        username=user.username
+        username=user.username,
+        refresh_token=raw_rt,
+        access_expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
 
@@ -2400,13 +2428,116 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         user.password_hash = hash_password(payload.password)
 
     track_daily_login(user, db)
+
+    # Issue refresh token
+    raw_rt, rt_hash, rt_expires = create_refresh_token()
+    db.add(RefreshToken(
+        user_id=user.id,
+        token_hash=rt_hash,
+        issued_at=datetime.utcnow(),
+        expires_at=rt_expires,
+    ))
     db.commit()
 
     return LoginResponse(
         user_id=user.id,
         token=create_access_token({"sub": str(user.id)}),
-        username=user.username
+        username=user.username,
+        refresh_token=raw_rt,
+        access_expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
+
+
+# -------------------------------------------------------------------
+# AUTH — refresh + logout
+# -------------------------------------------------------------------
+
+@app.post("/auth/refresh", response_model=TokenRefreshResponse)
+def auth_refresh(
+    payload: TokenRefreshRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Rotate a refresh token. Old token is revoked immediately.
+    Returns new access_token + new refresh_token.
+
+    Backward-compat: old long-lived access tokens (7-day exp) issued
+    before this feature was deployed keep working until they expire.
+    """
+    incoming_hash = hash_refresh_token(payload.refresh_token)
+    row = db.query(RefreshToken).filter(
+        RefreshToken.token_hash == incoming_hash
+    ).first()
+
+    if not row:
+        raise HTTPException(401, "Invalid refresh token")
+    if row.revoked_at is not None:
+        raise HTTPException(401, "Refresh token revoked")
+    if row.expires_at < datetime.utcnow():
+        raise HTTPException(401, "Refresh token expired")
+
+    user = db.query(User).filter(User.id == row.user_id).first()
+    if not user or user.is_banned or user.is_deleted:
+        raise HTTPException(401, "Account unavailable")
+
+    # Revoke old token (rotation)
+    row.revoked_at = datetime.utcnow()
+
+    # Issue new pair
+    raw_rt, rt_hash, rt_expires = create_refresh_token()
+    ua = request.headers.get("user-agent", "")[:512]
+    ip = request.client.host if request.client else None
+    db.add(RefreshToken(
+        user_id=user.id,
+        token_hash=rt_hash,
+        issued_at=datetime.utcnow(),
+        expires_at=rt_expires,
+        user_agent=ua,
+        ip=ip,
+    ))
+    db.commit()
+
+    return TokenRefreshResponse(
+        access_token=create_access_token({"sub": str(user.id)}),
+        refresh_token=raw_rt,
+        access_expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
+
+@app.post("/auth/logout", response_model=StatusOut)
+def auth_logout(
+    payload: LogoutRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Invalidate a refresh token. If refresh_token is provided — revoke
+    that specific session. Otherwise revoke all active sessions for the
+    current user (full logout).
+    """
+    current_user = get_required_user(user)
+    now = datetime.utcnow()
+
+    if payload.refresh_token:
+        incoming_hash = hash_refresh_token(payload.refresh_token)
+        row = db.query(RefreshToken).filter(
+            RefreshToken.token_hash == incoming_hash,
+            RefreshToken.user_id == current_user.id,
+        ).first()
+        if row and row.revoked_at is None:
+            row.revoked_at = now
+    else:
+        # Revoke all active sessions
+        db.query(RefreshToken).filter(
+            RefreshToken.user_id == current_user.id,
+            RefreshToken.revoked_at.is_(None),
+            RefreshToken.expires_at > now,
+        ).update({"revoked_at": now})
+
+    db.commit()
+    return StatusOut(status="ok")
+
 
 # -------------------------------------------------------------------
 # PROFILE
@@ -4054,6 +4185,42 @@ def generate_mix_from_brief(
 
 
 # MARK: Mix Wizard — GET /users/me/mixes with status filter (S2026-04-29)
+# MARK: Referrals — counter for ReferralView.
+# Юзер: «не отображается сколько друзей позвал». Считаем по
+# user_activities.event_type='referral_reward' — туда пишем при signup
+# с referrer_code (см. ~line 2347). Каждая строка = 1 успешный реферал
+# + 200 угольков начислено.
+@app.get("/users/me/referrals")
+def get_my_referrals(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    current = get_required_user(user)
+    rows = (
+        db.query(UserActivity)
+        .filter(
+            UserActivity.user_id == current.id,
+            UserActivity.event_type == "referral_reward"
+        )
+        .order_by(UserActivity.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return {
+        "invited_count": len(rows),
+        "total_bonus_earned": sum((r.points_delta or 0) for r in rows),
+        "recent_invites": [
+            {
+                "title": r.title,
+                "description": r.description,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "points": r.points_delta or 0,
+            }
+            for r in rows[:10]
+        ],
+    }
+
+
 @app.get("/users/me/mixes", response_model=List[MixOut])
 def list_my_mixes(
     status: Optional[str] = Query(None, description="Filter by status: 'public' | 'subscribers' | 'draft'"),
