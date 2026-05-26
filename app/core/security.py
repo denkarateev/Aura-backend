@@ -9,10 +9,11 @@ from app.core.config import ALGORITHM, SECRET_KEY
 
 security = HTTPBearer(auto_error=False)
 
-# Access token lifetime: 15 min for new clients.
-# Backward-compat: old long-lived tokens (7-day exp) are still accepted
-# because we validate only exp claim — no separate "type" check needed.
-ACCESS_TOKEN_EXPIRE_MINUTES = 15
+# Access token lifetime.
+# Юзер: «не удалось загрузить регуляров» — корень был в том что 15 мин
+# истекали и iOS пока не имеет refresh-логики. Возвращаем 7 дней до
+# момента когда iOS-агент подключит /auth/refresh и автоматический retry.
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 # Refresh token lifetime: 30 days.
 REFRESH_TOKEN_EXPIRE_DAYS = 30
