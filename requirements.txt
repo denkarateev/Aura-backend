@@ -16,3 +16,4 @@ Pillow>=10.0
 python-multipart
 gunicorn>=21
 slowapi>=0.1.9
+boto3>=1.34

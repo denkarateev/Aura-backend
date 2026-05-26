@@ -6607,12 +6607,10 @@ def _save_avatar_bytes(user_id: int, raw: bytes, mime_type: str) -> str:
         ext = "webp"
     elif "heic" in lowered or "heif" in lowered:
         ext = "heic"
-    folder = os.path.join(_STATIC_ROOT, "uploads", "avatars", str(user_id))
-    os.makedirs(folder, exist_ok=True)
     ts = int(datetime.utcnow().timestamp() * 1000)
     fname = f"{ts}.{ext}"
-    fpath = os.path.join(folder, fname)
-    payload = raw
+    upload_bytes = raw
+    content_type = mime_type or "image/jpeg"
     # Best-effort resize (degrades gracefully if Pillow not installed).
     try:
         from PIL import Image  # type: ignore
@@ -6626,18 +6624,21 @@ def _save_avatar_bytes(user_id: int, raw: bytes, mime_type: str) -> str:
         if save_format == "JPEG" and img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         img.save(buf, format=save_format, quality=85)
-        payload = buf.getvalue()
-        # If we re-encoded heic to jpeg, fix extension/url.
+        upload_bytes = buf.getvalue()
+        # If we re-encoded heic to jpeg, fix extension/content-type.
         if ext == "heic":
             ext = "jpg"
             fname = f"{ts}.{ext}"
-            fpath = os.path.join(folder, fname)
+            content_type = "image/jpeg"
     except Exception as e:
-        # Pillow missing or decode failed — write the raw bytes as-is.
+        # Pillow missing or decode failed — upload the raw bytes as-is.
         print(f"[avatar] pillow fallback: {e}")
-    with open(fpath, "wb") as f:
-        f.write(payload)
-    return f"/static/uploads/avatars/{user_id}/{fname}"
+
+    # Upload via storage abstraction (local or S3 depending on ENV).
+    from app.services.storage import get_storage as _get_storage
+    key = f"uploads/avatars/{user_id}/{fname}"
+    url = _get_storage().upload(key, upload_bytes, content_type)
+    return url
 
 
 @app.post("/me/master/avatar")
