@@ -816,3 +816,45 @@ class LoungeVisit(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     guest = relationship("User", foreign_keys=[user_id])
+
+
+# MARK: - Bonus Redemption (2026-05-26)
+
+class BonusRedemption(Base):
+    """
+    One bonus-points write-off executed by a lounge owner/manager.
+    bonus_points = amount_rub * 10  (10 pts per 1 rub).
+    balance_after is denormalised for fast audit display.
+    """
+    __tablename__ = "bonus_redemptions"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    guest_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount_rub = Column(Integer, nullable=False)
+    bonus_points = Column(Integer, nullable=False)
+    balance_after = Column(Integer, nullable=False)
+    note = Column(String(256), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    guest = relationship("User", foreign_keys=[guest_user_id])
+    owner = relationship("User", foreign_keys=[owner_user_id])
+
+
+# MARK: - Lounge Promoted Slots (2026-05-26)
+
+class LoungePromotedSlot(Base):
+    """
+    Featured / promoted placement for a lounge brand.
+    Active when NOW() is between starts_at and ends_at.
+    region is optional — NULL means shown to all regions.
+    """
+    __tablename__ = "lounge_promoted_slots"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, unique=True, index=True)
+    starts_at = Column(DateTime(timezone=True), nullable=False)
+    ends_at = Column(DateTime(timezone=True), nullable=False)
+    region = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

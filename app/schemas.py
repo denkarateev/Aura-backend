@@ -1180,3 +1180,84 @@ class LoungeCrmGuestCardOut(BaseModel):
     favorite_brands: Optional[List[str]] = None
     last_mixes: List[dict] = []
     recent_visits: List[GuestVisitRowOut] = []
+
+
+# MARK: - Bonus Redemption (2026-05-26)
+
+class GuestBalanceOut(BaseModel):
+    user_id: int
+    username: str
+    avatar_url: Optional[str] = None
+    bonus_balance: int        # текущий баланс в баллах
+    rub_equivalent: int       # bonus_balance // 10
+    total_earned: int         # всего начислено баллов
+    total_redeemed: int       # всего списано баллов
+    last_visit_at: Optional[datetime] = None
+
+
+class RedeemIn(BaseModel):
+    guest_user_id: int
+    amount_rub: int           # сколько рублей списываем (мин 200)
+    note: Optional[str] = None
+
+
+class RedemptionRowOut(BaseModel):
+    id: int
+    brand_id: str
+    guest_user_id: int
+    guest_username: Optional[str] = None
+    owner_user_id: int
+    amount_rub: int
+    bonus_points: int
+    balance_after: int
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class RedemptionListOut(BaseModel):
+    items: List[RedemptionRowOut]
+    total: int
+
+
+# MARK: - Promoted Lounges (2026-05-26)
+
+class PromotedLoungeOut(BaseModel):
+    brand_id: str
+    starts_at: datetime
+    ends_at: datetime
+    region: Optional[str] = None
+
+
+class PromotedListOut(BaseModel):
+    items: List[PromotedLoungeOut]
+    total: int
+
+
+class PromotedSlotIn(BaseModel):
+    brand_id: str
+    starts_at: datetime
+    ends_at: datetime
+    region: Optional[str] = None
+
+
+# MARK: - Brand Analytics (2026-05-26)
+
+class FlavorPopularity(BaseModel):
+    flavor: str
+    mixes_count: int
+    avg_percentage: float
+
+
+class RegionBucket(BaseModel):
+    region: str
+    mixes_count: int
+
+
+class BrandAnalyticsOut(BaseModel):
+    brand: str
+    total_mixes_using: int
+    total_likes_on_those_mixes: int
+    unique_authors: int
+    top_flavors: List[FlavorPopularity]
+    growth_30d: float
+    region_split: List[RegionBucket]

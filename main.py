@@ -53,6 +53,7 @@ from app.core.security import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from app.models import (
+    BonusRedemption,
     Duel,
     BowlHeatRun,
     Comment,
@@ -66,6 +67,7 @@ from app.models import (
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
     LoungePromo,
+    LoungePromotedSlot,
     LoungeSubscription,
     LoungeVisit,
     DeviceToken,
@@ -212,6 +214,16 @@ from app.schemas import (
     LoungeCrmRegularsOut,
     GuestVisitRowOut,
     LoungeCrmGuestCardOut,
+    GuestBalanceOut,
+    RedeemIn,
+    RedemptionRowOut,
+    RedemptionListOut,
+    PromotedLoungeOut,
+    PromotedListOut,
+    PromotedSlotIn,
+    FlavorPopularity,
+    RegionBucket,
+    BrandAnalyticsOut,
 )
 
 # -------------------------------------------------------------------
@@ -894,6 +906,17 @@ def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
     email = normalize_key(user.email)
     username = normalize_key(user.username)
     return username in allowed or email in allowed
+
+
+def require_admin(user: Optional[User] = Depends(get_current_user)) -> User:
+    """Dependency: raises 403 unless the caller is an admin.
+    MVP: user.is_admin flag OR user.id == 1 (dorfden).
+    """
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+    if not user.is_admin and user.id != 1:
+        raise HTTPException(403, "Admin access required")
+    return user
 
 
 def get_required_user(user: Optional[User]) -> User:
@@ -2120,6 +2143,78 @@ def startup():
                 """
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS share_flavors BOOLEAN NOT NULL DEFAULT TRUE
+                """
+            )
+
+    # MARK: bonus_redemptions — owner-initiated bonus write-off (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS bonus_redemptions (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL,
+                    guest_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                    amount_rub INTEGER NOT NULL,
+                    bonus_points INTEGER NOT NULL,
+                    balance_after INTEGER NOT NULL,
+                    note VARCHAR(256),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bonus_redemptions_brand_id
+                ON bonus_redemptions (brand_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bonus_redemptions_guest_user_id
+                ON bonus_redemptions (guest_user_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bonus_redemptions_brand_created
+                ON bonus_redemptions (brand_id, created_at DESC)
+                """
+            )
+
+    # MARK: lounge_promoted_slots — featured promo placements (2026-05-26)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_promoted_slots (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL UNIQUE,
+                    starts_at TIMESTAMPTZ NOT NULL,
+                    ends_at TIMESTAMPTZ NOT NULL,
+                    region VARCHAR(64),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS ix_lounge_promoted_slots_brand_id
+                ON lounge_promoted_slots (brand_id)
+                """
+            )
+            # Seed: garden_lounge_korolev promoted for 7 days from now, region=moscow
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_promoted_slots (brand_id, starts_at, ends_at, region)
+                VALUES (
+                    'garden_lounge_korolev',
+                    NOW(),
+                    NOW() + INTERVAL '7 days',
+                    'moscow'
+                )
+                ON CONFLICT (brand_id) DO NOTHING
                 """
             )
 
@@ -7121,3 +7216,381 @@ async def duel_websocket(duel_id: str, websocket: WebSocket, token: str = None, 
     except Exception as e:
         print("[WS] error duel=" + str(duel_id) + ":", e)
         await duel_manager.disconnect(duel_id, websocket)
+
+
+# ===================================================================
+# BLOCK 1 — Bonus Redemption (2026-05-26)
+# ===================================================================
+
+def _compute_guest_balance(db: Session, brand_id: str, guest_user_id: int) -> dict:
+    """Return aggregate bonus stats for a guest at a given lounge."""
+    total_earned = db.query(
+        func.coalesce(func.sum(LoungeVisit.bonus_awarded), 0)
+    ).filter(
+        LoungeVisit.brand_id == brand_id,
+        LoungeVisit.user_id == guest_user_id,
+    ).scalar() or 0
+
+    total_redeemed = db.query(
+        func.coalesce(func.sum(BonusRedemption.bonus_points), 0)
+    ).filter(
+        BonusRedemption.brand_id == brand_id,
+        BonusRedemption.guest_user_id == guest_user_id,
+    ).scalar() or 0
+
+    bonus_balance = max(total_earned - total_redeemed, 0)
+
+    last_loyalty = db.query(LoungeGuestLoyalty).filter(
+        LoungeGuestLoyalty.brand_id == brand_id,
+        LoungeGuestLoyalty.user_id == guest_user_id,
+    ).first()
+    last_visit_at = last_loyalty.last_visit_at if last_loyalty else None
+
+    return {
+        "total_earned": total_earned,
+        "total_redeemed": total_redeemed,
+        "bonus_balance": bonus_balance,
+        "last_visit_at": last_visit_at,
+    }
+
+
+@app.get(
+    "/lounges/{brand_id}/guests/{user_id}/balance",
+    response_model=GuestBalanceOut,
+    tags=["loyalty"],
+)
+def get_guest_bonus_balance(
+    brand_id: str,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Текущий бонусный баланс гостя в конкретном лаунже (только для менеджера)."""
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Нет доступа к этому лаунжу")
+
+    guest = db.query(User).filter(User.id == user_id, User.is_deleted == False).first()
+    if not guest:
+        raise HTTPException(404, "Гость не найден")
+
+    stats = _compute_guest_balance(db, brand_id, user_id)
+
+    return GuestBalanceOut(
+        user_id=guest.id,
+        username=guest.username or guest.display_name or f"user_{guest.id}",
+        avatar_url=guest.avatar_url,
+        bonus_balance=stats["bonus_balance"],
+        rub_equivalent=stats["bonus_balance"] // 10,
+        total_earned=stats["total_earned"],
+        total_redeemed=stats["total_redeemed"],
+        last_visit_at=stats["last_visit_at"],
+    )
+
+
+@app.post(
+    "/lounges/{brand_id}/redeem",
+    response_model=GuestBalanceOut,
+    tags=["loyalty"],
+)
+def redeem_bonus(
+    brand_id: str,
+    payload: RedeemIn,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Списание бонусов гостя владельцем/менеджером лаунжа."""
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Нет доступа к этому лаунжу")
+
+    if payload.amount_rub < 200:
+        raise HTTPException(400, "Минимальная сумма списания 200 ₽")
+
+    guest = db.query(User).filter(
+        User.id == payload.guest_user_id,
+        User.is_deleted == False,
+    ).first()
+    if not guest:
+        raise HTTPException(404, "Гость не найден")
+
+    stats = _compute_guest_balance(db, brand_id, payload.guest_user_id)
+    bonus_balance = stats["bonus_balance"]
+    points_needed = payload.amount_rub * 10
+
+    if bonus_balance < points_needed:
+        available_rub = bonus_balance // 10
+        raise HTTPException(
+            400,
+            f"Недостаточно баллов. Доступно: {available_rub} ₽",
+        )
+
+    balance_after = bonus_balance - points_needed
+
+    redemption = BonusRedemption(
+        brand_id=brand_id,
+        guest_user_id=payload.guest_user_id,
+        owner_user_id=current_user.id,
+        amount_rub=payload.amount_rub,
+        bonus_points=points_needed,
+        balance_after=balance_after,
+        note=payload.note,
+    )
+    db.add(redemption)
+    db.commit()
+
+    return GuestBalanceOut(
+        user_id=guest.id,
+        username=guest.username or guest.display_name or f"user_{guest.id}",
+        avatar_url=guest.avatar_url,
+        bonus_balance=balance_after,
+        rub_equivalent=balance_after // 10,
+        total_earned=stats["total_earned"],
+        total_redeemed=stats["total_redeemed"] + points_needed,
+        last_visit_at=stats["last_visit_at"],
+    )
+
+
+@app.get(
+    "/lounges/{brand_id}/redemptions",
+    response_model=RedemptionListOut,
+    tags=["loyalty"],
+)
+def list_redemptions(
+    brand_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Лента списаний бонусов для аудита (только менеджер)."""
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Нет доступа к этому лаунжу")
+
+    q = db.query(BonusRedemption).filter(BonusRedemption.brand_id == brand_id)
+    total = q.count()
+    rows = q.order_by(BonusRedemption.created_at.desc()).offset(offset).limit(limit).all()
+
+    # resolve guest usernames in one pass
+    guest_ids = list({r.guest_user_id for r in rows})
+    users_map = {
+        u.id: u
+        for u in db.query(User).filter(User.id.in_(guest_ids)).all()
+    } if guest_ids else {}
+
+    items = [
+        RedemptionRowOut(
+            id=r.id,
+            brand_id=r.brand_id,
+            guest_user_id=r.guest_user_id,
+            guest_username=(
+                users_map.get(r.guest_user_id, None).username
+                if users_map.get(r.guest_user_id) else None
+            ),
+            owner_user_id=r.owner_user_id,
+            amount_rub=r.amount_rub,
+            bonus_points=r.bonus_points,
+            balance_after=r.balance_after,
+            note=r.note,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+    return RedemptionListOut(items=items, total=total)
+
+
+# ===================================================================
+# BLOCK 2 — Featured Promoted Slots (2026-05-26)
+# ===================================================================
+
+@app.get(
+    "/lounges/promoted",
+    response_model=PromotedListOut,
+    tags=["lounges"],
+)
+def list_promoted_lounges(
+    region: Optional[str] = Query(None, description="Фильтр по региону: 'moscow', 'spb', ..."),
+    db: Session = Depends(get_db),
+):
+    """Публичный список активных featured-лаунжей (now between starts_at и ends_at)."""
+    now = datetime.utcnow()
+    q = db.query(LoungePromotedSlot).filter(
+        LoungePromotedSlot.starts_at <= now,
+        LoungePromotedSlot.ends_at >= now,
+    )
+    if region:
+        q = q.filter(
+            (LoungePromotedSlot.region == region) | (LoungePromotedSlot.region == None)
+        )
+
+    rows = q.order_by(LoungePromotedSlot.starts_at.asc()).all()
+
+    items = [
+        PromotedLoungeOut(
+            brand_id=r.brand_id,
+            starts_at=r.starts_at,
+            ends_at=r.ends_at,
+            region=r.region,
+        )
+        for r in rows
+    ]
+    return PromotedListOut(items=items, total=len(items))
+
+
+@app.post(
+    "/admin/promoted",
+    response_model=PromotedLoungeOut,
+    tags=["admin"],
+)
+def create_promoted_slot(
+    payload: PromotedSlotIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Создать или обновить featured-слот для лаунжа (только admin)."""
+    if payload.starts_at >= payload.ends_at:
+        raise HTTPException(400, "starts_at должен быть раньше ends_at")
+
+    existing = db.query(LoungePromotedSlot).filter(
+        LoungePromotedSlot.brand_id == payload.brand_id
+    ).first()
+
+    if existing:
+        existing.starts_at = payload.starts_at
+        existing.ends_at = payload.ends_at
+        existing.region = payload.region
+        slot = existing
+    else:
+        slot = LoungePromotedSlot(
+            brand_id=payload.brand_id,
+            starts_at=payload.starts_at,
+            ends_at=payload.ends_at,
+            region=payload.region,
+        )
+        db.add(slot)
+
+    db.commit()
+    db.refresh(slot)
+
+    return PromotedLoungeOut(
+        brand_id=slot.brand_id,
+        starts_at=slot.starts_at,
+        ends_at=slot.ends_at,
+        region=slot.region,
+    )
+
+
+# ===================================================================
+# BLOCK 3 — Brand Analytics (B2B data API, 2026-05-26)
+# ===================================================================
+
+@app.get(
+    "/admin/brand-analytics",
+    response_model=BrandAnalyticsOut,
+    tags=["admin"],
+)
+def get_brand_analytics(
+    brand: str = Query(..., description="Название бренда, напр. BlackBurn"),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Агрегированная B2B аналитика для табачного бренда. Никаких персональных данных."""
+    now = datetime.utcnow()
+    period_30d_start = now - timedelta(days=30)
+    period_60d_start = now - timedelta(days=60)
+
+    # Total mixes using this brand
+    total_mixes_using = db.query(func.count(func.distinct(MixIngredient.mix_id))).filter(
+        func.lower(MixIngredient.brand) == brand.lower()
+    ).scalar() or 0
+
+    # Total likes on those mixes
+    mix_ids_subq = db.query(MixIngredient.mix_id).filter(
+        func.lower(MixIngredient.brand) == brand.lower()
+    ).subquery()
+
+    total_likes_on_those_mixes = db.query(func.count(Favorite.id)).filter(
+        Favorite.mix_id.in_(mix_ids_subq)
+    ).scalar() or 0
+
+    # Unique authors
+    unique_authors = db.query(func.count(func.distinct(Mix.author_id))).join(
+        MixIngredient, Mix.id == MixIngredient.mix_id
+    ).filter(
+        func.lower(MixIngredient.brand) == brand.lower()
+    ).scalar() or 0
+
+    # Top-10 flavors by mixes count
+    flavor_rows = db.query(
+        MixIngredient.flavor,
+        func.count(MixIngredient.mix_id).label("mixes_count"),
+        func.avg(MixIngredient.percentage).label("avg_percentage"),
+    ).filter(
+        func.lower(MixIngredient.brand) == brand.lower(),
+        MixIngredient.flavor != None,
+    ).group_by(
+        MixIngredient.flavor
+    ).order_by(
+        func.count(MixIngredient.mix_id).desc()
+    ).limit(10).all()
+
+    top_flavors = [
+        FlavorPopularity(
+            flavor=row.flavor,
+            mixes_count=row.mixes_count,
+            avg_percentage=round(float(row.avg_percentage or 0), 1),
+        )
+        for row in flavor_rows
+    ]
+
+    # Growth 30d vs previous 30d
+    mixes_last_30d = db.query(func.count(func.distinct(MixIngredient.mix_id))).join(
+        Mix, Mix.id == MixIngredient.mix_id
+    ).filter(
+        func.lower(MixIngredient.brand) == brand.lower(),
+        Mix.created_at >= period_30d_start,
+    ).scalar() or 0
+
+    mixes_prev_30d = db.query(func.count(func.distinct(MixIngredient.mix_id))).join(
+        Mix, Mix.id == MixIngredient.mix_id
+    ).filter(
+        func.lower(MixIngredient.brand) == brand.lower(),
+        Mix.created_at >= period_60d_start,
+        Mix.created_at < period_30d_start,
+    ).scalar() or 0
+
+    if mixes_prev_30d > 0:
+        growth_30d = round((mixes_last_30d - mixes_prev_30d) / mixes_prev_30d * 100, 1)
+    elif mixes_last_30d > 0:
+        growth_30d = 100.0
+    else:
+        growth_30d = 0.0
+
+    # Region split — group by lounge_id of mixes
+    region_rows = db.query(
+        Mix.lounge_id,
+        func.count(func.distinct(Mix.id)).label("cnt"),
+    ).join(
+        MixIngredient, Mix.id == MixIngredient.mix_id
+    ).filter(
+        func.lower(MixIngredient.brand) == brand.lower(),
+        Mix.lounge_id != None,
+    ).group_by(
+        Mix.lounge_id
+    ).order_by(
+        func.count(func.distinct(Mix.id)).desc()
+    ).all()
+
+    region_split = [
+        RegionBucket(region=row.lounge_id, mixes_count=row.cnt)
+        for row in region_rows
+    ]
+
+    return BrandAnalyticsOut(
+        brand=brand,
+        total_mixes_using=total_mixes_using,
+        total_likes_on_those_mixes=total_likes_on_those_mixes,
+        unique_authors=unique_authors,
+        top_flavors=top_flavors,
+        growth_30d=growth_30d,
+        region_split=region_split,
+    )
