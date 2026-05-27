@@ -3650,6 +3650,37 @@ def register_lounge_checkin(
     from sqlalchemy import text as _sa_text
     db.execute(_sa_text("INSERT INTO pending_duel_offers (user_id, brand_id, discount_percent) VALUES (:uid, :bid, :disc)"), {"uid": guest_user.id, "bid": brand_id, "disc": loyalty_out.tier.discount_percent})
     db.commit()
+
+    # Юзер: «при начислении бонусов кому назначили ничего не происходит».
+    # Владелец сканит QR гостя → checkin начисляет баллы → но гость
+    # ничего не видел. Шлём ему push сразу после commit.
+    if checkin_bonus > 0:
+        try:
+            from app.push import send_push_fanout_async
+            import asyncio as _asyncio_push
+            venue_title = display_title_from_brand_id(brand_id)
+            rub = checkin_bonus // 10
+            body = (
+                f"+{rub} ₽ ({checkin_bonus} баллов) в {venue_title}"
+                if rub > 0
+                else f"+{checkin_bonus} баллов в {venue_title}"
+            )
+            push_title = "🎉 Тебе начислили бонусы!" if is_first_visit else "🔥 +Бонусы за визит"
+            _asyncio_push.run(send_push_fanout_async(
+                db,
+                [guest_user.id],
+                push_title,
+                body,
+                payload={
+                    "type": "checkin_bonus",
+                    "brand_id": brand_id,
+                    "bonus": checkin_bonus,
+                    "is_first_visit": is_first_visit,
+                },
+            ))
+        except Exception as push_e:
+            print(f"[checkin] push failed for {guest_user.id}: {push_e}")
+
     return LoungeCheckinOut(
         guest=user_search_to_out(guest_user),
         loyalty=loyalty_out,
