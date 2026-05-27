@@ -63,6 +63,7 @@ from app.models import (
     LoungeAdminMeta,
     LoungeAssets,
     LoungeBundle,
+    LoungeBillingSubscription,
     LoungeBundleVisit,
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
@@ -231,9 +232,14 @@ from app.schemas import (
     LoungeAdminMetaIn,
     LoungeAdminListItemOut,
     LoungePublicMetaOut,
+    LoungeBillingSubscriptionOut,
+    LoungeBillingSubscriptionGrantIn,
+    LoungeCheckoutIn,
+    LoungeCheckoutOut,
     VALID_LOUNGE_TIERS,
     VALID_LOUNGE_BADGES,
 )
+from app.services.subscriptions import get_active_tier, require_tier
 
 # -------------------------------------------------------------------
 # UTILS
@@ -2315,6 +2321,55 @@ def startup():
                 """
             )
 
+    # MARK: lounge_billing_subscriptions — billing/subscription table (Sprint 1, 2026-05-27)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS lounge_billing_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    brand_id VARCHAR(128) NOT NULL,
+                    tier VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    started_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    payment_method VARCHAR(64),
+                    external_id VARCHAR(256),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_brand
+                ON lounge_billing_subscriptions(brand_id)
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_expires
+                ON lounge_billing_subscriptions(expires_at)
+                """
+            )
+            # Idempotent trial grant for garden_lounge_korolev — 90-day Pro trial
+            conn.exec_driver_sql(
+                """
+                INSERT INTO lounge_billing_subscriptions
+                    (brand_id, tier, status, started_at, expires_at, payment_method)
+                SELECT
+                    'garden_lounge_korolev',
+                    'pro',
+                    'trialing',
+                    NOW(),
+                    NOW() + INTERVAL '90 days',
+                    'trial'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM lounge_billing_subscriptions
+                    WHERE brand_id = 'garden_lounge_korolev'
+                )
+                """
+            )
+
     # MARK: Hot-path FK indexes (perf audit 2026-05-26)
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
@@ -2943,10 +2998,13 @@ def create_lounge_promo(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Create a new promo for a lounge. Owner / admin only."""
+    """Create a new promo for a lounge. Owner / admin only. Requires tier >= lite."""
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id):
         raise HTTPException(403, "Business access required")
+    # Feature gate: promos require lite or higher
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "lite")
 
     promo = LoungePromo(
         brand_id=brand_id,
@@ -2973,13 +3031,16 @@ def update_lounge_promo(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Update promo fields. Only owner of the lounge that owns this promo."""
+    """Update promo fields. Only owner of the lounge that owns this promo. Requires tier >= lite."""
     current_user = get_required_user(user)
     promo = db.query(LoungePromo).filter(LoungePromo.id == promo_id).first()
     if not promo:
         raise HTTPException(404, "Promo not found")
     if not can_manage_brand(current_user, promo.brand_id):
         raise HTTPException(403, "Business access required")
+    # Feature gate: promos require lite or higher
+    if not current_user.is_admin:
+        require_tier(db, promo.brand_id, "lite")
 
     update_data = payload.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -3064,10 +3125,14 @@ def update_lounge_loyalty(
     Owner-only upsert for the per-venue loyalty config.
     Access: brand manager (can_manage_brand) or admin.
     Validates mode, bill_percent (0-100), bonuses (>=0), birthday_multiplier (1-10).
+    Requires tier >= lite.
     """
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id):
         raise HTTPException(403, "Only the lounge owner can edit loyalty settings")
+    # Feature gate: loyalty customisation requires lite or higher
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "lite")
 
     if payload.mode not in ("percent_of_bill", "fixed"):
         raise HTTPException(422, "mode must be 'percent_of_bill' or 'fixed'")
@@ -7332,10 +7397,12 @@ def lounge_crm_stats(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Aggregate CRM stats for a lounge. Owner-only."""
+    """Aggregate CRM stats for a lounge. Owner-only. Requires tier >= pro."""
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id):
         raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
 
     now = datetime.utcnow()
     if period == "week":
@@ -7433,10 +7500,12 @@ def lounge_crm_regulars(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Top guests by visit count. Owner-only."""
+    """Top guests by visit count. Owner-only. Requires tier >= pro."""
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id):
         raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
 
     # Aggregate per user
     from sqlalchemy import func as _func
@@ -7489,10 +7558,12 @@ def lounge_crm_guest_card(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Full guest card with visit history. Owner-only."""
+    """Full guest card with visit history. Owner-only. Requires tier >= pro."""
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id):
         raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
 
     guest = db.query(User).filter(User.id == guest_user_id).first()
     if not guest:
@@ -8202,3 +8273,185 @@ def get_lounge_public_meta(brand_id: str, db: Session = Depends(get_db)):
         tier=meta.tier,
         badges=meta.badges if isinstance(meta.badges, list) else [],
     )
+
+
+# -------------------------------------------------------------------
+# BILLING SUBSCRIPTIONS — Sprint 1, 2026-05-27
+# -------------------------------------------------------------------
+
+@app.post(
+    "/admin/lounges/{brand_id}/subscription",
+    response_model=LoungeBillingSubscriptionOut,
+    tags=["admin", "billing"],
+)
+def admin_grant_subscription(
+    brand_id: str,
+    payload: LoungeBillingSubscriptionGrantIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """
+    Admin: grant or extend a billing subscription for a lounge.
+
+    Creates a new row in lounge_billing_subscriptions. Duration starts
+    from now (or from current active expires_at, whichever is later),
+    so calling multiple times extends the subscription rather than
+    overwriting.
+
+    Example:
+        POST /admin/lounges/garden_lounge_korolev/subscription
+        {"tier": "pro", "days": 90, "payment_method": "trial"}
+    """
+    if payload.tier not in VALID_LOUNGE_TIERS:
+        raise HTTPException(422, f"Invalid tier. Valid: {sorted(VALID_LOUNGE_TIERS)}")
+    if payload.days <= 0:
+        raise HTTPException(422, "days must be > 0")
+
+    now = datetime.utcnow()
+
+    # If there's already an active subscription, extend from its expires_at
+    existing = (
+        db.query(LoungeBillingSubscription)
+        .filter(
+            LoungeBillingSubscription.brand_id == brand_id,
+            LoungeBillingSubscription.expires_at > now,
+            LoungeBillingSubscription.status.in_(["active", "trialing"]),
+        )
+        .order_by(LoungeBillingSubscription.expires_at.desc())
+        .first()
+    )
+
+    start_from = existing.expires_at if existing else now
+    new_expires = start_from + timedelta(days=payload.days)
+
+    status = "trialing" if payload.payment_method == "trial" else "active"
+
+    sub = LoungeBillingSubscription(
+        brand_id=brand_id,
+        tier=payload.tier,
+        status=status,
+        started_at=now,
+        expires_at=new_expires,
+        payment_method=payload.payment_method,
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+
+    return LoungeBillingSubscriptionOut(
+        id=sub.id,
+        brand_id=sub.brand_id,
+        tier=sub.tier,
+        status=sub.status,
+        started_at=sub.started_at,
+        expires_at=sub.expires_at,
+        payment_method=sub.payment_method,
+        external_id=sub.external_id,
+        created_at=sub.created_at,
+    )
+
+
+@app.get(
+    "/admin/lounges/{brand_id}/subscription",
+    response_model=List[LoungeBillingSubscriptionOut],
+    tags=["admin", "billing"],
+)
+def admin_list_subscriptions(
+    brand_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin: list all billing subscription rows for a lounge (history + active)."""
+    rows = (
+        db.query(LoungeBillingSubscription)
+        .filter(LoungeBillingSubscription.brand_id == brand_id)
+        .order_by(LoungeBillingSubscription.expires_at.desc())
+        .all()
+    )
+    return [
+        LoungeBillingSubscriptionOut(
+            id=r.id,
+            brand_id=r.brand_id,
+            tier=r.tier,
+            status=r.status,
+            started_at=r.started_at,
+            expires_at=r.expires_at,
+            payment_method=r.payment_method,
+            external_id=r.external_id,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+# -------------------------------------------------------------------
+# YOOKASSA STUB ENDPOINTS — Sprint 1 (real integration in Sprint 2)
+# -------------------------------------------------------------------
+
+@app.post(
+    "/lounges/{brand_id}/subscription/checkout",
+    response_model=LoungeCheckoutOut,
+    tags=["billing"],
+)
+def lounge_subscription_checkout(
+    brand_id: str,
+    payload: LoungeCheckoutIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    STUB: Returns a YooKassa checkout URL for a lounge subscription.
+    Full YooKassa SDK integration is planned for Sprint 2.
+    Currently returns a placeholder URL.
+    """
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    if payload.tier not in VALID_LOUNGE_TIERS:
+        raise HTTPException(422, f"Invalid tier. Valid: {sorted(VALID_LOUNGE_TIERS)}")
+
+    # STUB — Sprint 2 will call yookassa SDK here
+    fake_payment_id = str(uuid.uuid4())
+    checkout_url = f"https://yookassa.ru/checkout/{fake_payment_id}"
+
+    return LoungeCheckoutOut(checkout_url=checkout_url)
+
+
+@app.post(
+    "/webhooks/yookassa",
+    response_model=StatusOut,
+    tags=["billing"],
+)
+async def yookassa_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    STUB: YooKassa payment webhook receiver.
+
+    Full HMAC validation and payment processing will be implemented in Sprint 2.
+    Currently logs the payload and returns 200 to prevent YooKassa retries.
+
+    Expected payload:
+        {"type": "notification", "event": "payment.succeeded",
+         "object": {"id": "...", "metadata": {"brand_id": "...", "tier": "..."}}}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # STUB — Sprint 2 will:
+    # 1. Validate HMAC-SHA256 signature from X-Content-SHA256 header
+    # 2. Parse payment.succeeded event
+    # 3. Extract brand_id + tier from payment.metadata
+    # 4. Create LoungeBillingSubscription row (30 days, status=active)
+
+    import logging as _lg
+    _lg.getLogger(__name__).info(
+        "yookassa_webhook stub received event=%s",
+        body.get("event", "unknown"),
+    )
+
+    return StatusOut(status="ok", message="webhook received (stub)")

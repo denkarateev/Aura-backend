@@ -864,6 +864,34 @@ class LoungePromotedSlot(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+# MARK: - Lounge billing subscriptions (Sprint 1, 2026-05-27)
+
+class LoungeBillingSubscription(Base):
+    """
+    Paid / trial subscription record for a lounge brand.
+
+    tier    — start | lite | pro | network | partner
+    status  — active | trialing | expired | cancelled
+    payment_method — yookassa_card | manual | trial
+    external_id    — YooKassa recurring subscription id (set in Sprint 2)
+
+    One brand can have multiple historical rows. The active tier is
+    determined by get_active_tier() which picks the row with
+    max(expires_at) where expires_at > now() and status in (active, trialing).
+    """
+    __tablename__ = "lounge_billing_subscriptions"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    tier = Column(String(32), nullable=False)                   # start|lite|pro|network|partner
+    status = Column(String(32), nullable=False)                 # active|trialing|expired|cancelled
+    started_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    payment_method = Column(String(64), nullable=True)          # yookassa_card|manual|trial
+    external_id = Column(String(256), nullable=True)            # YooKassa subscription id
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 # MARK: - Admin CRM meta for lounges (2026-05-26)
 
 class LoungeAdminMeta(Base):

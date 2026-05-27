@@ -1321,3 +1321,42 @@ class LoungePublicMetaOut(BaseModel):
     brand_id: str
     tier: str
     badges: List[str]
+
+
+# MARK: - Lounge billing subscription schemas (Sprint 1, 2026-05-27)
+
+class LoungeBillingSubscriptionOut(BaseModel):
+    id: int
+    brand_id: str
+    tier: str
+    status: str
+    started_at: datetime
+    expires_at: datetime
+    payment_method: Optional[str] = None
+    external_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LoungeBillingSubscriptionGrantIn(BaseModel):
+    """Admin: grant or extend a subscription."""
+    tier: str                       # start|lite|pro|network|partner
+    days: int                       # duration to add from now (or from current expires_at)
+    payment_method: str = "manual"  # yookassa_card|manual|trial
+
+
+class LoungeCheckoutIn(BaseModel):
+    """Body for POST /lounges/{brand_id}/subscription/checkout (stub)."""
+    tier: str                       # start|lite|pro|network|partner
+
+
+class LoungeCheckoutOut(BaseModel):
+    checkout_url: str
+
+
+class UpgradeRequiredOut(BaseModel):
+    error: str = "upgrade_required"
+    required_tier: str
+    current_tier: str
