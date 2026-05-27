@@ -2322,52 +2322,62 @@ def startup():
             )
 
     # MARK: lounge_billing_subscriptions — billing/subscription table (Sprint 1, 2026-05-27)
+    # Wrapped in try/except because multiple gunicorn workers run startup() concurrently;
+    # CREATE TABLE IF NOT EXISTS can race and raise UniqueViolation on pg_type_typname_nsp_index.
     if engine.dialect.name == "postgresql":
-        with engine.begin() as conn:
-            conn.exec_driver_sql(
-                """
-                CREATE TABLE IF NOT EXISTS lounge_billing_subscriptions (
-                    id SERIAL PRIMARY KEY,
-                    brand_id VARCHAR(128) NOT NULL,
-                    tier VARCHAR(32) NOT NULL,
-                    status VARCHAR(32) NOT NULL,
-                    started_at TIMESTAMP NOT NULL,
-                    expires_at TIMESTAMP NOT NULL,
-                    payment_method VARCHAR(64),
-                    external_id VARCHAR(256),
-                    created_at TIMESTAMP DEFAULT NOW()
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS lounge_billing_subscriptions (
+                        id SERIAL PRIMARY KEY,
+                        brand_id VARCHAR(128) NOT NULL,
+                        tier VARCHAR(32) NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        started_at TIMESTAMP NOT NULL,
+                        expires_at TIMESTAMP NOT NULL,
+                        payment_method VARCHAR(64),
+                        external_id VARCHAR(256),
+                        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
-            conn.exec_driver_sql(
-                """
-                CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_brand
-                ON lounge_billing_subscriptions(brand_id)
-                """
-            )
-            conn.exec_driver_sql(
-                """
-                CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_expires
-                ON lounge_billing_subscriptions(expires_at)
-                """
-            )
-            # Idempotent trial grant for garden_lounge_korolev — 90-day Pro trial
-            conn.exec_driver_sql(
-                """
-                INSERT INTO lounge_billing_subscriptions
-                    (brand_id, tier, status, started_at, expires_at, payment_method)
-                SELECT
-                    'garden_lounge_korolev',
-                    'pro',
-                    'trialing',
-                    NOW(),
-                    NOW() + INTERVAL '90 days',
-                    'trial'
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM lounge_billing_subscriptions
-                    WHERE brand_id = 'garden_lounge_korolev'
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_brand
+                    ON lounge_billing_subscriptions(brand_id)
+                    """
                 )
-                """
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lounge_billing_sub_expires
+                    ON lounge_billing_subscriptions(expires_at)
+                    """
+                )
+                # Idempotent trial grant for garden_lounge_korolev — 90-day Pro trial
+                conn.exec_driver_sql(
+                    """
+                    INSERT INTO lounge_billing_subscriptions
+                        (brand_id, tier, status, started_at, expires_at, payment_method, created_at)
+                    SELECT
+                        'garden_lounge_korolev',
+                        'pro',
+                        'trialing',
+                        NOW(),
+                        NOW() + INTERVAL '90 days',
+                        'trial',
+                        NOW()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM lounge_billing_subscriptions
+                        WHERE brand_id = 'garden_lounge_korolev'
+                    )
+                    """
+                )
+        except Exception as _billing_migration_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "lounge_billing_subscriptions migration skipped (likely race with another worker): %s",
+                _billing_migration_exc,
             )
 
     # MARK: Hot-path FK indexes (perf audit 2026-05-26)

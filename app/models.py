@@ -889,7 +889,7 @@ class LoungeBillingSubscription(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
     payment_method = Column(String(64), nullable=True)          # yookassa_card|manual|trial
     external_id = Column(String(256), nullable=True)            # YooKassa subscription id
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
 
 
 # MARK: - Admin CRM meta for lounges (2026-05-26)
