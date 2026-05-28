@@ -71,6 +71,7 @@ from app.models import (
     LoungeBusinessEvent,
     LoungeGuestLoyalty,
     LoungeGuestPersonalization,
+    LoungeOwnerCredentials,
     LoungePromo,
     LoungePromotedSlot,
     LoungeSubscription,
@@ -936,7 +937,7 @@ def resolve_brand_managers(brand_id: str) -> set[str]:
     return {username.lower() for username in managers}
 
 
-def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
+def can_manage_brand(user: Optional[User], brand_id: str, db: Optional[Session] = None) -> bool:
     if not user:
         return False
     if user.is_admin:
@@ -945,7 +946,100 @@ def can_manage_brand(user: Optional[User], brand_id: str) -> bool:
     allowed = resolve_brand_managers(brand_id)
     email = normalize_key(user.email)
     username = normalize_key(user.username)
-    return username in allowed or email in allowed
+    if username in allowed or email in allowed:
+        return True
+
+    # Convention: lounge owner username equals brand_id slug
+    if username and username == normalize_key(brand_id):
+        return True
+
+    # DB check: lounge_owner_credentials row links this user to this brand
+    if db is not None:
+        try:
+            row = db.query(LoungeOwnerCredentials).filter(
+                LoungeOwnerCredentials.brand_id == brand_id,
+                LoungeOwnerCredentials.user_id == user.id,
+            ).first()
+            if row is not None:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _gen_owner_password() -> str:
+    """Generate a readable password like Lounge-Ab3X9."""
+    chars = string.ascii_letters + string.digits
+    suffix = "".join(random.choices(chars, k=5))
+    return f"Lounge-{suffix}"
+
+
+def ensure_lounge_owner(brand_id: str, db: Session, title: Optional[str] = None) -> dict:
+    """
+    Idempotent: if lounge_owner_credentials row exists, return it.
+    Otherwise create a User (account_type='lounge_owner') and the creds row.
+    Returns dict with keys: email, username, password, user_id.
+    """
+    existing = db.query(LoungeOwnerCredentials).filter(
+        LoungeOwnerCredentials.brand_id == brand_id
+    ).first()
+    if existing:
+        return {
+            "email": existing.email,
+            "username": existing.username,
+            "password": existing.password_plain,
+            "user_id": existing.user_id,
+        }
+
+    email = f"{brand_id}@ember.app"
+    username = brand_id
+
+    # Check if user with that email already exists
+    user_row = db.query(User).filter(User.email == email).first()
+    if user_row is None:
+        # Also check by username (same slug)
+        user_row = db.query(User).filter(User.username == username).first()
+
+    password = _gen_owner_password()
+
+    if user_row is None:
+        # Try preferred username; if taken, fall back to brand_id_owner
+        chosen_username = username
+        username_taken = db.query(User).filter(User.username == chosen_username).first()
+        if username_taken:
+            chosen_username = f"{brand_id}_owner"
+        user_row = User(
+            email=email,
+            username=chosen_username,
+            password_hash=hash_password(password),
+            account_type="lounge_owner",
+            is_admin=False,
+            is_banned=False,
+        )
+        db.add(user_row)
+        db.flush()
+    else:
+        # Reuse existing user — update password to the generated one
+        user_row.password_hash = hash_password(password)
+        db.flush()
+
+    creds = LoungeOwnerCredentials(
+        brand_id=brand_id,
+        user_id=user_row.id,
+        email=user_row.email,
+        username=user_row.username or username,
+        password_plain=password,
+    )
+    db.add(creds)
+    db.commit()
+
+    return {
+        "email": creds.email,
+        "username": creds.username,
+        "password": creds.password_plain,
+        "user_id": creds.user_id,
+    }
 
 
 def require_admin(user: Optional[User] = Depends(get_current_user)) -> User:
@@ -2660,6 +2754,70 @@ def startup():
             _lg.getLogger(__name__).warning(
                 "lounge_catalog migration skipped: %s", _catalog_exc
             )
+
+    # MARK: lounge_owner_credentials — plaintext creds for CRM (2026-05-28)
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS lounge_owner_credentials (
+                        brand_id TEXT PRIMARY KEY,
+                        user_id INTEGER REFERENCES users(id),
+                        email TEXT,
+                        username TEXT,
+                        password_plain TEXT,
+                        updated_at TIMESTAMPTZ DEFAULT now()
+                    )
+                    """
+                )
+        except Exception as _loc_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "lounge_owner_credentials migration skipped: %s", _loc_exc
+            )
+
+    # MARK: backfill lounge owner accounts (2026-05-28)
+    # Runs on every startup but is idempotent — skips brands that already have a creds row.
+    if engine.dialect.name == "postgresql":
+        _bfdb = SessionLocal()
+        try:
+            # 1. myata_platinum — hardcoded known credentials, user_id=92
+            _myata_existing = _bfdb.execute(
+                sa_text("SELECT brand_id FROM lounge_owner_credentials WHERE brand_id = 'myata_platinum'")
+            ).first()
+            if not _myata_existing:
+                _bfdb.execute(
+                    sa_text(
+                        """
+                        INSERT INTO lounge_owner_credentials (brand_id, user_id, email, username, password_plain, updated_at)
+                        VALUES ('myata_platinum', 92, 'myata.platinum@ember.app', 'myata_platinum', 'MyataEvent2026', now())
+                        ON CONFLICT (brand_id) DO NOTHING
+                        """
+                    )
+                )
+                _bfdb.commit()
+
+            # 2. All other lounges in lounge_catalog that have no creds row yet
+            _all_brands = _bfdb.execute(
+                sa_text("SELECT brand_id FROM lounge_catalog WHERE is_active = true")
+            ).fetchall()
+            for (_bid,) in _all_brands:
+                if _bid == "myata_platinum":
+                    continue
+                _has_creds = _bfdb.execute(
+                    sa_text("SELECT brand_id FROM lounge_owner_credentials WHERE brand_id = :b"),
+                    {"b": _bid},
+                ).first()
+                if not _has_creds:
+                    ensure_lounge_owner(_bid, _bfdb)
+        except Exception as _bf_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "lounge owner backfill skipped: %s", _bf_exc
+            )
+        finally:
+            _bfdb.close()
 
 # -------------------------------------------------------------------
 # LEGAL — Privacy Policy & Terms of Use (152-FZ / App Store compliance)
@@ -10439,6 +10597,13 @@ async def admin_web_lounge_new_post(
 
     db.commit()
 
+    # --- Ensure lounge owner account + credentials ---
+    try:
+        ensure_lounge_owner(brand_id, db, title=title)
+    except Exception as _owner_exc:
+        import logging as _lg
+        _lg.getLogger(__name__).warning("ensure_lounge_owner failed for %s: %s", brand_id, _owner_exc)
+
     imgs_count = (1 if cover_url_local else 0) + len(photo_urls_local)
     flash_msg = (
         f"Лаунж {brand_id} создан. "
@@ -10520,6 +10685,18 @@ def admin_web_lounge_detail(
         for s in sub_history_rows
     ]
 
+    owner_creds_row = db.query(LoungeOwnerCredentials).filter(
+        LoungeOwnerCredentials.brand_id == brand_id
+    ).first()
+    owner_creds = None
+    if owner_creds_row:
+        owner_creds = {
+            "email": owner_creds_row.email,
+            "username": owner_creds_row.username,
+            "password": owner_creds_row.password_plain,
+            "user_id": owner_creds_row.user_id,
+        }
+
     ctx = {
         "active_nav": "lounges",
         "admin_email": admin.email,
@@ -10533,10 +10710,77 @@ def admin_web_lounge_detail(
             "promos_active": promos_active,
         },
         "sub_history": sub_history,
+        "owner_creds": owner_creds,
         "flash_ok": flash_ok,
         "flash_err": flash_err,
     }
     return templates.TemplateResponse(request, "lounge_detail.html", ctx)
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/lounges/{brand_id}/create-owner
+# ---------------------------------------------------------------
+@app.post("/admin-web/lounges/{brand_id}/create-owner", tags=["admin-web"])
+async def admin_web_create_owner(
+    brand_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    try:
+        creds = ensure_lounge_owner(brand_id, db)
+        flash_msg = f"Доступ создан: {creds['email']} / {creds['password']}"
+        return RedirectResponse(
+            url=f"/admin-web/lounges/{brand_id}?flash_ok={urllib.parse.quote(flash_msg)}",
+            status_code=302,
+        )
+    except Exception as exc:
+        return RedirectResponse(
+            url=f"/admin-web/lounges/{brand_id}?flash_err={urllib.parse.quote(str(exc))}",
+            status_code=302,
+        )
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/lounges/{brand_id}/reset-owner-password
+# ---------------------------------------------------------------
+@app.post("/admin-web/lounges/{brand_id}/reset-owner-password", tags=["admin-web"])
+async def admin_web_reset_owner_password(
+    brand_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    creds_row = db.query(LoungeOwnerCredentials).filter(
+        LoungeOwnerCredentials.brand_id == brand_id
+    ).first()
+    if not creds_row:
+        return RedirectResponse(
+            url=f"/admin-web/lounges/{brand_id}?flash_err=No+owner+account+found",
+            status_code=302,
+        )
+
+    new_password = _gen_owner_password()
+    # Update the User record
+    if creds_row.user_id:
+        user_row = db.query(User).filter(User.id == creds_row.user_id).first()
+        if user_row:
+            user_row.password_hash = hash_password(new_password)
+
+    creds_row.password_plain = new_password
+    db.commit()
+
+    flash_msg = f"Пароль сброшен. Новый: {new_password}"
+    return RedirectResponse(
+        url=f"/admin-web/lounges/{brand_id}?flash_ok={urllib.parse.quote(flash_msg)}",
+        status_code=302,
+    )
 
 
 # ---------------------------------------------------------------

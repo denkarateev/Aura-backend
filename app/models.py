@@ -919,6 +919,25 @@ class FeaturedSlot(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
 
 
+# MARK: - Lounge Owner Credentials (2026-05-28)
+
+class LoungeOwnerCredentials(Base):
+    """
+    Admin-visible plaintext credentials for lounge owner accounts.
+    Stored so the CRM can display login/password to hand off to the owner.
+    password_plain is stored as-is (internal admin CRM only, never exposed
+    to public API endpoints).
+    """
+    __tablename__ = "lounge_owner_credentials"
+
+    brand_id = Column(String(128), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    email = Column(String, nullable=True)
+    username = Column(String, nullable=True)
+    password_plain = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 # MARK: - Admin CRM meta for lounges (2026-05-26)
 
 class LoungeAdminMeta(Base):

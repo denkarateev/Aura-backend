@@ -205,6 +205,41 @@
       </div>
     </div>
 
+    <!-- Owner credentials -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Доступ владельца</span>
+      </div>
+      <div class="card-body">
+        {% if owner_creds %}
+        <div class="detail-row">
+          <span class="detail-key">Email</span>
+          <span class="detail-val mono" style="user-select: all;">{{ owner_creds.email }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Username</span>
+          <span class="detail-val mono" style="user-select: all;">{{ owner_creds.username }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Пароль</span>
+          <span class="detail-val mono" style="user-select: all; background: var(--surface-2, #1e2027); padding: 2px 6px; border-radius: 4px; letter-spacing: 0.05em;">{{ owner_creds.password }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">User ID</span>
+          <span class="detail-val mono" style="color: var(--muted);">{{ owner_creds.user_id }}</span>
+        </div>
+        <form method="post" action="/admin-web/lounges/{{ brand_id }}/reset-owner-password" style="margin-top: 12px;">
+          <button class="btn btn-ghost" type="submit" style="width: 100%;">Сбросить пароль</button>
+        </form>
+        {% else %}
+        <div style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">Аккаунт владельца не создан</div>
+        <form method="post" action="/admin-web/lounges/{{ brand_id }}/create-owner">
+          <button class="btn btn-primary" type="submit" style="width: 100%;">Создать доступ</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
     <!-- Quick links -->
     <div class="card">
       <div class="card-header">
