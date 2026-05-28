@@ -1440,6 +1440,10 @@ class LoungeHighlightPhotoOut(BaseModel):
     url: str
 
 
+class EventPhotoOut(BaseModel):
+    url: str
+
+
 # MARK: - Lounge Broadcast Push (2026-05-28)
 
 class LoungePushIn(BaseModel):

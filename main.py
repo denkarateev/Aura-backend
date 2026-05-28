@@ -252,6 +252,7 @@ from app.schemas import (
     LoungeHighlightsIn,
     LoungeHighlightsOut,
     LoungeHighlightPhotoOut,
+    EventPhotoOut,
     LoungePushIn,
 )
 from app.services.subscriptions import get_active_tier, require_tier
@@ -1235,7 +1236,12 @@ def _apply_event_payload(event: Event, payload: EventIn, current_user: User):
     event.starts_at = payload.starts_at
     event.ends_at = payload.ends_at
     event.recurrence = json.dumps(payload.recurrence, ensure_ascii=False) if payload.recurrence else None
-    event.cover_image_url = (payload.cover_image_url or "").strip() or None
+    raw_cover = (payload.cover_image_url or "").strip()
+    if raw_cover.startswith("data:image"):
+        # Legacy iOS path — base64 data-URIs must NOT be stored.
+        # Client should upload via POST /events/photo and pass the returned URL.
+        raw_cover = None
+    event.cover_image_url = raw_cover or None
     event.price_text = (payload.price_text or "").strip() or None
     event.booking_url = (payload.booking_url or "").strip() or None
     event.tags = _clean_event_tags(payload.tags)  # Python list → text[] на проде
@@ -3259,6 +3265,65 @@ def delete_event(
     db.delete(event)
     db.commit()
     return StatusOut(status="ok", message="Event deleted")
+
+
+_EVENT_PHOTO_MAX_DIM = 1200   # max width/height in pixels
+_EVENT_PHOTO_MAX_BYTES = 8 * 1024 * 1024  # 8 MB
+
+
+@app.post("/events/photo", response_model=EventPhotoOut)
+def upload_event_photo(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """Upload an event cover photo (multipart JPEG).
+    Any authenticated lounge owner (or admin) can upload.
+    Image is resized to fit within 1200px on the longest side and saved as JPEG
+    under /app/static/events/{uuid}.jpg.
+    Returns {"url": "http://188.253.19.166:8000/static/events/{uuid}.jpg"}."""
+    get_required_user(user)  # must be logged in
+
+    raw = file.file.read()
+    if len(raw) > _EVENT_PHOTO_MAX_BYTES:
+        raise HTTPException(413, "Image too large (max 8 MB)")
+
+    try:
+        from PIL import Image as _PIL_Image
+        from io import BytesIO as _BytesIO
+    except Exception as e:
+        raise HTTPException(500, f"Image processing unavailable: {e}")
+
+    try:
+        img = _PIL_Image.open(_BytesIO(raw))
+        img.load()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot decode image: {e}")
+
+    # Resize to fit within _EVENT_PHOTO_MAX_DIM on longest side (no upscale)
+    w, h = img.size
+    max_dim = _EVENT_PHOTO_MAX_DIM
+    if w > max_dim or h > max_dim:
+        ratio = min(max_dim / w, max_dim / h)
+        img = img.resize((int(w * ratio), int(h * ratio)), _PIL_Image.LANCZOS)
+
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    from io import BytesIO as _BytesIO2
+    buf = _BytesIO2()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    image_bytes = buf.getvalue()
+
+    fname = f"{uuid.uuid4().hex}.jpg"
+    from app.services.storage import get_storage as _get_storage
+    storage = _get_storage()
+    key = f"events/{fname}"
+    url = storage.upload(key, image_bytes, "image/jpeg")
+
+    if not url.startswith("http"):
+        url = f"http://188.253.19.166:8000{url}"
+
+    return EventPhotoOut(url=url)
 
 
 @app.post("/events/{event_id}/rsvp", response_model=EventRSVPOut)
