@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 class IngredientIn(BaseModel):
@@ -1438,3 +1438,10 @@ class LoungeHighlightsOut(BaseModel):
 
 class LoungeHighlightPhotoOut(BaseModel):
     url: str
+
+
+# MARK: - Lounge Broadcast Push (2026-05-28)
+
+class LoungePushIn(BaseModel):
+    title: str = Field(..., min_length=1, max_length=80)
+    body: str = Field(..., min_length=1, max_length=200)

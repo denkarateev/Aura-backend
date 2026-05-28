@@ -252,6 +252,7 @@ from app.schemas import (
     LoungeHighlightsIn,
     LoungeHighlightsOut,
     LoungeHighlightPhotoOut,
+    LoungePushIn,
 )
 from app.services.subscriptions import get_active_tier, require_tier
 
@@ -4713,6 +4714,63 @@ def refresh_lounge_busyness(
         source="yandex_maps",
         updated_at=now,
     )
+
+
+# MARK: Lounge Broadcast Push — POST /lounges/{brand_id}/push (2026-05-28)
+# Premium feature: Network or Partner tier only. Sends APNs push to all
+# lounge subscribers. Returns {"sent": N}.
+@app.post("/lounges/{brand_id}/push", tags=["lounges"])
+def lounge_broadcast_push(
+    brand_id: str,
+    payload: LoungePushIn,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    """Send a broadcast push notification to all subscribers of a lounge.
+
+    Requires:
+    - Bearer auth (lounge owner / manager)
+    - Lounge billing tier >= network (network or partner)
+    """
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id, db):
+        raise HTTPException(403, "Business access required")
+
+    # Tier gate — require_tier raises HTTP 402 when tier is too low.
+    # We normalise that to a 403 with a machine-readable detail so iOS
+    # can show an upsell screen instead of a generic error.
+    try:
+        require_tier(db, brand_id, "network")
+    except HTTPException as _exc:
+        if _exc.status_code == 402:
+            raise HTTPException(403, detail="tier_required:network")
+        raise
+
+    subs = (
+        db.query(LoungeSubscription)
+        .filter(LoungeSubscription.brand_id == brand_id)
+        .limit(5000)
+        .all()
+    )
+    uid_list = [s.user_id for s in subs if s.user_id != current_user.id]
+
+    if uid_list:
+        try:
+            import asyncio as _asyncio
+            from app.push import send_push_fanout_async
+            _asyncio.run(
+                send_push_fanout_async(
+                    db,
+                    uid_list,
+                    payload.title,
+                    payload.body,
+                    payload={"type": "lounge_announcement", "lounge_id": brand_id},
+                )
+            )
+        except Exception as _e:
+            print(f"[push] lounge-broadcast failed for {brand_id}: {_e}")
+
+    return {"sent": len(uid_list)}
 
 
 @app.get("/mini-game/heat-bowl", response_model=BowlHeatGameStateOut)
