@@ -8344,7 +8344,7 @@ def lounge_crm_heatmap(
 
     # Use raw SQL for efficient GROUP BY on date-shifted values to avoid
     # loading all visit rows into Python. tz_offset_min applied as interval.
-    sql = text("""
+    sql = sa_text("""
         SELECT
             EXTRACT(DOW FROM (created_at + CAST(:tz_interval AS INTERVAL)))::int AS dow,
             EXTRACT(HOUR FROM (created_at + CAST(:tz_interval AS INTERVAL)))::int AS hour,
