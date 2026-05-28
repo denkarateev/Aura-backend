@@ -139,6 +139,7 @@ DEFAULT_BRAND_MANAGER_USERNAMES = {
     "cran_cunade_night": {"cran_cunade"},
     "garnet_gum_premium": {"garnet_gum"},
     "garden_lounge_korolev": {"garden_lounge_korolev"},
+    "myata_platinum": {"myata_platinum"},
 }
 
 

@@ -892,6 +892,33 @@ class LoungeBillingSubscription(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
 
 
+# MARK: - Featured Slots (2026-05-27)
+
+class FeaturedSlot(Base):
+    """
+    Paid featured placement for a lounge brand in /Места screen.
+
+    slot_type — 'hero'  : top hero card (max 1 per city at a time)
+                'grid'  : ribbon «Топ недели» in the regular grid
+    city      — 'msk' | 'spb' | 'general' (shown to all)
+    status    — 'active' | 'expired' | 'cancelled'
+    payment_method — 'trial' | 'manual' | 'yookassa_card'
+    """
+    __tablename__ = "featured_slots"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    slot_type = Column(String(32), nullable=False)               # hero | grid
+    city = Column(String(64), nullable=True)                     # msk | spb | general
+    starts_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    price_paid = Column(Integer, default=0, server_default="0")  # RUB
+    status = Column(String(32), nullable=False, default="active", server_default="active")
+    payment_method = Column(String(64), nullable=True)           # trial|manual|yookassa_card
+    created_by_admin = Column(Boolean, default=False, server_default="false")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+
+
 # MARK: - Admin CRM meta for lounges (2026-05-26)
 
 class LoungeAdminMeta(Base):

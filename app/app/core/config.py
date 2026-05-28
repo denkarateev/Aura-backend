@@ -84,6 +84,8 @@ DEFAULT_BRAND_MANAGER_USERNAMES = {
     "darkside": {"darkside"},
     "hoob": {"hoob"},
     "alpha_hookah": {"alphahookah", "alpha_hookah"},
+    "garden_lounge_korolev": {"garden_lounge_korolev"},
+    "myata_platinum": {"myata_platinum"},
 }
 
 

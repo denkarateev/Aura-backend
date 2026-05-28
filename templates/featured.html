@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Featured Slots — Ember Admin{% endblock %}
+{% block breadcrumb %}<a href="/admin-web/featured">Featured</a><span class="sep">/</span><span class="current">Слоты</span>{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-header-left">
+    <div class="page-h1">Featured Slots</div>
+    <div class="page-h1-sub">{{ total }} слотов всего</div>
+  </div>
+</div>
+
+<!-- Status chips -->
+<div class="filter-chips">
+  <a class="chip {% if not status_filter %}active{% endif %}" href="/admin-web/featured">Все</a>
+  <a class="chip {% if status_filter == 'active' %}active{% endif %}" href="/admin-web/featured?status=active">
+    <span class="chip-dot"></span> Active
+  </a>
+  <a class="chip {% if status_filter == 'expired' %}active{% endif %}" href="/admin-web/featured?status=expired">Expired</a>
+  <a class="chip {% if status_filter == 'cancelled' %}active{% endif %}" href="/admin-web/featured?status=cancelled">Cancelled</a>
+</div>
+
+<!-- Create form card -->
+<div class="card" style="margin-bottom: 24px;">
+  <div class="card-header">
+    <span class="card-header-title">Создать Featured Slot</span>
+    {% if flash_create_err %}
+    <span class="badge badge-red">{{ flash_create_err }}</span>
+    {% endif %}
+  </div>
+  <div class="card-body">
+    <form method="post" action="/admin-web/featured/create"
+          style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;">
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Brand ID</label>
+        <input class="form-control" name="brand_id" placeholder="garden_lounge_korolev" required list="brand-list" autocomplete="off">
+        <datalist id="brand-list">
+          {% for b in known_brands %}
+          <option value="{{ b }}">
+          {% endfor %}
+        </datalist>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Тип слота</label>
+        <select class="form-control" name="slot_type">
+          <option value="hero">Hero</option>
+          <option value="grid">Grid</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Город</label>
+        <select class="form-control" name="city">
+          <option value="general">General (все)</option>
+          <option value="msk">Москва</option>
+          <option value="spb">Санкт-Петербург</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Дней</label>
+        <input class="form-control" type="number" name="days" value="7" min="1" max="365" required>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Цена ₽</label>
+        <input class="form-control" type="number" name="price_paid" value="0" min="0">
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Метод оплаты</label>
+        <select class="form-control" name="payment_method">
+          <option value="trial">Trial</option>
+          <option value="manual">Manual</option>
+          <option value="yookassa_card">YooKassa</option>
+        </select>
+      </div>
+      <div style="grid-column: 1 / -1; padding-top: 4px;">
+        <button class="btn btn-primary" type="submit">Создать слот</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Slots table -->
+<div class="table-wrap">
+  <div class="table-header">
+    <span class="table-title">Слоты</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Лаунж</th>
+        <th>Тип</th>
+        <th>Город</th>
+        <th>Статус</th>
+        <th>Оплата</th>
+        <th class="num" style="text-align:center;">Цена ₽</th>
+        <th>Истекает</th>
+        <th style="text-align:center;">Осталось</th>
+        <th>Действие</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in slots %}
+      <tr id="featured-row-{{ s.id }}">
+        <td>
+          <div class="user-cell">
+            <div class="avatar avatar-sm avatar-lounge">{{ s.brand_id[:2] | upper }}</div>
+            <a href="/admin-web/lounges/{{ s.brand_id }}" class="mono" style="color: var(--text); text-decoration: none; font-size: 12.5px;">{{ s.brand_id }}</a>
+          </div>
+        </td>
+        <td>
+          {% if s.slot_type == 'hero' %}
+          <span class="badge badge-yellow">&#9733; Hero</span>
+          {% else %}
+          <span class="badge badge-blue">Grid</span>
+          {% endif %}
+        </td>
+        <td style="color: var(--muted); font-size: 12px;">{{ s.city or '—' }}</td>
+        <td>
+          {% if s.status == 'active' %}<span class="badge badge-green">active</span>
+          {% elif s.status == 'expired' %}<span class="badge badge-red">expired</span>
+          {% elif s.status == 'cancelled' %}<span class="badge badge-gray">cancelled</span>
+          {% else %}<span class="badge badge-gray">{{ s.status }}</span>{% endif %}
+        </td>
+        <td style="color: var(--muted); font-size: 12px;">{{ s.payment_method or '—' }}</td>
+        <td class="num" style="text-align: center; color: var(--text);">{{ s.price_paid }}</td>
+        <td style="font-size: 12px; white-space: nowrap; font-weight: 600;
+          {% if s.status == 'active' %}color: var(--accent){% else %}color: var(--muted){% endif %}">
+          {{ s.expires_at }}
+        </td>
+        <td style="text-align: center; font-weight: 700; font-variant-numeric: tabular-nums;
+          {% if s.remaining_days > 0 %}color: var(--accent){% else %}color: var(--muted-dim){% endif %}">
+          {% if s.remaining_days > 0 %}{{ s.remaining_days }}д{% else %}—{% endif %}
+        </td>
+        <td>
+          {% if s.status == 'active' %}
+          <button class="btn btn-danger btn-xs"
+                  hx-post="/admin-web/featured/{{ s.id }}/cancel"
+                  hx-target="#featured-row-{{ s.id }}"
+                  hx-swap="outerHTML"
+                  hx-confirm="Отменить слот #{{ s.id }} для {{ s.brand_id }}?">
+            Завершить
+          </button>
+          {% else %}
+          <span style="color: var(--muted-dim); font-size: 12px;">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if not slots %}
+  <div class="empty">
+    <div class="empty-icon">&#9733;</div>
+    <div class="empty-title">Нет Featured-слотов</div>
+    <div class="empty-sub">Создай первый слот через форму выше</div>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

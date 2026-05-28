@@ -1,0 +1,246 @@
+{% extends "base.html" %}
+{% block title %}{{ u.username or u.email }} — Ember Admin{% endblock %}
+{% block breadcrumb %}
+  <a href="/admin-web/users">Пользователи</a>
+  <span class="sep">/</span>
+  <span class="current">{{ u.username or u.email }}</span>
+{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-header-left">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div class="avatar" style="width: 52px; height: 52px; font-size: 18px; font-weight: 900; border-radius: 16px;">
+        {{ (u.username or u.email)[:2] | upper }}
+      </div>
+      <div>
+        <div class="page-h1">{{ u.username or u.email }}</div>
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 5px; flex-wrap: wrap;">
+          {% if u.is_admin %}<span class="badge badge-admin">admin</span>{% endif %}
+          {% if u.is_banned %}<span class="badge badge-red">banned</span>{% endif %}
+          {% if u.account_type and u.account_type != 'user' %}
+          <span class="badge badge-blue">{{ u.account_type }}</span>
+          {% endif %}
+          <span class="page-h1-sub" style="margin: 0;">ID: {{ u.id }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="page-header-actions">
+    <a class="btn btn-ghost btn-sm" href="/admin-web/users">&larr; К списку</a>
+  </div>
+</div>
+
+<div class="detail-layout">
+
+  <!-- LEFT -->
+  <div class="detail-main">
+
+    <!-- Profile + activity stats mini grid -->
+    <div class="card" style="margin-bottom: 20px; padding: 0; overflow: hidden;">
+      <div class="stats-mini-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="stats-mini-cell">
+          <div class="label">Очки (ugolki)</div>
+          <div class="value">{{ u.points }}</div>
+        </div>
+        <div class="stats-mini-cell">
+          <div class="label">Рейтинг</div>
+          <div class="value muted">{{ u.rating }}</div>
+        </div>
+        <div class="stats-mini-cell">
+          <div class="label">Streak</div>
+          <div class="value warm">{{ u.streak_days }}d</div>
+        </div>
+        <div class="stats-mini-cell">
+          <div class="label">Визиты</div>
+          <div class="value muted">{{ u.total_visits }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profile info -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Профиль</span>
+      </div>
+      <div class="card-body">
+        <div class="detail-row">
+          <span class="detail-key">Email</span>
+          <span class="detail-val">{{ u.email }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Username</span>
+          <span class="detail-val">{{ u.username or '—' }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Display name</span>
+          <span class="detail-val">{{ u.display_name or '—' }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Город</span>
+          <span class="detail-val">{{ u.city or '—' }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Account type</span>
+          <span class="detail-val">{{ u.account_type }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Зарегистрирован</span>
+          <span class="detail-val" style="color: var(--muted);">{{ u.created_at }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Premium до</span>
+          <span class="detail-val {% if u.premium_until %}accent{% endif %}">{{ u.premium_until or '—' }}</span>
+        </div>
+        {% if u.ton_address %}
+        <div class="detail-row">
+          <span class="detail-key">TON address</span>
+          <span class="detail-val mono" style="font-size: 10.5px; color: var(--muted);">{{ u.ton_address }}</span>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Activity -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Активность</span>
+      </div>
+      <div class="card-body">
+        <div class="detail-row">
+          <span class="detail-key">Миксов</span>
+          <span class="detail-val accent">{{ u.mixes_count }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Избранных</span>
+          <span class="detail-val">{{ u.favorites_count }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Подписчики / Подписки</span>
+          <span class="detail-val">{{ u.followers_count }} / {{ u.following_count }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Device tokens</span>
+          <span class="detail-val">{{ u.device_tokens_count }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Ban info -->
+    {% if u.is_banned %}
+    <div class="card" style="border-color: var(--red-bdr);">
+      <div class="card-header">
+        <span class="card-header-title" style="color: var(--red);">Бан</span>
+      </div>
+      <div class="card-body">
+        <div class="detail-row">
+          <span class="detail-key">Причина</span>
+          <span class="detail-val" style="color: var(--red);">{{ u.ban_reason or '—' }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Дата бана</span>
+          <span class="detail-val" style="color: var(--muted);">{{ u.banned_at or '—' }}</span>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Recent visits -->
+    <div class="table-wrap">
+      <div class="table-header">
+        <span class="table-title">Последние визиты</span>
+      </div>
+      {% if recent_visits %}
+      <table>
+        <thead>
+          <tr>
+            <th>Лаунж</th>
+            <th class="num" style="text-align:center;">Сумма ₽</th>
+            <th class="num" style="text-align:center;">Бонусы</th>
+            <th>Дата</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for v in recent_visits %}
+          <tr>
+            <td>
+              <div class="user-cell">
+                <div class="avatar avatar-sm avatar-lounge">{{ v.brand_id[:2] | upper }}</div>
+                <a href="/admin-web/lounges/{{ v.brand_id }}" class="mono" style="color: var(--text); text-decoration: none; font-size: 12px;">{{ v.brand_id }}</a>
+              </div>
+            </td>
+            <td class="num" style="text-align:center; color: var(--text);">{{ v.bill_amount }}</td>
+            <td class="num" style="text-align:center; color: var(--accent);">+{{ v.bonus_awarded }}</td>
+            <td style="color: var(--muted); font-size: 12px; white-space: nowrap;">{{ v.created_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty" style="padding: 32px;">
+        <div class="empty-icon" style="font-size: 28px;">&#9673;</div>
+        <div class="empty-title" style="font-size: 14px;">Нет визитов</div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- RIGHT sidebar — actions -->
+  <div class="detail-sidebar">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Действия</span>
+      </div>
+      <div class="card-body" style="display: flex; flex-direction: column; gap: 10px;">
+        {% if u.is_banned %}
+        <form method="post" action="/admin-web/users/{{ u.id }}/unban">
+          <button class="btn btn-primary" type="submit" style="width: 100%; justify-content: center;">
+            Разбанить
+          </button>
+        </form>
+        <div class="callout">
+          Пользователь забанен. Нажми «Разбанить» чтобы восстановить доступ.
+        </div>
+        {% else %}
+        <form method="post" action="/admin-web/users/{{ u.id }}/ban"
+              onsubmit="return confirm('Забанить пользователя?')">
+          <div class="form-group" style="margin-bottom: 10px;">
+            <label class="form-label">Причина бана</label>
+            <input class="form-control" type="text" name="reason" placeholder="Нарушение правил...">
+          </div>
+          <button class="btn btn-danger" type="submit" style="width: 100%; justify-content: center;">
+            Забанить
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Summary card -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Кратко</span>
+      </div>
+      <div class="card-body">
+        <div class="detail-row">
+          <span class="detail-key">Очков</span>
+          <span class="detail-val accent">{{ u.points }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Визитов</span>
+          <span class="detail-val">{{ u.total_visits }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Миксов</span>
+          <span class="detail-val">{{ u.mixes_count }}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Streak</span>
+          <span class="detail-val" style="color: var(--warm);">{{ u.streak_days }} дн.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

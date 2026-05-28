@@ -1248,6 +1248,41 @@ class PromotedSlotIn(BaseModel):
     region: Optional[str] = None
 
 
+# MARK: - Featured Slots (2026-05-27)
+
+class FeaturedSlotOut(BaseModel):
+    id: int
+    brand_id: str
+    slot_type: str
+    city: Optional[str] = None
+    starts_at: datetime
+    expires_at: datetime
+    price_paid: int = 0
+    status: str
+    payment_method: Optional[str] = None
+    created_by_admin: bool = False
+    created_at: datetime
+    remaining_days: Optional[int] = None   # computed, only in admin list
+
+    class Config:
+        from_attributes = True
+
+
+class FeaturedSlotIn(BaseModel):
+    """Admin: create a new featured slot."""
+    slot_type: str                          # hero | grid
+    city: str = "general"                  # msk | spb | general
+    days: int                               # duration from now
+    price_paid: int = 0
+    payment_method: str = "manual"         # trial | manual | yookassa_card
+
+
+class FeaturedFeedOut(BaseModel):
+    """Public /lounges/featured response consumed by iOS."""
+    hero: Optional[FeaturedSlotOut] = None
+    grid: List[FeaturedSlotOut] = []
+
+
 # MARK: - Per-lounge bonus balances for current user (2026-05-26)
 
 class LoungeMyBonusItemOut(BaseModel):
@@ -1321,6 +1356,8 @@ class LoungePublicMetaOut(BaseModel):
     brand_id: str
     tier: str
     badges: List[str]
+    subscription_active: bool = False
+    is_featured_now: bool = False
 
 
 # MARK: - Lounge billing subscription schemas (Sprint 1, 2026-05-27)
@@ -1360,3 +1397,17 @@ class UpgradeRequiredOut(BaseModel):
     error: str = "upgrade_required"
     required_tier: str
     current_tier: str
+
+
+# MARK: CRM Heatmap (2026-05-27)
+class LoungeCRMHeatmapCellOut(BaseModel):
+    dow: int        # 0=Sun, 1=Mon..6=Sat (Postgres EXTRACT DOW default)
+    hour: int       # 0-23
+    visit_count: int
+
+
+class LoungeCRMHeatmapOut(BaseModel):
+    cells: List[LoungeCRMHeatmapCellOut]
+    total_visits: int
+    days_back: int
+    tz_offset_min: int

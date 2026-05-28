@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ember Admin — Вход</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0A0B0E;
+      color: #F5F5F2;
+      font-family: "Inter", -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background-image:
+        radial-gradient(ellipse at 72% 18%, rgba(196,244,73,0.09) 0%, transparent 55%),
+        radial-gradient(ellipse at 18% 82%, rgba(255,159,74,0.05) 0%, transparent 60%);
+    }
+    .login-wrap {
+      width: 100%;
+      max-width: 380px;
+      padding: 20px;
+    }
+    .login-logo-area {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    .login-logo-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 56px; height: 56px;
+      background: #C4F449;
+      border-radius: 16px;
+      font-size: 28px; font-weight: 900; color: #0A0B0E;
+      margin-bottom: 14px;
+    }
+    .login-title {
+      font-size: 22px; font-weight: 800; letter-spacing: -0.5px; color: #F5F5F2;
+      margin-bottom: 4px;
+    }
+    .login-sub {
+      font-size: 12px; color: rgba(245,245,242,0.45);
+      font-weight: 500;
+    }
+    .login-box {
+      background: rgba(245,245,242,0.03);
+      border: 1px solid rgba(245,245,242,0.08);
+      border-radius: 16px;
+      padding: 28px 28px 24px;
+      position: relative;
+      overflow: hidden;
+    }
+    .login-box::before {
+      content: "";
+      position: absolute; top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(196,244,73,0.25), transparent);
+    }
+    .form-group { margin-bottom: 16px; }
+    .form-label {
+      display: block; font-size: 9.5px; font-weight: 700; color: rgba(245,245,242,0.55);
+      text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 7px;
+    }
+    .form-control {
+      width: 100%; background: rgba(245,245,242,0.03); border: 1px solid rgba(245,245,242,0.08);
+      border-radius: 10px; color: #F5F5F2; padding: 11px 14px; font-size: 14px;
+      outline: none; transition: border-color 0.2s, background 0.2s;
+      font-family: inherit;
+    }
+    .form-control:focus { border-color: rgba(196,244,73,0.5); background: rgba(196,244,73,0.04); }
+    .form-control::placeholder { color: rgba(245,245,242,0.25); }
+    .btn-submit {
+      width: 100%; padding: 12px; border-radius: 999px; border: none;
+      background: #C4F449; color: #0A0B0E; font-size: 14px; font-weight: 800;
+      cursor: pointer; transition: opacity 0.15s, box-shadow 0.2s; margin-top: 8px;
+      font-family: inherit; letter-spacing: 0.2px;
+    }
+    .btn-submit:hover { opacity: 1; box-shadow: 0 6px 20px rgba(196,244,73,0.30); }
+    .btn-submit:active { opacity: 0.88; }
+    .error {
+      background: rgba(255,107,107,0.10);
+      color: #FF6B6B;
+      border-left: 3px solid #FF6B6B;
+      border-radius: 0 8px 8px 0;
+      padding: 10px 14px; font-size: 13px; margin-bottom: 16px;
+    }
+    .login-footer {
+      text-align: center; margin-top: 20px;
+      font-size: 11px; color: rgba(245,245,242,0.25);
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-logo-area">
+      <div class="login-logo-badge">E</div>
+      <div class="login-title">Ember Admin</div>
+      <div class="login-sub">Управление платформой</div>
+    </div>
+
+    <div class="login-box">
+      {% if error %}
+      <div class="error">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/admin-web/login">
+        <div class="form-group">
+          <label class="form-label">Email</label>
+          <input class="form-control" type="email" name="email" placeholder="admin@ember.app" required autofocus>
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Пароль</label>
+          <input class="form-control" type="password" name="password" required>
+        </div>
+        <button class="btn-submit" type="submit">Войти</button>
+      </form>
+    </div>
+
+    <div class="login-footer">ember.app &mdash; Ember CRM v2</div>
+  </div>
+</body>
+</html>

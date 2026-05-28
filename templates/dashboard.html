@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Ember Admin{% endblock %}
+{% block breadcrumb %}<span class="current">Dashboard</span>{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-header-left">
+    <div class="page-h1">Dashboard</div>
+    <div class="page-h1-sub">Общая статистика платформы Ember</div>
+  </div>
+  <div class="page-header-actions">
+    <a class="btn btn-ghost btn-sm" href="/admin-web/users">Все пользователи</a>
+    <a class="btn btn-primary btn-sm" href="/admin-web/featured">Featured +</a>
+  </div>
+</div>
+
+<!-- ---- STAT CARDS ---- -->
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-label">Пользователей</div>
+    <div class="stat-value">{{ stats.total_users }}</div>
+    <div class="stat-delta neutral">всего в базе</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">MAU (30 дней)</div>
+    <div class="stat-value warm">{{ stats.mau }}</div>
+    <div class="stat-delta up">&#9650; активных</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Активных лаунжей</div>
+    <div class="stat-value blue">{{ stats.total_lounges }}</div>
+    <div class="stat-delta neutral">брендов</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Активных подписок</div>
+    <div class="stat-value">{{ stats.active_subscriptions }}</div>
+    <div class="stat-delta up">&#9650; paid</div>
+  </div>
+</div>
+
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+  <div class="stat-card">
+    <div class="stat-label">Забанено</div>
+    <div class="stat-value red" style="font-size: 28px;">{{ stats.banned_users }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Миксов создано</div>
+    <div class="stat-value muted" style="font-size: 28px;">{{ stats.total_mixes }}</div>
+  </div>
+</div>
+
+<!-- ---- TOP LOUNGES ---- -->
+<div class="table-wrap" style="margin-bottom: 20px;">
+  <div class="table-header">
+    <div class="table-header-left">
+      <span class="table-title">Топ лаунжей</span>
+      <span class="table-subtitle">по визитам за 30 дней</span>
+    </div>
+    <a class="btn btn-ghost btn-sm" href="/admin-web/lounges">Все лаунжи</a>
+  </div>
+  {% if top_lounges %}
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Лаунж</th>
+        <th>Tier</th>
+        <th>Подписка</th>
+        <th class="num">Визиты</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for lounge in top_lounges %}
+      <tr>
+        <td style="width:36px; color: var(--muted-dim); font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;">
+          {{ loop.index }}
+        </td>
+        <td>
+          <div class="user-cell">
+            <div class="avatar avatar-sm avatar-lounge">{{ lounge.brand_id[:2] | upper }}</div>
+            <div class="user-cell-name mono" style="font-size: 12.5px;">{{ lounge.brand_id }}</div>
+          </div>
+        </td>
+        <td><span class="tier-{{ lounge.tier }}" style="font-weight: 600; font-size: 12px;">{{ lounge.tier }}</span></td>
+        <td>
+          {% if lounge.sub_status == 'active' %}
+          <span class="badge badge-green">active</span>
+          {% elif lounge.sub_status == 'trialing' %}
+          <span class="badge badge-blue">trialing</span>
+          {% else %}
+          <span class="badge badge-gray">—</span>
+          {% endif %}
+        </td>
+        <td class="num">{{ lounge.visits_30d }}</td>
+        <td style="width: 80px;">
+          <a class="btn btn-ghost btn-xs" href="/admin-web/lounges/{{ lounge.brand_id }}">Открыть</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    <div class="empty-icon">&#9673;</div>
+    <div class="empty-title">Нет данных</div>
+    <div class="empty-sub">Визиты в лаунжи ещё не зафиксированы</div>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ---- RECENT USERS ---- -->
+<div class="table-wrap">
+  <div class="table-header">
+    <div class="table-header-left">
+      <span class="table-title">Последние регистрации</span>
+      <span class="table-subtitle">10 новых пользователей</span>
+    </div>
+    <a class="btn btn-ghost btn-sm" href="/admin-web/users">Все →</a>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Пользователь</th>
+        <th>Зарегистрирован</th>
+        <th>Статус</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in recent_users %}
+      <tr>
+        <td>
+          <div class="user-cell">
+            <div class="avatar avatar-sm">{{ (u.username or u.email)[:2] | upper }}</div>
+            <div>
+              <div class="user-cell-name">{{ u.username or '—' }}</div>
+              <div class="user-cell-email">{{ u.email }}</div>
+            </div>
+          </div>
+        </td>
+        <td style="color: var(--muted); font-size: 12px; white-space: nowrap;">{{ u.created_at }}</td>
+        <td>
+          {% if u.is_banned %}
+          <span class="badge badge-red">banned</span>
+          {% elif u.is_admin %}
+          <span class="badge badge-admin">admin</span>
+          {% else %}
+          <span class="badge badge-gray">user</span>
+          {% endif %}
+        </td>
+        <td style="width: 80px;">
+          <a class="btn btn-ghost btn-xs" href="/admin-web/users/{{ u.id }}">Профиль</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}

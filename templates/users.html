@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Пользователи — Ember Admin{% endblock %}
+{% block breadcrumb %}
+  <a href="/admin-web/users">Пользователи</a>
+  {% if query %}<span class="sep">/</span><span class="current">{{ query }}</span>{% endif %}
+{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-header-left">
+    <div class="page-h1">Пользователи</div>
+    <div class="page-h1-sub">{{ total }} записей в базе</div>
+  </div>
+</div>
+
+<!-- Filter chips + search -->
+<div class="filter-chips">
+  <a class="chip {% if not query and not filter_role %}active{% endif %}" href="/admin-web/users">
+    Все
+  </a>
+  <a class="chip {% if filter_role == 'active' %}active{% endif %}" href="/admin-web/users?role=active">
+    <span class="chip-dot"></span> Активные
+  </a>
+  <a class="chip {% if filter_role == 'banned' %}active{% endif %}" href="/admin-web/users?role=banned">
+    Заблокированные
+  </a>
+  <a class="chip {% if filter_role == 'admin' %}active{% endif %}" href="/admin-web/users?role=admin">
+    Admins
+  </a>
+</div>
+
+<form class="search-row" method="get" action="/admin-web/users">
+  <div class="search-input-wrap">
+    <span class="search-icon">&#9906;</span>
+    <input type="text" name="q" placeholder="Поиск по email или username..." value="{{ query or '' }}" autocomplete="off">
+  </div>
+  <button class="btn btn-primary btn-sm" type="submit">Найти</button>
+  {% if query %}
+  <a class="btn btn-ghost btn-sm" href="/admin-web/users">Сброс</a>
+  {% endif %}
+</form>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Пользователь</th>
+        <th>Зарегистрирован</th>
+        <th class="num" style="text-align: center;">Визиты</th>
+        <th class="num" style="text-align: center;">Очки</th>
+        <th>Роль</th>
+        <th>Действия</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr id="user-row-{{ u.id }}">
+        <td>
+          <div class="user-cell">
+            <div class="avatar">{{ (u.username or u.email)[:2] | upper }}</div>
+            <div>
+              <div class="user-cell-name">
+                <a href="/admin-web/users/{{ u.id }}" style="color: var(--text); text-decoration: none; hover: underline;">
+                  {{ u.username or '—' }}
+                </a>
+              </div>
+              <div class="user-cell-email">{{ u.email }}</div>
+            </div>
+          </div>
+        </td>
+        <td style="color: var(--muted); font-size: 12px; white-space: nowrap;">{{ u.created_at }}</td>
+        <td class="num" style="text-align: center;">{{ u.total_visits }}</td>
+        <td class="num" style="text-align: center;">{{ u.total_points }}</td>
+        <td>
+          {% if u.is_banned %}
+          <span class="badge badge-red">banned</span>
+          {% elif u.is_admin %}
+          <span class="badge badge-admin">admin</span>
+          {% elif u.account_type and u.account_type != 'user' %}
+          <span class="badge badge-blue">{{ u.account_type }}</span>
+          {% else %}
+          <span class="badge badge-gray">user</span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="action-row">
+            <a class="btn btn-ghost btn-xs" href="/admin-web/users/{{ u.id }}">Открыть</a>
+            {% if u.is_banned %}
+            <button class="btn btn-ghost btn-xs"
+                    hx-post="/admin-web/users/{{ u.id }}/unban"
+                    hx-target="#user-row-{{ u.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Разбанить пользователя?">
+              Разбанить
+            </button>
+            {% else %}
+            <button class="btn btn-danger btn-xs"
+                    hx-post="/admin-web/users/{{ u.id }}/ban"
+                    hx-target="#user-row-{{ u.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Забанить пользователя {{ u.username or u.email }}?">
+              Бан
+            </button>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if not users %}
+  <div class="empty">
+    <div class="empty-icon">&#9786;</div>
+    <div class="empty-title">Нет пользователей</div>
+    <div class="empty-sub">{% if query %}По запросу «{{ query }}» ничего не найдено{% else %}Пользователи не зарегистрированы{% endif %}</div>
+  </div>
+  {% endif %}
+
+  {% if total_pages > 1 %}
+  <div class="pagination">
+    {% if page > 1 %}
+    <a class="pag-btn" href="/admin-web/users?page={{ page - 1 }}{% if query %}&q={{ query }}{% endif %}">&larr;</a>
+    {% endif %}
+    {% for p in range(1, total_pages + 1) %}
+      {% if p == page %}
+      <a class="pag-btn active" href="#">{{ p }}</a>
+      {% elif p <= 3 or p >= total_pages - 2 or (p >= page - 2 and p <= page + 2) %}
+      <a class="pag-btn" href="/admin-web/users?page={{ p }}{% if query %}&q={{ query }}{% endif %}">{{ p }}</a>
+      {% elif p == 4 or p == total_pages - 3 %}
+      <span class="pag-btn" style="cursor:default">…</span>
+      {% endif %}
+    {% endfor %}
+    {% if page < total_pages %}
+    <a class="pag-btn" href="/admin-web/users?page={{ page + 1 }}{% if query %}&q={{ query }}{% endif %}">&rarr;</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

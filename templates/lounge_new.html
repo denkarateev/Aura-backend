@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}Создать лаунж — Ember Admin{% endblock %}
+{% block breadcrumb %}
+  <a href="/admin-web/lounges">Лаунжи</a>
+  <span class="sep">/</span>
+  <span class="current">Создать лаунж</span>
+{% endblock %}
+
+{% block extra_head %}
+<style>
+  .parse-bar {
+    display: flex; gap: 10px; align-items: flex-end;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px 16px;
+    margin-bottom: 24px;
+  }
+  .parse-bar .form-group { margin-bottom: 0; flex: 1; }
+  .preview-img-grid {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px;
+  }
+  .preview-img {
+    width: 100px; height: 70px; object-fit: cover;
+    border-radius: 6px; border: 1px solid var(--border);
+  }
+  .section-title {
+    font-size: 10px; font-weight: 800; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 16px; margin-top: 8px;
+    border-bottom: 1px solid var(--border); padding-bottom: 8px;
+  }
+  .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+  .form-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 20px; }
+  .spinner { display: none; }
+  .parse-bar form.loading .spinner { display: inline; }
+</style>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-header-left">
+    <div class="page-h1">Создать лаунж</div>
+    <div class="page-h1-sub">Заполни вручную или спарси данные с сайта заведения</div>
+  </div>
+</div>
+
+{% if flash_err %}
+<div class="flash flash-err">{{ flash_err }}</div>
+{% endif %}
+
+<!-- ===== STEP 1: Parser ===== -->
+<div class="parse-bar">
+  <form method="post" action="/admin-web/lounges/parse" id="parse-form"
+        onsubmit="this.classList.add('loading')">
+    <div class="form-group">
+      <label class="form-label">Ссылка на сайт заведения</label>
+      <input class="form-control" type="url" name="url"
+             value="{{ parse_url or '' }}"
+             placeholder="https://hookahplace.ru/" autocomplete="off">
+    </div>
+  </form>
+  <button class="btn btn-primary" onclick="document.getElementById('parse-form').submit()" style="white-space:nowrap;">
+    <span class="spinner">...</span>
+    Спарсить
+  </button>
+  <a class="btn btn-ghost" href="/admin-web/lounges/new">Сбросить</a>
+</div>
+
+{% if parsed %}
+<!-- Parser result summary -->
+<div class="callout" style="margin-bottom: 20px;">
+  Спарсено с <strong>{{ parsed.source_url }}</strong>:
+  заголовок «{{ parsed.title or '—' }}»,
+  телефон {{ parsed.phone or '—' }},
+  картинок найдено {{ parsed.extra_image_urls | length + (1 if parsed.cover_url_remote else 0) }}.
+  Проверь поля ниже и нажми «Сохранить лаунж».
+</div>
+
+{% if parsed.cover_url_remote or parsed.extra_image_urls %}
+<div style="margin-bottom: 20px;">
+  <div class="section-title">Найденные картинки (будут скачаны при сохранении)</div>
+  <div class="preview-img-grid">
+    {% if parsed.cover_url_remote %}
+    <img class="preview-img" src="{{ parsed.cover_url_remote }}" alt="cover" title="cover (og:image)">
+    {% endif %}
+    {% for img in parsed.extra_image_urls %}
+    <img class="preview-img" src="{{ img }}" alt="photo {{ loop.index }}" title="{{ img }}">
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- ===== STEP 2: Form ===== -->
+<div class="card">
+  <div class="card-header">
+    <div class="card-header-title">Данные лаунжа</div>
+  </div>
+  <div class="card-body">
+    <form method="post" action="/admin-web/lounges/new">
+
+      <!-- Hidden: image URLs from parser -->
+      <input type="hidden" name="cover_url_remote"
+             value="{{ form.cover_url_remote or '' }}">
+      <input type="hidden" name="avatar_url_remote"
+             value="{{ form.avatar_url_remote or '' }}">
+      <input type="hidden" name="extra_image_urls"
+             value="{{ (form.extra_image_urls or []) | join('\n') }}">
+      <input type="hidden" name="source_url"
+             value="{{ form.source_url or parse_url or '' }}">
+
+      <div class="section-title">Идентификация</div>
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label">brand_id (slug, латиница + _) *</label>
+          <input class="form-control" type="text" name="brand_id"
+                 value="{{ form.brand_id_suggestion or '' }}"
+                 placeholder="hookahplace" required
+                 pattern="[a-z0-9_]+" title="только латиница, цифры, _">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Название заведения *</label>
+          <input class="form-control" type="text" name="title"
+                 value="{{ form.title or '' }}"
+                 placeholder="HookahPlace Арбат" required>
+        </div>
+      </div>
+
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label">Tier</label>
+          <select class="form-control" name="tier">
+            <option value="start">start</option>
+            <option value="lite">lite</option>
+            <option value="pro">pro</option>
+            <option value="network">network</option>
+            <option value="partner">partner</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Category</label>
+          <select class="form-control" name="category">
+            <option value="lounge">lounge</option>
+            <option value="bar">bar</option>
+            <option value="restaurant">restaurant</option>
+            <option value="club">club</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="section-title">Контакты и адрес</div>
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label">Город</label>
+          <input class="form-control" type="text" name="city"
+                 value="{{ form.city or '' }}"
+                 placeholder="Москва">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Адрес</label>
+          <input class="form-control" type="text" name="address"
+                 value="{{ form.address or '' }}"
+                 placeholder="ул. Арбат, 10">
+        </div>
+      </div>
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label">Телефон</label>
+          <input class="form-control" type="text" name="phone"
+                 value="{{ form.phone or '' }}"
+                 placeholder="+7 999 000-00-00">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Часы работы</label>
+          <input class="form-control" type="text" name="hours"
+                 value="{{ form.hours or '' }}"
+                 placeholder="Ежедн. 12:00–02:00">
+        </div>
+      </div>
+
+      <div class="section-title">Описание</div>
+      <div class="form-group">
+        <label class="form-label">Tagline (короткий слоган)</label>
+        <input class="form-control" type="text" name="tagline"
+               value="{{ form.tagline or form.description or '' }}"
+               placeholder="Лучший кальян в центре Москвы">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Summary (абзац для карточки)</label>
+        <textarea class="form-control" name="summary" rows="3"
+                  placeholder="Подробнее о заведении...">{{ form.summary or form.description or '' }}</textarea>
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-top: 8px;">
+        <button class="btn btn-primary" type="submit">Сохранить лаунж</button>
+        <a class="btn btn-ghost" href="/admin-web/lounges">Отмена</a>
+      </div>
+
+    </form>
+  </div>
+</div>
+
+{% endblock %}

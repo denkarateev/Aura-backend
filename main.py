@@ -3,6 +3,7 @@ import uuid
 import random
 import string
 import asyncio
+import urllib.parse
 from fastapi import WebSocket, WebSocketDisconnect
 import hashlib
 import bcrypt
@@ -12,13 +13,14 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError
 from jose import jwt
@@ -60,6 +62,7 @@ from app.models import (
     Event,
     EventRSVP,
     Favorite,
+    FeaturedSlot,
     LoungeAdminMeta,
     LoungeAssets,
     LoungeBundle,
@@ -223,6 +226,9 @@ from app.schemas import (
     PromotedLoungeOut,
     PromotedListOut,
     PromotedSlotIn,
+    FeaturedSlotOut,
+    FeaturedSlotIn,
+    FeaturedFeedOut,
     FlavorPopularity,
     RegionBucket,
     BrandAnalyticsOut,
@@ -238,6 +244,8 @@ from app.schemas import (
     LoungeCheckoutOut,
     VALID_LOUNGE_TIERS,
     VALID_LOUNGE_BADGES,
+    LoungeCRMHeatmapCellOut,
+    LoungeCRMHeatmapOut,
 )
 from app.services.subscriptions import get_active_tier, require_tier
 
@@ -1579,6 +1587,12 @@ def build_monthly_flavor(db: Session) -> MonthlyFlavorOut:
 app = FastAPI(title="HookahMix API")
 
 # -------------------------------------------------------------------
+# JINJA2 TEMPLATES — admin web CRM
+# -------------------------------------------------------------------
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+templates = Jinja2Templates(directory=_TEMPLATES_DIR)
+
+# -------------------------------------------------------------------
 # RATE LIMITING (slowapi)
 # -------------------------------------------------------------------
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute", "30/second"])
@@ -2380,6 +2394,64 @@ def startup():
                 _billing_migration_exc,
             )
 
+    # MARK: featured_slots — paid featured placements (2026-05-27)
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS featured_slots (
+                        id SERIAL PRIMARY KEY,
+                        brand_id VARCHAR(128) NOT NULL,
+                        slot_type VARCHAR(32) NOT NULL,
+                        city VARCHAR(64),
+                        starts_at TIMESTAMP NOT NULL,
+                        expires_at TIMESTAMP NOT NULL,
+                        price_paid INTEGER NOT NULL DEFAULT 0,
+                        status VARCHAR(32) NOT NULL DEFAULT 'active',
+                        payment_method VARCHAR(64),
+                        created_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_featured_slots_active
+                    ON featured_slots(status, expires_at)
+                    WHERE status='active'
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_featured_slots_city
+                    ON featured_slots(city, slot_type)
+                    WHERE status='active'
+                    """
+                )
+                # Idempotent seed: garden_lounge_korolev as hero for 7 days
+                conn.exec_driver_sql(
+                    """
+                    INSERT INTO featured_slots
+                        (brand_id, slot_type, city, starts_at, expires_at,
+                         price_paid, status, payment_method, created_by_admin, created_at)
+                    SELECT
+                        'garden_lounge_korolev', 'hero', 'general',
+                        NOW(), NOW() + INTERVAL '7 days',
+                        0, 'active', 'trial', TRUE, NOW()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM featured_slots
+                        WHERE brand_id = 'garden_lounge_korolev' AND status = 'active'
+                    )
+                    """
+                )
+        except Exception as _featured_migration_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "featured_slots migration skipped (likely race with another worker): %s",
+                _featured_migration_exc,
+            )
+
     # MARK: Hot-path FK indexes (perf audit 2026-05-26)
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
@@ -2453,6 +2525,136 @@ def startup():
         _lg.getLogger(__name__).warning(
             "leaderboard scheduler not started: %s", exc
         )
+
+    # MARK: lounge_catalog — server-driven lounge catalog (2026-05-28)
+    # Allows new lounges to appear in iOS app without a rebuild.
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS lounge_catalog (
+                        brand_id TEXT PRIMARY KEY,
+                        profile_json JSONB NOT NULL,
+                        is_active BOOLEAN NOT NULL DEFAULT true,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lounge_catalog_active
+                    ON lounge_catalog (is_active)
+                    WHERE is_active = true
+                    """
+                )
+                # Seed: myata_platinum
+                _myata_json = json.dumps({
+                    "brand_id": "myata_platinum",
+                    "title": "Мята Платинум Событие",
+                    "category": "lounge",
+                    "accent_hex": "A8F55F",
+                    "secondary_hex": "15220F",
+                    "badge": "Network lounge",
+                    "tagline": "Африканский лаундж-бар Мяты в ЖК «Событие»: джунгли посреди Москвы, кухня comfort food, авторские коктейли и loyalty-логика сети.",
+                    "summary": "Мята Платинум Событие — лаундж-бар в африканском стиле в ЖК «Событие»: двухметровые скульптуры, четырёхметровые пальмы и панорамные окна. Кухня comfort food с африканскими нотками, авторские коктейли. На уровне продукта это сильный пример сетевого lounge с понятной loyalty-системой бренда.",
+                    "signature": "Сильная сторона места: атмосферный африканский lounge-формат с сервисом и встроенной loyalty-логикой Мяты.",
+                    "heritage": "В приложении Мята Платинум Событие показывает, как работает сетевой lounge со своей системой возврата и бонусов.",
+                    "best_for": "Подходит для rail'ов `с loyalty`, `сеть`, `атмосфера`, `вечеринки` и как пример non-HookahPlace места в Москве.",
+                    "lines": ["Африканский интерьер", "Кухня comfort food", "Авторские коктейли", "Панорамные окна", "VIP-зоны", "Мята Loyalty"],
+                    "highlights": ["Loyalty", "Атмосфера", "Сетевой lounge"],
+                    "aliases": ["мята событие", "мята платинум событие", "myata platinum sobytie", "мята platinum событие", "myata_platinum", "мята жк событие"],
+                    "hero_symbol": "leaf.fill",
+                    "logo_image_url": None,
+                    "hero_image_url": "http://188.253.19.166:8000/static/lounges/myata_platinum_cover.jpg",
+                    "avatar_url": None,
+                    "cover_url": None,
+                    "official_authors": ["myata_platinum", "Мята Платинум Событие", "Myata Platinum Sobytie", "Мята Событие"],
+                    "venue_address": "Москва, ул. Василия Ланового, 5 (ЖК «Событие»)",
+                    "nearest_metro": "Минская",
+                    "venue_latitude": 55.7180,
+                    "venue_longitude": 37.4905,
+                    "venue_hours": "Вс-Чт 11:00-02:00 · Пт-Сб 11:00-04:00",
+                    "venue_price": "ср. чек ~2 200 ₽",
+                    "venue_format": "Африканский лаунж · кухня · коктейли",
+                    "venue_phone": "+7 916 666-45-11",
+                    "venue_booking_url": "https://myatasobytiye.ru",
+                    "venue_menu_url": "https://myatasobytiye.ru",
+                    "venue_loyalty_title": "Мята Loyalty",
+                    "venue_loyalty_summary": "Сетевой loyalty-слой Мяты: welcome-баллы, кешбэк, рост уровня и возможность оплачивать часть счёта бонусами.",
+                    "articles": [
+                        {
+                            "id": "myata_platinum_event",
+                            "title": "Happy Hours 17–19",
+                            "subtitle": "Каждый будний день: кальян + чай по специальной цене до вечернего наплыва.",
+                            "tag": "Акции",
+                            "image_url": "https://sf.imcsoft.ru/image/1122/109/109_1766747075587dbe304104532a90610e941321f6c3-optimization.jpg"
+                        },
+                        {
+                            "id": "myata_platinum_loyalty",
+                            "title": "Loyalty-система сети Мята",
+                            "subtitle": "Баллы, кешбэк и рост уровня делают это место удобным кейсом для вкладки `Места`.",
+                            "tag": "Новости",
+                            "image_url": "https://sf.imcsoft.ru/image/1104/309/309_1692020978514c77ef6afffc1dae471d07ee09cd49.jpg"
+                        }
+                    ],
+                    "menu_highlights": [
+                        {
+                            "id": "myata_platinum_africa",
+                            "title": "Африканская атмосфера",
+                            "subtitle": "Скульптуры, пальмы и панорамные окна — особенный вечерний сценарий.",
+                            "icon_name": "leaf.fill"
+                        },
+                        {
+                            "id": "myata_platinum_kitchen",
+                            "title": "Кухня comfort food",
+                            "subtitle": "Понятная, но интересная кухня с африканскими нотками.",
+                            "icon_name": "fork.knife"
+                        },
+                        {
+                            "id": "myata_platinum_loyalty",
+                            "title": "Мята Loyalty",
+                            "subtitle": "Привилегии и накопительная логика сети, понятная пользователю.",
+                            "icon_name": "star.circle.fill"
+                        }
+                    ],
+                    "service_cards": [
+                        {
+                            "id": "myata_platinum_open",
+                            "title": "Открыть заведение",
+                            "subtitle": "Официальная карточка lounge с бронью и услугами.",
+                            "icon_name": "calendar.badge.plus",
+                            "destination_url": "https://myatasobytiye.ru"
+                        },
+                        {
+                            "id": "myata_platinum_menu",
+                            "title": "Открыть карточку Мяты",
+                            "subtitle": "Меню, новости и услуги заведения.",
+                            "icon_name": "menucard.fill",
+                            "destination_url": "https://myatasobytiye.ru"
+                        },
+                        {
+                            "id": "myata_platinum_call",
+                            "title": "Позвонить",
+                            "subtitle": "+7 916 666-45-11",
+                            "icon_name": "phone.fill",
+                            "destination_url": "tel://79166664511"
+                        }
+                    ]
+                }, ensure_ascii=False)
+                conn.exec_driver_sql(
+                    """
+                    INSERT INTO lounge_catalog (brand_id, profile_json, is_active, updated_at)
+                    VALUES ('myata_platinum', %s::jsonb, true, now())
+                    ON CONFLICT (brand_id) DO NOTHING
+                    """,
+                    (_myata_json,),
+                )
+        except Exception as _catalog_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "lounge_catalog migration skipped: %s", _catalog_exc
+            )
 
 # -------------------------------------------------------------------
 # LEGAL — Privacy Policy & Terms of Use (152-FZ / App Store compliance)
@@ -2921,6 +3123,78 @@ def rsvp_event(
         EventRSVP.going == True,  # noqa: E712
     ).count()
     return EventRSVPOut(status="ok", going=row.going, going_count=going_count)
+
+
+# ===================================================================
+# BLOCK: Featured Slots public feed (2026-05-27)
+# NOTE: must be declared BEFORE /lounges/{brand_id}/... routes
+# ===================================================================
+
+@app.get(
+    "/lounges/featured",
+    response_model=FeaturedFeedOut,
+    tags=["lounges"],
+)
+def get_featured_lounges(
+    city: Optional[str] = Query(None, description="Город: msk | spb | general"),
+    slot_type: Optional[str] = Query(None, description="Тип слота: hero | grid"),
+    db: Session = Depends(get_db),
+):
+    """
+    Публичный endpoint для iOS. Возвращает активные featured-слоты.
+    hero — первый активный hero-слот для города (или general), max 1.
+    grid — все активные grid-слоты для города (или general).
+    """
+    now = datetime.utcnow()
+
+    base_q = db.query(FeaturedSlot).filter(
+        FeaturedSlot.status == "active",
+        FeaturedSlot.expires_at > now,
+    )
+
+    if city:
+        base_q = base_q.filter(
+            (FeaturedSlot.city == city) | (FeaturedSlot.city == "general")
+        )
+
+    def _to_out(r: FeaturedSlot) -> FeaturedSlotOut:
+        remaining = max(0, (r.expires_at - now).days)
+        return FeaturedSlotOut(
+            id=r.id,
+            brand_id=r.brand_id,
+            slot_type=r.slot_type,
+            city=r.city,
+            starts_at=r.starts_at,
+            expires_at=r.expires_at,
+            price_paid=r.price_paid or 0,
+            status=r.status,
+            payment_method=r.payment_method,
+            created_by_admin=r.created_by_admin or False,
+            created_at=r.created_at,
+            remaining_days=remaining,
+        )
+
+    hero_slot: Optional[FeaturedSlotOut] = None
+    grid_slots: list = []
+
+    if slot_type in (None, "hero"):
+        hero_row = (
+            base_q.filter(FeaturedSlot.slot_type == "hero")
+            .order_by(FeaturedSlot.expires_at.desc())
+            .first()
+        )
+        if hero_row:
+            hero_slot = _to_out(hero_row)
+
+    if slot_type in (None, "grid"):
+        grid_rows = (
+            base_q.filter(FeaturedSlot.slot_type == "grid")
+            .order_by(FeaturedSlot.expires_at.desc())
+            .all()
+        )
+        grid_slots = [_to_out(r) for r in grid_rows]
+
+    return FeaturedFeedOut(hero=hero_slot, grid=grid_slots)
 
 
 @app.get("/lounges/{brand_id}/program", response_model=LoungeProgramOut)
@@ -6993,6 +7267,27 @@ def list_tobacco_flavors(
     return TobaccoFlavorListOut(items=items, total=total, limit=limit, offset=offset)
 
 
+# ── Single flavor by id (GET /flavors/{flavor_id}) ───────────────────────
+# Юзер 2026-05-27: «вместо имени флейвора показывается Загрузка...» —
+# раньше iOS должен был грузить весь /flavors?brand=... и искать match.
+# Это медленно и часто фейлится из-за неточного match. Direct lookup —
+# единственный надёжный путь.
+
+@app.get("/flavors/{flavor_id}", response_model=TobaccoFlavorOut)
+def get_tobacco_flavor(flavor_id: int, db: Session = Depends(get_db)):
+    """Single flavor by id. Public — no auth required."""
+    row = db.execute(
+        sa_text(
+            "SELECT id, brand, name, category, strength, description, "
+            "image_url, source AS source_url FROM tobacco_flavors WHERE id = :id"
+        ),
+        {"id": flavor_id},
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="flavor_not_found")
+    return TobaccoFlavorOut(**dict(row))
+
+
 # ── Tobacco brands catalog (GET /tobacco/brands) ─────────────────────────
 # Returns distinct brands grouped from tobacco_flavors with flavor count.
 # category filter: 'tobacco' | 'liquid'
@@ -7654,6 +7949,60 @@ def lounge_crm_guest_card(
     )
 
 
+@app.get("/lounges/{brand_id}/crm/heatmap", response_model=LoungeCRMHeatmapOut, tags=["crm"])
+@limiter.limit("60/minute")
+def lounge_crm_heatmap(
+    request: Request,
+    brand_id: str,
+    tz_offset_min: int = Query(0, ge=-720, le=840),
+    days_back: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Visit heatmap matrix (dow × hour) for CRM calendar view. Owner-only. Requires tier >= pro."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
+
+    since = datetime.utcnow() - timedelta(days=days_back)
+
+    # Use raw SQL for efficient GROUP BY on date-shifted values to avoid
+    # loading all visit rows into Python. tz_offset_min applied as interval.
+    sql = text("""
+        SELECT
+            EXTRACT(DOW FROM (created_at + CAST(:tz_interval AS INTERVAL)))::int AS dow,
+            EXTRACT(HOUR FROM (created_at + CAST(:tz_interval AS INTERVAL)))::int AS hour,
+            COUNT(*)::int AS visit_count
+        FROM lounge_visits
+        WHERE brand_id = :brand_id
+          AND created_at >= :since
+        GROUP BY dow, hour
+        ORDER BY dow, hour
+    """)
+
+    tz_interval = f"{tz_offset_min} minutes"
+    rows = db.execute(sql, {
+        "brand_id": brand_id,
+        "since": since,
+        "tz_interval": tz_interval,
+    }).fetchall()
+
+    cells = [
+        LoungeCRMHeatmapCellOut(dow=row[0], hour=row[1], visit_count=row[2])
+        for row in rows
+    ]
+    total_visits = sum(c.visit_count for c in cells)
+
+    return LoungeCRMHeatmapOut(
+        cells=cells,
+        total_visits=total_visits,
+        days_back=days_back,
+        tz_offset_min=tz_offset_min,
+    )
+
+
 @app.websocket("/ws/duel/{duel_id}")
 async def duel_websocket(duel_id: str, websocket: WebSocket, token: str = None, db: Session = Depends(get_db)):
     user_id = None
@@ -7975,6 +8324,139 @@ def create_promoted_slot(
     )
 
 
+@app.post(
+    "/admin/lounges/{brand_id}/featured",
+    response_model=FeaturedSlotOut,
+    tags=["admin"],
+    status_code=201,
+)
+def create_featured_slot(
+    brand_id: str,
+    payload: FeaturedSlotIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """
+    Admin: создать featured-слот для лаунжа.
+    Требует tier >= pro у лаунжа (lounge_billing_subscriptions).
+    Для hero: проверяет конфликт по city на тот же период → 409.
+    """
+    # Check billing tier >= pro
+    tier = get_active_tier(db, brand_id)
+    from app.services.subscriptions import _tier_rank
+    if _tier_rank(tier) < _tier_rank("pro"):
+        raise HTTPException(
+            status_code=402,
+            detail=f"Лаунж {brand_id} имеет тариф '{tier}'. Для featured-слотов требуется pro+.",
+        )
+
+    now = datetime.utcnow()
+    starts_at = now
+    expires_at = now + timedelta(days=payload.days)
+
+    # Hero conflict check
+    if payload.slot_type == "hero":
+        conflict = db.query(FeaturedSlot).filter(
+            FeaturedSlot.slot_type == "hero",
+            FeaturedSlot.city == payload.city,
+            FeaturedSlot.status == "active",
+            FeaturedSlot.expires_at > now,
+        ).first()
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Hero-слот для города '{payload.city}' уже занят брендом '{conflict.brand_id}' до {conflict.expires_at.isoformat()}.",
+            )
+
+    slot = FeaturedSlot(
+        brand_id=brand_id,
+        slot_type=payload.slot_type,
+        city=payload.city,
+        starts_at=starts_at,
+        expires_at=expires_at,
+        price_paid=payload.price_paid,
+        status="active",
+        payment_method=payload.payment_method,
+        created_by_admin=True,
+        created_at=now,
+    )
+    db.add(slot)
+    db.commit()
+    db.refresh(slot)
+
+    remaining = max(0, (slot.expires_at - now).days)
+    return FeaturedSlotOut(
+        id=slot.id,
+        brand_id=slot.brand_id,
+        slot_type=slot.slot_type,
+        city=slot.city,
+        starts_at=slot.starts_at,
+        expires_at=slot.expires_at,
+        price_paid=slot.price_paid or 0,
+        status=slot.status,
+        payment_method=slot.payment_method,
+        created_by_admin=slot.created_by_admin or False,
+        created_at=slot.created_at,
+        remaining_days=remaining,
+    )
+
+
+@app.get(
+    "/admin/featured",
+    tags=["admin"],
+)
+def list_featured_slots(
+    status: Optional[str] = Query("active", description="active | expired | cancelled"),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin: список всех featured-слотов с оставшимися днями."""
+    now = datetime.utcnow()
+    q = db.query(FeaturedSlot)
+    if status:
+        q = q.filter(FeaturedSlot.status == status)
+    rows = q.order_by(FeaturedSlot.expires_at.desc()).all()
+
+    result = []
+    for r in rows:
+        remaining = max(0, (r.expires_at - now).days)
+        result.append({
+            "id": r.id,
+            "brand_id": r.brand_id,
+            "slot_type": r.slot_type,
+            "city": r.city,
+            "starts_at": r.starts_at.isoformat() if r.starts_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+            "price_paid": r.price_paid or 0,
+            "status": r.status,
+            "payment_method": r.payment_method,
+            "created_by_admin": r.created_by_admin or False,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "remaining_days": remaining,
+        })
+    return {"items": result, "total": len(result)}
+
+
+@app.post(
+    "/admin/featured/{slot_id}/cancel",
+    tags=["admin"],
+)
+def cancel_featured_slot(
+    slot_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin: отменить featured-слот (для refund/досрочного завершения)."""
+    slot = db.query(FeaturedSlot).filter(FeaturedSlot.id == slot_id).first()
+    if not slot:
+        raise HTTPException(status_code=404, detail="Слот не найден")
+    if slot.status == "cancelled":
+        raise HTTPException(status_code=400, detail="Слот уже отменён")
+    slot.status = "cancelled"
+    db.commit()
+    return {"ok": True, "slot_id": slot_id, "status": "cancelled"}
+
+
 # ===================================================================
 # BLOCK 3 — Brand Analytics (B2B data API, 2026-05-26)
 # ===================================================================
@@ -8285,6 +8767,55 @@ def get_lounge_public_meta(brand_id: str, db: Session = Depends(get_db)):
     )
 
 
+@app.get("/lounges/{brand_id}/public-meta", response_model=LoungePublicMetaOut, tags=["lounges"])
+def get_lounge_public_meta_v2(brand_id: str, db: Session = Depends(get_db)):
+    """
+    Public endpoint (no auth): full social-proof meta for iOS LoungeProfileView.
+
+    Returns active billing tier via get_active_tier(), public badges from
+    lounge_admin_meta, subscription_active flag, and is_featured_now
+    (active featured_slot for this brand).
+    """
+    # Tier from billing (overrides admin_meta.tier for display)
+    active_tier = get_active_tier(db, brand_id)
+
+    # Badges from admin CRM meta
+    meta = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    badges: list = meta.badges if (meta and isinstance(meta.badges, list)) else []
+
+    # subscription_active: any row with status active|trialing and expires_at > now
+    from app.models import LoungeBillingSubscription
+    now = datetime.utcnow()
+    sub_active = (
+        db.query(LoungeBillingSubscription.id)
+        .filter(
+            LoungeBillingSubscription.brand_id == brand_id,
+            LoungeBillingSubscription.expires_at > now,
+            LoungeBillingSubscription.status.in_(["active", "trialing"]),
+        )
+        .first()
+    ) is not None
+
+    # is_featured_now: active featured slot for this brand
+    featured = (
+        db.query(FeaturedSlot.id)
+        .filter(
+            FeaturedSlot.brand_id == brand_id,
+            FeaturedSlot.status == "active",
+            FeaturedSlot.expires_at > now,
+        )
+        .first()
+    ) is not None
+
+    return LoungePublicMetaOut(
+        brand_id=brand_id,
+        tier=active_tier,
+        badges=badges,
+        subscription_active=sub_active,
+        is_featured_now=featured,
+    )
+
+
 # -------------------------------------------------------------------
 # BILLING SUBSCRIPTIONS — Sprint 1, 2026-05-27
 # -------------------------------------------------------------------
@@ -8464,4 +8995,1385 @@ async def yookassa_webhook(
         body.get("event", "unknown"),
     )
 
-    return StatusOut(status="ok", message="webhook received (stub)")
+
+# ===================================================================
+# ADMIN WEB CRM — /admin-web/*
+# Server-rendered HTML UI (Jinja2 + HTMX).
+# Auth: session cookie "admin_session" = JWT access token for an
+# is_admin user. Completely separate from /admin/* JSON endpoints.
+# ===================================================================
+
+_ADMIN_SESSION_COOKIE = "ember_admin_session"
+_ADMIN_SESSION_MAX_AGE = 60 * 60 * 8  # 8 hours
+
+
+def _admin_web_user(request: Request, db: Session = Depends(get_db)) -> Optional[User]:
+    """
+    Reads admin_session cookie, validates JWT, returns User if is_admin.
+    Returns None if not authenticated.
+    """
+    token = request.cookies.get(_ADMIN_SESSION_COOKIE)
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["sub"])
+    except Exception:
+        return None
+    user = db.query(User).get(user_id)
+    if not user:
+        return None
+    if user.is_banned or getattr(user, "is_deleted", False):
+        return None
+    if not user.is_admin and user.id != 1:
+        return None
+    return user
+
+
+def _require_admin_web(request: Request, db: Session = Depends(get_db)) -> User:
+    """Dependency for admin-web routes: redirect to login if not authenticated."""
+    user = _admin_web_user(request, db)
+    if not user:
+        raise HTTPException(status_code=302, headers={"Location": "/admin-web/login"})
+    return user
+
+
+def _fmt_dt(dt) -> str:
+    """Format datetime for display."""
+    if dt is None:
+        return "—"
+    try:
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(dt)
+
+
+def _sub_status_for_brand(brand_id: str, db: Session):
+    """Return (status, expires_at_str) for the active subscription of a brand."""
+    now = datetime.utcnow()
+    sub = (
+        db.query(LoungeBillingSubscription)
+        .filter(
+            LoungeBillingSubscription.brand_id == brand_id,
+            LoungeBillingSubscription.expires_at > now,
+            LoungeBillingSubscription.status.in_(["active", "trialing"]),
+        )
+        .order_by(LoungeBillingSubscription.expires_at.desc())
+        .first()
+    )
+    if sub:
+        return sub.status, _fmt_dt(sub.expires_at)
+    return None, None
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/login
+# ---------------------------------------------------------------
+@app.get("/admin-web/login", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_login_page(request: Request):
+    return templates.TemplateResponse(request, "login.html", {"error": None})
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/login
+# ---------------------------------------------------------------
+@app.post("/admin-web/login", response_class=HTMLResponse, tags=["admin-web"])
+async def admin_web_login_submit(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    email_val = (form.get("email") or "").strip().lower()
+    password_val = (form.get("password") or "").strip()
+
+    def _render_error(msg: str):
+        return templates.TemplateResponse(request, "login.html", {"error": msg})
+
+    if not email_val or not password_val:
+        return _render_error("Введите email и пароль")
+
+    user = db.query(User).filter(
+        func.lower(User.email) == email_val
+    ).first()
+
+    if not user:
+        return _render_error("Неверный email или пароль")
+    if not verify_password(password_val, user.password_hash):
+        return _render_error("Неверный email или пароль")
+    if not user.is_admin and user.id != 1:
+        return _render_error("Нет прав администратора")
+
+    # create_access_token uses fixed ACCESS_TOKEN_EXPIRE_MINUTES (7 days), which is fine.
+    token = create_access_token({"sub": str(user.id)})
+    response = RedirectResponse(url="/admin-web/", status_code=302)
+    response.set_cookie(
+        _ADMIN_SESSION_COOKIE,
+        token,
+        max_age=_ADMIN_SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/logout
+# ---------------------------------------------------------------
+@app.get("/admin-web/logout", tags=["admin-web"])
+def admin_web_logout():
+    response = RedirectResponse(url="/admin-web/login", status_code=302)
+    response.delete_cookie(_ADMIN_SESSION_COOKIE)
+    return response
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/   (dashboard)
+# ---------------------------------------------------------------
+@app.get("/admin-web/", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_ok: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    now = datetime.utcnow()
+    cutoff_30 = now - timedelta(days=30)
+
+    total_users = db.query(func.count(User.id)).scalar() or 0
+    banned_users = db.query(func.count(User.id)).filter(User.is_banned.is_(True)).scalar() or 0
+    total_mixes = db.query(func.count(Mix.id)).scalar() or 0
+
+    # MAU: users who have any UserActivity in last 30 days
+    mau = (
+        db.query(func.count(func.distinct(UserActivity.user_id)))
+        .filter(UserActivity.created_at >= cutoff_30)
+        .scalar() or 0
+    )
+
+    # Distinct lounges
+    brand_ids_set: set = set()
+    for row in db.query(LoungeGuestLoyalty.brand_id).distinct().all():
+        brand_ids_set.add(row.brand_id)
+    for row in db.query(LoungeVisit.brand_id).distinct().all():
+        brand_ids_set.add(row.brand_id)
+    for row in db.query(LoungeAdminMeta.brand_id).all():
+        brand_ids_set.add(row.brand_id)
+    total_lounges = len(brand_ids_set)
+
+    # Active subscriptions
+    active_subs = (
+        db.query(func.count(LoungeBillingSubscription.id))
+        .filter(
+            LoungeBillingSubscription.expires_at > now,
+            LoungeBillingSubscription.status.in_(["active", "trialing"]),
+        )
+        .scalar() or 0
+    )
+
+    # Top 5 lounges by visits_30d
+    top_rows = (
+        db.query(LoungeVisit.brand_id, func.count(LoungeVisit.id).label("cnt"))
+        .filter(LoungeVisit.created_at >= cutoff_30)
+        .group_by(LoungeVisit.brand_id)
+        .order_by(func.count(LoungeVisit.id).desc())
+        .limit(5)
+        .all()
+    )
+    top_lounges = []
+    for brand_id, cnt in top_rows:
+        meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+        tier = meta_row.tier if meta_row else "start"
+        sub_status, _ = _sub_status_for_brand(brand_id, db)
+        top_lounges.append({
+            "brand_id": brand_id,
+            "visits_30d": cnt,
+            "tier": tier,
+            "sub_status": sub_status,
+        })
+
+    # Recent 10 users
+    recent_users_rows = (
+        db.query(User)
+        .filter(User.is_deleted.is_(False))
+        .order_by(User.id.desc())
+        .limit(10)
+        .all()
+    )
+    recent_users = [
+        {
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "created_at": _fmt_dt(getattr(u, "created_at", None)),
+            "is_banned": u.is_banned,
+            "is_admin": u.is_admin,
+        }
+        for u in recent_users_rows
+    ]
+
+    ctx = {
+        "active_nav": "dashboard",
+        "admin_email": admin.email,
+        "flash_ok": flash_ok,
+        "stats": {
+            "total_users": total_users,
+            "mau": mau,
+            "total_lounges": total_lounges,
+            "active_subscriptions": active_subs,
+            "banned_users": banned_users,
+            "total_mixes": total_mixes,
+        },
+        "top_lounges": top_lounges,
+        "recent_users": recent_users,
+    }
+    return templates.TemplateResponse(request, "dashboard.html", ctx)
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/users
+# ---------------------------------------------------------------
+@app.get("/admin-web/users", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_users(
+    request: Request,
+    db: Session = Depends(get_db),
+    page: int = Query(default=1, ge=1),
+    q: str = Query(default=None),
+    flash_ok: str = Query(default=None),
+    flash_err: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    per_page = 50
+    base_q = db.query(User).filter(User.is_deleted.is_(False))
+    if q:
+        pattern = f"%{q.strip()}%"
+        base_q = base_q.filter(
+            (User.email.ilike(pattern)) | (User.username.ilike(pattern))
+        )
+
+    total = base_q.count()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+
+    rows = (
+        base_q.order_by(User.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    users_out = []
+    for u in rows:
+        total_visits = (
+            db.query(func.count(LoungeVisit.id))
+            .filter(LoungeVisit.user_id == u.id)
+            .scalar() or 0
+        )
+        prog = db.query(UserProgress).filter(UserProgress.user_id == u.id).first()
+        total_points = prog.points if prog else 0
+
+        users_out.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "created_at": _fmt_dt(getattr(u, "created_at", None)),
+            "is_banned": u.is_banned,
+            "is_admin": u.is_admin,
+            "account_type": u.account_type,
+            "total_visits": total_visits,
+            "total_points": total_points,
+        })
+
+    ctx = {
+        "active_nav": "users",
+        "admin_email": admin.email,
+        "users": users_out,
+        "total": total,
+        "page": page,
+        "total_pages": total_pages,
+        "query": q,
+        "flash_ok": flash_ok,
+        "flash_err": flash_err,
+    }
+    return templates.TemplateResponse(request, "users.html", ctx)
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/users/{user_id}
+# ---------------------------------------------------------------
+@app.get("/admin-web/users/{user_id}", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_user_detail(
+    user_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_ok: str = Query(default=None),
+    flash_err: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    u = db.query(User).get(user_id)
+    if not u:
+        raise HTTPException(404, "User not found")
+
+    prog = db.query(UserProgress).filter(UserProgress.user_id == u.id).first()
+    total_visits = (
+        db.query(func.count(LoungeVisit.id)).filter(LoungeVisit.user_id == u.id).scalar() or 0
+    )
+    mixes_count = db.query(func.count(Mix.id)).filter(Mix.author_id == u.id).scalar() or 0
+    favs_count = db.query(func.count(Favorite.id)).filter(Favorite.user_id == u.id).scalar() or 0
+    followers_count = (
+        db.query(func.count(UserFollow.id)).filter(UserFollow.following_id == u.id).scalar() or 0
+    )
+    following_count = (
+        db.query(func.count(UserFollow.id)).filter(UserFollow.follower_id == u.id).scalar() or 0
+    )
+    device_tokens_count = (
+        db.query(func.count(DeviceToken.id)).filter(DeviceToken.user_id == u.id).scalar() or 0
+    )
+
+    recent_visits = (
+        db.query(LoungeVisit)
+        .filter(LoungeVisit.user_id == u.id)
+        .order_by(LoungeVisit.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    visits_out = [
+        {
+            "brand_id": v.brand_id,
+            "bill_amount": v.bill_amount,
+            "bonus_awarded": v.bonus_awarded,
+            "created_at": _fmt_dt(v.created_at),
+        }
+        for v in recent_visits
+    ]
+
+    user_dict = {
+        "id": u.id,
+        "email": u.email,
+        "username": u.username,
+        "display_name": u.display_name,
+        "city": u.city,
+        "account_type": u.account_type,
+        "is_admin": u.is_admin,
+        "is_banned": u.is_banned,
+        "ban_reason": u.ban_reason,
+        "banned_at": _fmt_dt(u.banned_at),
+        "premium_until": _fmt_dt(u.premium_until),
+        "ton_address": u.ton_address,
+        "created_at": _fmt_dt(getattr(u, "created_at", None)),
+        "points": prog.points if prog else 0,
+        "rating": prog.rating if prog else 0,
+        "streak_days": prog.streak_days if prog else 0,
+        "mixes_count": mixes_count,
+        "favorites_count": favs_count,
+        "total_visits": total_visits,
+        "followers_count": followers_count,
+        "following_count": following_count,
+        "device_tokens_count": device_tokens_count,
+    }
+
+    ctx = {
+        "active_nav": "users",
+        "admin_email": admin.email,
+        "u": user_dict,
+        "recent_visits": visits_out,
+        "flash_ok": flash_ok,
+        "flash_err": flash_err,
+    }
+    return templates.TemplateResponse(request, "user_detail.html", ctx)
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/users/{user_id}/ban
+# ---------------------------------------------------------------
+@app.post("/admin-web/users/{user_id}/ban", tags=["admin-web"])
+async def admin_web_ban_user(
+    user_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    form = await request.form()
+    reason = form.get("reason", "").strip() or "Нарушение правил платформы"
+
+    u = db.query(User).get(user_id)
+    if not u:
+        return RedirectResponse(url="/admin-web/users?flash_err=User+not+found", status_code=302)
+    if u.id == admin.id:
+        return RedirectResponse(url=f"/admin-web/users/{user_id}?flash_err=Cannot+ban+yourself", status_code=302)
+
+    u.is_banned = True
+    u.ban_reason = reason
+    u.banned_at = datetime.utcnow()
+    db.commit()
+    return RedirectResponse(url=f"/admin-web/users/{user_id}?flash_ok=User+banned", status_code=302)
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/users/{user_id}/unban
+# ---------------------------------------------------------------
+@app.post("/admin-web/users/{user_id}/unban", tags=["admin-web"])
+def admin_web_unban_user(
+    user_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    u = db.query(User).get(user_id)
+    if not u:
+        return RedirectResponse(url="/admin-web/users?flash_err=User+not+found", status_code=302)
+
+    u.is_banned = False
+    u.ban_reason = None
+    u.banned_at = None
+    db.commit()
+    return RedirectResponse(url=f"/admin-web/users/{user_id}?flash_ok=User+unbanned", status_code=302)
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/lounges
+# ---------------------------------------------------------------
+@app.get("/admin-web/lounges", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_lounges(
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_ok: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    brand_ids: set = set()
+    for row in db.query(LoungeLoyaltyProgram.brand_id).all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeVisit.brand_id).distinct().all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeGuestLoyalty.brand_id).distinct().all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(LoungeAdminMeta.brand_id).all():
+        brand_ids.add(row.brand_id)
+
+    cutoff_30 = datetime.utcnow() - timedelta(days=30)
+    lounges_out = []
+    for bid in sorted(brand_ids):
+        meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == bid).first()
+        tier = meta_row.tier if meta_row else "start"
+        badges = (meta_row.badges if isinstance(meta_row.badges, list) else []) if meta_row else []
+
+        visits_30d = (
+            db.query(func.count(LoungeVisit.id))
+            .filter(LoungeVisit.brand_id == bid, LoungeVisit.created_at >= cutoff_30)
+            .scalar() or 0
+        )
+        bonus_outstanding = (
+            db.query(func.coalesce(func.sum(LoungeGuestLoyalty.bonus_balance), 0))
+            .filter(LoungeGuestLoyalty.brand_id == bid)
+            .scalar() or 0
+        )
+        promos_active = (
+            db.query(func.count(LoungePromo.id))
+            .filter(LoungePromo.brand_id == bid, LoungePromo.active == True)
+            .scalar() or 0
+        )
+        sub_status, sub_expires = _sub_status_for_brand(bid, db)
+
+        lounges_out.append({
+            "brand_id": bid,
+            "tier": tier,
+            "badges": badges,
+            "visits_last_30d": visits_30d,
+            "bonus_outstanding": int(bonus_outstanding),
+            "promos_active": promos_active,
+            "sub_status": sub_status,
+            "sub_expires": sub_expires,
+        })
+
+    ctx = {
+        "active_nav": "lounges",
+        "admin_email": admin.email,
+        "lounges": lounges_out,
+        "flash_ok": flash_ok,
+    }
+    return templates.TemplateResponse(request, "lounges.html", ctx)
+
+
+# ---------------------------------------------------------------
+# LOUNGE ONBOARDING — Create / Parse (CRM)
+# IMPORTANT: These routes must be registered BEFORE /lounges/{brand_id}
+# so FastAPI matches /lounges/new literally (not as brand_id="new").
+# GET  /admin-web/lounges/new      — form
+# POST /admin-web/lounges/parse    — server-side URL parser
+# POST /admin-web/lounges/new      — save to lounge_catalog + lounge_assets
+# ---------------------------------------------------------------
+def _slugify(text: str) -> str:
+    """Convert a string to a brand_id-safe slug (lowercase ASCII + underscores)."""
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    text = re.sub(r"[\s\-]+", "_", text)
+    return text[:60]
+
+
+def _domain_slug(url: str) -> str:
+    """Extract domain and turn it into a slug, e.g. hookahplace.ru → hookahplace."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc or url
+        host = host.replace("www.", "")
+        base = host.split(".")[0]
+        return _slugify(base)
+    except Exception:
+        return "new_lounge"
+
+
+def _download_image(url: str, dest_path: str) -> bool:
+    """Download an image from url to dest_path. Returns True on success."""
+    import urllib.request
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; HookaBot/1.0)"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            data = resp.read()
+        if len(data) < 2048:          # skip tiny icons
+            return False
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        with open(dest_path, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_lounge_url_internal(url: str) -> dict:
+    """
+    Fetch a lounge website and extract metadata.
+    Returns a dict with keys: title, description, address, phone, hours,
+    brand_id_suggestion, cover_url_remote, avatar_url_remote, extra_image_urls.
+    All image fields are remote URLs (not yet downloaded).
+    """
+    import urllib.request
+    import urllib.parse as _uparse
+    import ssl
+    from html.parser import HTMLParser
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Safari/605.1.15"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, context=ctx, timeout=25) as resp:
+        html_bytes = resp.read(500_000)
+        final_url = resp.url
+
+    try:
+        html = html_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        html = html_bytes.decode("cp1251", errors="replace")
+
+    class MetaParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.title = ""
+            self.description = ""
+            self.og_image = ""
+            self.og_title = ""
+            self.og_description = ""
+            self.images: list = []
+            self._in_title = False
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == "title":
+                self._in_title = True
+            elif tag == "meta":
+                prop = (a.get("property") or a.get("name") or "").lower()
+                content = a.get("content") or ""
+                if prop == "og:title":
+                    self.og_title = content
+                elif prop == "og:description":
+                    self.og_description = content
+                elif prop == "og:image":
+                    self.og_image = content
+                elif prop in ("description",):
+                    self.description = content
+            elif tag == "img":
+                src = a.get("src") or a.get("data-src") or ""
+                if src and not src.startswith("data:"):
+                    self.images.append(src)
+
+        def handle_data(self, data):
+            if self._in_title:
+                self.title += data
+
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self._in_title = False
+
+    parser = MetaParser()
+    parser.feed(html)
+
+    title = (parser.og_title or parser.title or "").strip()
+    description = (parser.og_description or parser.description or "").strip()
+
+    # --- Phone ---
+    phone_match = re.search(r"\+?7[\s\-\(\)0-9]{9,14}", html)
+    phone = phone_match.group(0).strip() if phone_match else ""
+
+    # --- Address ---
+    addr_match = re.search(
+        r"(?:ул\.|улица|проспект|пр-т|бульвар|шоссе|переулок|пер\.|набережная|пл\.)[\s\S]{3,80}?(?=<|,\s*[А-Яа-яЁё]{3,}|тел|$)",
+        html,
+    )
+    address = addr_match.group(0).strip() if addr_match else ""
+    address = re.sub(r"<[^>]+>", "", address).strip()
+
+    # --- Hours ---
+    hours_match = re.search(
+        r"(?:работаем|часы работы|режим работы|открыты|время работы)[^<]{0,10}[:\s]*([^\n<]{5,60})",
+        html,
+        re.IGNORECASE,
+    )
+    if not hours_match:
+        hours_match = re.search(
+            r"\b(пн|вт|ср|чт|пт|сб|вс|пн[-–]вс|пн[-–]пт|пн[-–]чт|ежедн)[^<]{0,40}(?:\d{1,2}:\d{2})[^<]{0,40}",
+            html,
+            re.IGNORECASE,
+        )
+    hours = hours_match.group(1 if hours_match and hours_match.lastindex else 0).strip() if hours_match else ""
+    hours = re.sub(r"<[^>]+>", "", hours).strip()
+
+    # --- Images ---
+    parsed_base = _uparse.urlparse(final_url)
+    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    def absolutize(src: str) -> str:
+        if src.startswith("http"):
+            return src
+        if src.startswith("//"):
+            return "https:" + src
+        return _uparse.urljoin(base_origin, src)
+
+    cover_url_remote = absolutize(parser.og_image) if parser.og_image else ""
+
+    extra_images = []
+    for src in parser.images:
+        abs_src = absolutize(src)
+        ext_lower = abs_src.lower().split("?")[0]
+        if not any(ext_lower.endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        if "tildacdn" in abs_src or "thb.tildacdn" in abs_src or parsed_base.netloc in abs_src:
+            if abs_src != cover_url_remote and abs_src not in extra_images:
+                extra_images.append(abs_src)
+        if len(extra_images) >= 8:
+            break
+
+    avatar_url_remote = cover_url_remote
+
+    brand_id_suggestion = _domain_slug(url)
+
+    return {
+        "title": title,
+        "description": description,
+        "phone": phone,
+        "address": address,
+        "hours": hours,
+        "cover_url_remote": cover_url_remote,
+        "avatar_url_remote": avatar_url_remote,
+        "extra_image_urls": extra_images[:8],
+        "brand_id_suggestion": brand_id_suggestion,
+        "source_url": url,
+    }
+
+
+@app.get("/admin-web/lounges/new", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_lounge_new_get(
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_err: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+    ctx = {
+        "active_nav": "lounges",
+        "admin_email": admin.email,
+        "flash_err": flash_err,
+        "parsed": None,
+        "form": {},
+    }
+    return templates.TemplateResponse(request, "lounge_new.html", ctx)
+
+
+@app.post("/admin-web/lounges/parse", response_class=HTMLResponse, tags=["admin-web"])
+async def admin_web_lounge_parse(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    form = await request.form()
+    url = (form.get("url") or "").strip()
+    flash_err = None
+    parsed_data = None
+
+    if url:
+        try:
+            parsed_data = _parse_lounge_url_internal(url)
+        except Exception as e:
+            flash_err = f"Не удалось спарсить сайт: {e}"
+
+    ctx = {
+        "active_nav": "lounges",
+        "admin_email": admin.email,
+        "flash_err": flash_err,
+        "parsed": parsed_data,
+        "form": parsed_data or {},
+        "parse_url": url,
+    }
+    return templates.TemplateResponse(request, "lounge_new.html", ctx)
+
+
+@app.post("/admin-web/lounges/new", tags=["admin-web"])
+async def admin_web_lounge_new_post(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    form = await request.form()
+
+    brand_id = _slugify((form.get("brand_id") or "").strip())
+    if not brand_id:
+        return RedirectResponse(
+            url="/admin-web/lounges/new?flash_err=brand_id+is+required",
+            status_code=302,
+        )
+
+    title = (form.get("title") or brand_id).strip()
+    city = (form.get("city") or "").strip()
+    address = (form.get("address") or "").strip()
+    phone = (form.get("phone") or "").strip()
+    hours = (form.get("hours") or "").strip()
+    category = (form.get("category") or "lounge").strip()
+    tier = (form.get("tier") or "start").strip()
+    tagline = (form.get("tagline") or "").strip()
+    summary = (form.get("summary") or "").strip()
+    source_url = (form.get("source_url") or "").strip()
+
+    # --- Download images ---
+    cover_url_remote = (form.get("cover_url_remote") or "").strip()
+    avatar_url_remote = (form.get("avatar_url_remote") or "").strip()
+    extra_images_raw = (form.get("extra_image_urls") or "").strip()
+    extra_image_urls = [u.strip() for u in extra_images_raw.splitlines() if u.strip()]
+
+    # /app/static is the container path (host volume: /opt/hooka-backend/static)
+    static_dir = f"/app/static/lounges/{brand_id}"
+    static_url_base = f"http://188.253.19.166:8000/static/lounges/{brand_id}"
+    os.makedirs(static_dir, exist_ok=True)
+
+    cover_url_local = ""
+    avatar_url_local = ""
+    photo_urls_local = []
+
+    idx = 0
+    for remote_url in ([cover_url_remote] + extra_image_urls):
+        if not remote_url:
+            continue
+        ext = "jpg"
+        for candidate_ext in ("webp", "png", "jpg", "jpeg"):
+            if f".{candidate_ext}" in remote_url.lower().split("?")[0]:
+                ext = candidate_ext
+                break
+        dest = os.path.join(static_dir, f"{idx}.{ext}")
+        ok = _download_image(remote_url, dest)
+        if ok:
+            local_url = f"{static_url_base}/{idx}.{ext}"
+            if idx == 0:
+                cover_url_local = local_url
+                import shutil as _shutil
+                avatar_dest = os.path.join(static_dir, f"avatar.{ext}")
+                _shutil.copy2(dest, avatar_dest)
+                avatar_url_local = f"{static_url_base}/avatar.{ext}"
+            else:
+                photo_urls_local.append(local_url)
+            idx += 1
+
+    if avatar_url_remote and avatar_url_remote != cover_url_remote:
+        dest = os.path.join(static_dir, "avatar.jpg")
+        ok = _download_image(avatar_url_remote, dest)
+        if ok:
+            avatar_url_local = f"{static_url_base}/avatar.jpg"
+
+    # --- Build profile_json matching myata_platinum contract ---
+    venue_address_full = f"{city}, {address}".strip(", ") if city else address
+    phone_clean = re.sub(r"[\s\-\(\)]", "", phone)
+    phone_tel = f"tel://{phone_clean}" if phone_clean else ""
+
+    profile_json_dict = {
+        "brand_id": brand_id,
+        "title": title,
+        "category": category,
+        "accent_hex": "A8F55F",
+        "secondary_hex": "15220F",
+        "badge": "Lounge",
+        "tagline": tagline or title,
+        "summary": summary or title,
+        "signature": "",
+        "heritage": "",
+        "best_for": "",
+        "lines": [],
+        "highlights": [],
+        "aliases": [brand_id, title],
+        "hero_symbol": "leaf.fill",
+        "logo_image_url": None,
+        "hero_image_url": cover_url_local or None,
+        "avatar_url": avatar_url_local or None,
+        "cover_url": cover_url_local or None,
+        "official_authors": [brand_id, title],
+        "venue_address": venue_address_full,
+        "nearest_metro": "",
+        "venue_latitude": None,
+        "venue_longitude": None,
+        "venue_hours": hours,
+        "venue_price": "",
+        "venue_format": category,
+        "venue_phone": phone,
+        "venue_booking_url": source_url,
+        "venue_menu_url": source_url,
+        "venue_loyalty_title": "",
+        "venue_loyalty_summary": "",
+        "articles": [],
+        "menu_highlights": [],
+        "service_cards": (
+            [
+                {
+                    "id": f"{brand_id}_open",
+                    "title": "Открыть сайт",
+                    "subtitle": source_url,
+                    "icon_name": "safari.fill",
+                    "destination_url": source_url,
+                },
+                {
+                    "id": f"{brand_id}_call",
+                    "title": "Позвонить",
+                    "subtitle": phone,
+                    "icon_name": "phone.fill",
+                    "destination_url": phone_tel,
+                },
+            ]
+            if source_url
+            else []
+        ),
+    }
+
+    profile_json_str = json.dumps(profile_json_dict, ensure_ascii=False)
+    photo_urls_json = json.dumps(photo_urls_local, ensure_ascii=False)
+
+    # --- UPSERT lounge_catalog ---
+    # Note: use CAST(:pj AS jsonb) — SQLAlchemy sa_text() treats :: as Python
+    # slice syntax for named params, so the explicit CAST form is safer.
+    db.execute(
+        sa_text(
+            """
+            INSERT INTO lounge_catalog (brand_id, profile_json, is_active, updated_at)
+            VALUES (:bid, CAST(:pj AS jsonb), true, now())
+            ON CONFLICT (brand_id) DO UPDATE
+                SET profile_json = EXCLUDED.profile_json,
+                    is_active    = true,
+                    updated_at   = now()
+            """
+        ),
+        {"bid": brand_id, "pj": profile_json_str},
+    )
+
+    # --- UPSERT lounge_assets ---
+    db.execute(
+        sa_text(
+            """
+            INSERT INTO lounge_assets (brand_id, avatar_url, cover_url, photo_urls, info_json, updated_at)
+            VALUES (:bid, :av, :cv, :pu, '{}', now())
+            ON CONFLICT (brand_id) DO UPDATE
+                SET avatar_url  = EXCLUDED.avatar_url,
+                    cover_url   = EXCLUDED.cover_url,
+                    photo_urls  = EXCLUDED.photo_urls,
+                    updated_at  = now()
+            """
+        ),
+        {
+            "bid": brand_id,
+            "av": avatar_url_local or None,
+            "cv": cover_url_local or None,
+            "pu": photo_urls_json,
+        },
+    )
+
+    # --- Ensure LoungeAdminMeta row exists ---
+    meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta_row is None:
+        meta_row = LoungeAdminMeta(brand_id=brand_id, tier=tier, badges=[])
+        db.add(meta_row)
+    else:
+        meta_row.tier = tier
+
+    db.commit()
+
+    imgs_count = (1 if cover_url_local else 0) + len(photo_urls_local)
+    flash_msg = (
+        f"Лаунж {brand_id} создан. "
+        f"Картинок скачано: {imgs_count}. "
+        f"Видно в /catalog/lounges."
+    )
+    return RedirectResponse(
+        url=f"/admin-web/lounges?flash_ok={urllib.parse.quote(flash_msg)}",
+        status_code=302,
+    )
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/lounges/{brand_id}
+# ---------------------------------------------------------------
+@app.get("/admin-web/lounges/{brand_id}", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_lounge_detail(
+    brand_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_ok: str = Query(default=None),
+    flash_err: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    cutoff_30 = datetime.utcnow() - timedelta(days=30)
+
+    meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    meta = {
+        "tier": meta_row.tier if meta_row else "start",
+        "badges": (meta_row.badges if isinstance(meta_row.badges, list) else []) if meta_row else [],
+        "notes": meta_row.notes if meta_row else None,
+    }
+
+    visits_30d = (
+        db.query(func.count(LoungeVisit.id))
+        .filter(LoungeVisit.brand_id == brand_id, LoungeVisit.created_at >= cutoff_30)
+        .scalar() or 0
+    )
+    visits_total = (
+        db.query(func.count(LoungeVisit.id))
+        .filter(LoungeVisit.brand_id == brand_id)
+        .scalar() or 0
+    )
+    guests_count = (
+        db.query(func.count(LoungeGuestLoyalty.id))
+        .filter(LoungeGuestLoyalty.brand_id == brand_id)
+        .scalar() or 0
+    )
+    bonus_outstanding = (
+        db.query(func.coalesce(func.sum(LoungeGuestLoyalty.bonus_balance), 0))
+        .filter(LoungeGuestLoyalty.brand_id == brand_id)
+        .scalar() or 0
+    )
+    promos_active = (
+        db.query(func.count(LoungePromo.id))
+        .filter(LoungePromo.brand_id == brand_id, LoungePromo.active == True)
+        .scalar() or 0
+    )
+
+    sub_history_rows = (
+        db.query(LoungeBillingSubscription)
+        .filter(LoungeBillingSubscription.brand_id == brand_id)
+        .order_by(LoungeBillingSubscription.expires_at.desc())
+        .limit(20)
+        .all()
+    )
+    sub_history = [
+        {
+            "id": s.id,
+            "tier": s.tier,
+            "status": s.status,
+            "payment_method": s.payment_method,
+            "started_at": _fmt_dt(s.started_at),
+            "expires_at": _fmt_dt(s.expires_at),
+        }
+        for s in sub_history_rows
+    ]
+
+    ctx = {
+        "active_nav": "lounges",
+        "admin_email": admin.email,
+        "brand_id": brand_id,
+        "meta": meta,
+        "stats": {
+            "visits_30d": visits_30d,
+            "visits_total": visits_total,
+            "guests_count": guests_count,
+            "bonus_outstanding": int(bonus_outstanding),
+            "promos_active": promos_active,
+        },
+        "sub_history": sub_history,
+        "flash_ok": flash_ok,
+        "flash_err": flash_err,
+    }
+    return templates.TemplateResponse(request, "lounge_detail.html", ctx)
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/lounges/{brand_id}/grant-trial
+# ---------------------------------------------------------------
+@app.post("/admin-web/lounges/{brand_id}/grant-trial", tags=["admin-web"])
+async def admin_web_grant_trial(
+    brand_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    form = await request.form()
+    tier = form.get("tier", "pro").strip()
+    try:
+        days = int(form.get("days", 30))
+    except (ValueError, TypeError):
+        days = 30
+    payment_method = form.get("payment_method", "trial").strip()
+
+    valid_tiers = {"start", "lite", "pro", "network", "partner"}
+    if tier not in valid_tiers:
+        tier = "pro"
+    if days <= 0:
+        days = 30
+
+    now = datetime.utcnow()
+    existing = (
+        db.query(LoungeBillingSubscription)
+        .filter(
+            LoungeBillingSubscription.brand_id == brand_id,
+            LoungeBillingSubscription.expires_at > now,
+            LoungeBillingSubscription.status.in_(["active", "trialing"]),
+        )
+        .order_by(LoungeBillingSubscription.expires_at.desc())
+        .first()
+    )
+    start_from = existing.expires_at if existing else now
+    new_expires = start_from + timedelta(days=days)
+    status = "trialing" if payment_method == "trial" else "active"
+
+    sub = LoungeBillingSubscription(
+        brand_id=brand_id,
+        tier=tier,
+        status=status,
+        started_at=now,
+        expires_at=new_expires,
+        payment_method=payment_method,
+    )
+    db.add(sub)
+
+    # Also sync tier in LoungeAdminMeta
+    meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta_row is None:
+        meta_row = LoungeAdminMeta(brand_id=brand_id, tier=tier, badges=[])
+        db.add(meta_row)
+    else:
+        meta_row.tier = tier
+    db.commit()
+
+    return RedirectResponse(
+        url=f"/admin-web/lounges/{brand_id}?flash_ok=Subscription+granted+{tier}+{days}d",
+        status_code=302,
+    )
+
+
+# ---------------------------------------------------------------
+# POST /admin-web/lounges/{brand_id}/patch
+# ---------------------------------------------------------------
+@app.post("/admin-web/lounges/{brand_id}/patch", tags=["admin-web"])
+async def admin_web_patch_lounge(
+    brand_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    form = await request.form()
+    tier = form.get("tier", "").strip()
+    notes = form.get("notes", "").strip() or None
+
+    valid_tiers = {"start", "lite", "pro", "network", "partner"}
+    if tier not in valid_tiers:
+        tier = None
+
+    meta_row = db.query(LoungeAdminMeta).filter(LoungeAdminMeta.brand_id == brand_id).first()
+    if meta_row is None:
+        meta_row = LoungeAdminMeta(brand_id=brand_id, tier=tier or "start", badges=[])
+        db.add(meta_row)
+    else:
+        if tier:
+            meta_row.tier = tier
+        meta_row.notes = notes
+    db.commit()
+
+    return RedirectResponse(
+        url=f"/admin-web/lounges/{brand_id}?flash_ok=Saved",
+        status_code=302,
+    )
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/subscriptions
+# ---------------------------------------------------------------
+@app.get("/admin-web/subscriptions", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_subscriptions(
+    request: Request,
+    db: Session = Depends(get_db),
+    page: int = Query(default=1, ge=1),
+    status: str = Query(default=None),
+    brand_id: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    per_page = 50
+    base_q = db.query(LoungeBillingSubscription)
+    if status:
+        base_q = base_q.filter(LoungeBillingSubscription.status == status)
+    if brand_id:
+        base_q = base_q.filter(LoungeBillingSubscription.brand_id.ilike(f"%{brand_id}%"))
+
+    total = base_q.count()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+
+    rows = (
+        base_q.order_by(LoungeBillingSubscription.expires_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    subs_out = [
+        {
+            "id": s.id,
+            "brand_id": s.brand_id,
+            "tier": s.tier,
+            "status": s.status,
+            "payment_method": s.payment_method,
+            "created_at": _fmt_dt(s.created_at),
+            "started_at": _fmt_dt(s.started_at),
+            "expires_at": _fmt_dt(s.expires_at),
+        }
+        for s in rows
+    ]
+
+    ctx = {
+        "active_nav": "subscriptions",
+        "admin_email": admin.email,
+        "subs": subs_out,
+        "total": total,
+        "page": page,
+        "total_pages": total_pages,
+        "status_filter": status,
+        "brand_id_filter": brand_id,
+    }
+    return templates.TemplateResponse(request, "subscriptions.html", ctx)
+
+
+# GET /admin-web/featured
+# ---------------------------------------------------------------
+@app.get("/admin-web/featured", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_featured(
+    request: Request,
+    db: Session = Depends(get_db),
+    status: Optional[str] = Query(default="active"),
+    flash_ok: Optional[str] = Query(default=None),
+    flash_err: Optional[str] = Query(default=None),
+    flash_create_err: Optional[str] = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    now = datetime.utcnow()
+    q = db.query(FeaturedSlot)
+    if status:
+        q = q.filter(FeaturedSlot.status == status)
+    rows = q.order_by(FeaturedSlot.expires_at.desc()).all()
+
+    slots_out = []
+    for r in rows:
+        remaining = max(0, (r.expires_at - now).days)
+        slots_out.append({
+            "id": r.id,
+            "brand_id": r.brand_id,
+            "slot_type": r.slot_type,
+            "city": r.city,
+            "expires_at": _fmt_dt(r.expires_at),
+            "price_paid": r.price_paid or 0,
+            "status": r.status,
+            "payment_method": r.payment_method,
+            "remaining_days": remaining,
+        })
+
+    # Collect known brand IDs for autocomplete
+    brand_ids: set = set()
+    for row in db.query(LoungeAdminMeta.brand_id).all():
+        brand_ids.add(row.brand_id)
+    for row in db.query(FeaturedSlot.brand_id).distinct().all():
+        brand_ids.add(row.brand_id)
+
+    ctx = {
+        "active_nav": "featured",
+        "admin_email": admin.email,
+        "slots": slots_out,
+        "total": len(slots_out),
+        "status_filter": status,
+        "known_brands": sorted(brand_ids),
+        "flash_ok": flash_ok,
+        "flash_err": flash_err,
+        "flash_create_err": flash_create_err,
+    }
+    return templates.TemplateResponse(request, "featured.html", ctx)
+
+
+# POST /admin-web/featured/create
+# ---------------------------------------------------------------
+@app.post("/admin-web/featured/create", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_featured_create(
+    request: Request,
+    db: Session = Depends(get_db),
+    brand_id: str = Form(...),
+    slot_type: str = Form(...),
+    city: str = Form("general"),
+    days: int = Form(7),
+    price_paid: int = Form(0),
+    payment_method: str = Form("manual"),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    now = datetime.utcnow()
+    starts_at = now
+    expires_at = now + timedelta(days=days)
+
+    # Tier check
+    tier = get_active_tier(db, brand_id)
+    from app.services.subscriptions import _tier_rank
+    if _tier_rank(tier) < _tier_rank("pro"):
+        err = f"Лаунж '{brand_id}' имеет тариф '{tier}'. Требуется pro+"
+        return RedirectResponse(
+            url=f"/admin-web/featured?flash_create_err={err}",
+            status_code=302,
+        )
+
+    # Hero conflict check
+    if slot_type == "hero":
+        conflict = db.query(FeaturedSlot).filter(
+            FeaturedSlot.slot_type == "hero",
+            FeaturedSlot.city == city,
+            FeaturedSlot.status == "active",
+            FeaturedSlot.expires_at > now,
+        ).first()
+        if conflict:
+            err = f"Hero для '{city}' занят: {conflict.brand_id}"
+            return RedirectResponse(
+                url=f"/admin-web/featured?flash_create_err={err}",
+                status_code=302,
+            )
+
+    slot = FeaturedSlot(
+        brand_id=brand_id,
+        slot_type=slot_type,
+        city=city,
+        starts_at=starts_at,
+        expires_at=expires_at,
+        price_paid=price_paid,
+        status="active",
+        payment_method=payment_method,
+        created_by_admin=True,
+        created_at=now,
+    )
+    db.add(slot)
+    db.commit()
+
+    return RedirectResponse(
+        url=f"/admin-web/featured?flash_ok=Слот+создан+для+{brand_id}",
+        status_code=302,
+    )
+
+
+# POST /admin-web/featured/{slot_id}/cancel
+# ---------------------------------------------------------------
+@app.post("/admin-web/featured/{slot_id}/cancel", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_featured_cancel(
+    slot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    slot = db.query(FeaturedSlot).filter(FeaturedSlot.id == slot_id).first()
+    if not slot:
+        return RedirectResponse(
+            url="/admin-web/featured?flash_err=Слот+не+найден",
+            status_code=302,
+        )
+    slot.status = "cancelled"
+    db.commit()
+    return RedirectResponse(
+        url=f"/admin-web/featured?flash_ok=Слот+{slot_id}+отменён",
+        status_code=302,
+    )
+
+
+# -------------------------------------------------------------------
+# CATALOG — Server-driven lounge catalog (2026-05-28)
+# No auth required. iOS app fetches this to show new lounges without rebuild.
+# -------------------------------------------------------------------
+
+@app.get("/catalog/lounges", tags=["catalog"])
+def catalog_lounges(db: Session = Depends(get_db)):
+    """Return all active lounge profiles from the server-driven catalog."""
+    rows = db.execute(
+        sa_text("SELECT profile_json FROM lounge_catalog WHERE is_active = true ORDER BY updated_at DESC")
+    ).fetchall()
+    return {"lounges": [row[0] for row in rows]}
+
