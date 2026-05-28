@@ -842,6 +842,7 @@ def user_to_out(profile_user: User, viewer: Optional[User], db: Session) -> User
         is_admin=profile_user.is_admin,
         is_banned=profile_user.is_banned,
         ban_reason=profile_user.ban_reason,
+        avatar_url=profile_user.avatar_url,
         mixes=[mix_to_out(mix, viewer, db) for mix in profile_user.mixes],
         favorites=[mix_to_out(mix, viewer, db) for mix in favorites],
         comments=[comment_to_profile_out(comment) for comment in profile_user.comments],
@@ -7661,6 +7662,28 @@ def upload_master_avatar(
         db.refresh(master)
         return MasterOut(**_master_to_out(master, current.id, db))
     return {"url": url, "avatar_url": url}
+
+
+# ── User avatar upload (POST /me/avatar) ──────────────────────────────────
+# Any logged-in user can set their own profile photo via multipart upload.
+# Delegates bytes persistence to _save_avatar_bytes (same as master avatar).
+
+@app.post("/me/avatar")
+def upload_user_avatar(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a profile avatar for the currently authenticated user.
+    Accepts multipart/form-data with field `file` (jpeg or png).
+    Returns {avatar_url}."""
+    current = get_required_user(user)
+    raw = file.file.read()
+    mime_type = file.content_type or "image/jpeg"
+    url = _save_avatar_bytes(current.id, raw, mime_type)
+    current.avatar_url = url
+    db.commit()
+    return {"avatar_url": url}
 
 
 # ── Tobacco flavors catalog (GET /flavors) ────────────────────────────────

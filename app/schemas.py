@@ -183,6 +183,7 @@ class UserOut(BaseModel):
     is_admin: bool
     is_banned: bool
     ban_reason: Optional[str]
+    avatar_url: Optional[str] = None
     mixes: List[MixOut]
     favorites: List[MixOut]
     comments: List[ProfileCommentOut]
