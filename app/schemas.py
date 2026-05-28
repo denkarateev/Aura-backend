@@ -1411,3 +1411,30 @@ class LoungeCRMHeatmapOut(BaseModel):
     total_visits: int
     days_back: int
     tz_offset_min: int
+
+
+# MARK: - Lounge Highlights (2026-05-28)
+
+class HighlightCardIn(BaseModel):
+    title: str
+    subtitle: str
+    image_url: str
+
+
+class HighlightCardOut(BaseModel):
+    id: str
+    title: str
+    subtitle: str
+    image_url: str
+
+
+class LoungeHighlightsIn(BaseModel):
+    highlights: List[HighlightCardIn]
+
+
+class LoungeHighlightsOut(BaseModel):
+    highlights: List[HighlightCardOut]
+
+
+class LoungeHighlightPhotoOut(BaseModel):
+    url: str

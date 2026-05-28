@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -246,6 +246,11 @@ from app.schemas import (
     VALID_LOUNGE_BADGES,
     LoungeCRMHeatmapCellOut,
     LoungeCRMHeatmapOut,
+    HighlightCardIn,
+    HighlightCardOut,
+    LoungeHighlightsIn,
+    LoungeHighlightsOut,
+    LoungeHighlightPhotoOut,
 )
 from app.services.subscriptions import get_active_tier, require_tier
 
@@ -3713,6 +3718,159 @@ def upload_lounge_avatar(
     return _upload_lounge_image(
         brand_id, payload, "avatar_url", _LOUNGE_AVATAR_SIZE, "avatar", user, db
     )
+
+
+# ── Lounge Highlights (2026-05-28) ───────────────────────────────────────────
+# Owner can configure up to 4 highlight cards (photo + title + subtitle).
+# Cards are stored in lounge_catalog.profile_json["highlight_cards"].
+# GET /catalog/lounges already returns the full profile_json, so iOS
+# sees the cards automatically — no extra read endpoint needed.
+
+_LOUNGE_HIGHLIGHT_SIZE = (800, 600)   # 4:3 card photo
+
+
+@app.post("/lounges/{brand_id}/highlights/photo", response_model=LoungeHighlightPhotoOut)
+def upload_highlight_photo(
+    brand_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Upload a highlight card photo (multipart). Owner / admin only.
+    Image is center-cropped to 800x600 JPEG and stored under
+    /app/static/lounges/{brand_id}/hl_{timestamp}.jpg.
+    Returns {"url": "http://188.253.19.166:8000/static/lounges/{brand_id}/hl_{ts}.jpg"}."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    raw = file.file.read()
+    if len(raw) > _LOUNGE_IMG_MAX_BYTES:
+        raise HTTPException(413, "Image too large (max 8 MB)")
+
+    try:
+        from PIL import Image as _PIL_Image
+        from io import BytesIO as _BytesIO
+    except Exception as e:
+        raise HTTPException(500, f"Image processing unavailable: {e}")
+
+    try:
+        img = _PIL_Image.open(_BytesIO(raw))
+        img.load()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot decode image: {e}")
+
+    tw, th = _LOUNGE_HIGHLIGHT_SIZE
+    target_ratio = tw / th
+    sw, sh = img.size
+    src_ratio = sw / sh
+    if src_ratio > target_ratio:
+        new_w = int(sh * target_ratio)
+        x0 = (sw - new_w) // 2
+        img = img.crop((x0, 0, x0 + new_w, sh))
+    elif src_ratio < target_ratio:
+        new_h = int(sw / target_ratio)
+        y0 = (sh - new_h) // 2
+        img = img.crop((0, y0, sw, y0 + new_h))
+
+    img = img.resize(_LOUNGE_HIGHLIGHT_SIZE, _PIL_Image.LANCZOS)
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    safe_brand = "".join(ch for ch in brand_id if ch.isalnum() or ch in ("-", "_"))
+    if not safe_brand:
+        raise HTTPException(400, "Invalid brand_id")
+
+    ts = int(datetime.utcnow().timestamp())
+    fname = f"hl_{ts}.jpg"
+
+    buf = _BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    image_bytes = buf.getvalue()
+
+    from app.services.storage import get_storage as _get_storage
+    storage = _get_storage()
+    key = f"lounges/{safe_brand}/{fname}"
+    url = storage.upload(key, image_bytes, "image/jpeg")
+
+    # Ensure the URL is absolute for highlight cards (iOS uses it directly)
+    if not url.startswith("http"):
+        url = f"http://188.253.19.166:8000{url}"
+
+    return LoungeHighlightPhotoOut(url=url)
+
+
+@app.put("/lounges/{brand_id}/highlights", response_model=LoungeHighlightsOut)
+def save_lounge_highlights(
+    brand_id: str,
+    payload: LoungeHighlightsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Save up to 4 highlight cards for a lounge. Owner / admin only.
+    Writes into lounge_catalog.profile_json['highlight_cards'] via jsonb_set.
+    The existing GET /catalog/lounges returns the full profile_json so no
+    additional read endpoint is needed."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+
+    # Cap at 4 cards, assign deterministic ids hl_1..hl_4
+    cards_in = payload.highlights[:4]
+    cards_out = []
+    for i, card in enumerate(cards_in, start=1):
+        cards_out.append({
+            "id": f"hl_{i}",
+            "title": card.title.strip(),
+            "subtitle": card.subtitle.strip(),
+            "image_url": card.image_url.strip(),
+        })
+
+    cards_json = json.dumps(cards_out, ensure_ascii=False)
+
+    # Upsert into lounge_catalog.profile_json using jsonb_set.
+    # If the row doesn't exist yet, insert a minimal profile_json.
+    existing = db.execute(
+        sa_text("SELECT 1 FROM lounge_catalog WHERE brand_id = :bid"),
+        {"bid": brand_id},
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            sa_text(
+                """
+                UPDATE lounge_catalog
+                SET profile_json = jsonb_set(
+                    profile_json,
+                    '{highlight_cards}',
+                    CAST(:cards AS jsonb),
+                    true
+                ),
+                updated_at = now()
+                WHERE brand_id = :bid
+                """
+            ),
+            {"cards": cards_json, "bid": brand_id},
+        )
+    else:
+        minimal = json.dumps(
+            {"brand_id": brand_id, "highlight_cards": cards_out},
+            ensure_ascii=False,
+        )
+        db.execute(
+            sa_text(
+                """
+                INSERT INTO lounge_catalog (brand_id, profile_json, is_active, updated_at)
+                VALUES (:bid, CAST(:pj AS jsonb), true, now())
+                """
+            ),
+            {"bid": brand_id, "pj": minimal},
+        )
+
+    db.commit()
+
+    result = [HighlightCardOut(**c) for c in cards_out]
+    return LoungeHighlightsOut(highlights=result)
 
 
 @app.get("/lounges/{brand_id}/my-loyalty", response_model=LoungeMyLoyaltyOut)
