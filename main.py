@@ -9566,13 +9566,15 @@ def _download_image(url: str, dest_path: str) -> bool:
 def _parse_lounge_url_internal(url: str) -> dict:
     """
     Fetch a lounge website and extract metadata.
-    Returns a dict with keys: title, description, address, phone, hours,
-    brand_id_suggestion, cover_url_remote, avatar_url_remote, extra_image_urls.
+    Returns a dict with keys: title, description, tagline, summary, address,
+    phone, hours, venue_format, brand_id_suggestion, cover_url_remote,
+    avatar_url_remote, extra_image_urls.
     All image fields are remote URLs (not yet downloaded).
     """
     import urllib.request
     import urllib.parse as _uparse
     import ssl
+    import json as _json
     from html.parser import HTMLParser
 
     ctx = ssl.create_default_context()
@@ -9599,6 +9601,10 @@ def _parse_lounge_url_internal(url: str) -> dict:
     except Exception:
         html = html_bytes.decode("cp1251", errors="replace")
 
+    # Strip HTML to plain text (keep href attrs for tel: links)
+    text_plain = re.sub(r"<[^>]+>", " ", html)
+    text_plain = re.sub(r"[ \t]+", " ", text_plain)
+
     class MetaParser(HTMLParser):
         def __init__(self):
             super().__init__()
@@ -9608,12 +9614,23 @@ def _parse_lounge_url_internal(url: str) -> dict:
             self.og_title = ""
             self.og_description = ""
             self.images: list = []
+            self.tel_hrefs: list = []  # href="tel:..." values
             self._in_title = False
+            self._in_script = False
+            self._script_type = ""
+            self.ld_json_blocks: list = []
+            self._script_buf = ""
 
         def handle_starttag(self, tag, attrs):
             a = dict(attrs)
             if tag == "title":
                 self._in_title = True
+            elif tag == "script":
+                stype = (a.get("type") or "").lower()
+                if stype == "application/ld+json":
+                    self._in_script = True
+                    self._script_type = "ldjson"
+                    self._script_buf = ""
             elif tag == "meta":
                 prop = (a.get("property") or a.get("name") or "").lower()
                 content = a.get("content") or ""
@@ -9629,14 +9646,26 @@ def _parse_lounge_url_internal(url: str) -> dict:
                 src = a.get("src") or a.get("data-src") or ""
                 if src and not src.startswith("data:"):
                     self.images.append(src)
+            elif tag == "a":
+                href = (a.get("href") or "").strip()
+                if href.startswith("tel:"):
+                    self.tel_hrefs.append(href[4:])
 
         def handle_data(self, data):
             if self._in_title:
                 self.title += data
+            if self._in_script and self._script_type == "ldjson":
+                self._script_buf += data
 
         def handle_endtag(self, tag):
             if tag == "title":
                 self._in_title = False
+            if tag == "script" and self._in_script:
+                self._in_script = False
+                if self._script_buf.strip():
+                    self.ld_json_blocks.append(self._script_buf.strip())
+                self._script_buf = ""
+                self._script_type = ""
 
     parser = MetaParser()
     parser.feed(html)
@@ -9645,31 +9674,329 @@ def _parse_lounge_url_internal(url: str) -> dict:
     description = (parser.og_description or parser.description or "").strip()
 
     # --- Phone ---
-    phone_match = re.search(r"\+?7[\s\-\(\)0-9]{9,14}", html)
-    phone = phone_match.group(0).strip() if phone_match else ""
+    # 1. Prefer tel: href links (most reliable)
+    def _normalize_phone(raw: str) -> str:
+        """Normalize to +7 XXX XXX-XX-XX format. Return '' if invalid."""
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) == 11 and digits[0] in ("7", "8"):
+            digits = "7" + digits[1:]
+        elif len(digits) == 10:
+            digits = "7" + digits
+        else:
+            return ""
+        return f"+{digits[0]} {digits[1:4]} {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+
+    phone = ""
+    # Try tel: hrefs first
+    for raw_tel in parser.tel_hrefs:
+        candidate = _normalize_phone(raw_tel)
+        if candidate:
+            phone = candidate
+            break
+
+    # If no tel: href, scan text for RU phone patterns
+    if not phone:
+        # Scan near "тел"/"phone" keywords first, then whole text
+        for search_area in [
+            text_plain,
+            html,
+        ]:
+            # Look for phone near keyword
+            for m in re.finditer(
+                r"(?:тел[еефон\.:\s]*|phone[\s:]*|☎|📞)[\s\(\+]*(\+?[78][\s\-\(\)0-9]{9,15})",
+                search_area,
+                re.IGNORECASE,
+            ):
+                candidate = _normalize_phone(m.group(1))
+                if candidate:
+                    phone = candidate
+                    break
+            if phone:
+                break
+
+    if not phone:
+        # Fallback: any RU-looking phone sequence in text
+        for m in re.finditer(
+            r"(?<!\d)(\+?[78][\s\-\(\)]{0,2}[\(\[]?\d{3}[\)\]]?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})(?!\d)",
+            text_plain,
+        ):
+            candidate = _normalize_phone(m.group(1))
+            if candidate:
+                phone = candidate
+                break
 
     # --- Address ---
-    addr_match = re.search(
-        r"(?:ул\.|улица|проспект|пр-т|бульвар|шоссе|переулок|пер\.|набережная|пл\.)[\s\S]{3,80}?(?=<|,\s*[А-Яа-яЁё]{3,}|тел|$)",
-        html,
-    )
-    address = addr_match.group(0).strip() if addr_match else ""
-    address = re.sub(r"<[^>]+>", "", address).strip()
+    # 1. Try JSON-LD schema.org PostalAddress
+    address = ""
+    for ld_block in parser.ld_json_blocks:
+        try:
+            ld = _json.loads(ld_block)
+            # handle @graph arrays
+            items = ld if isinstance(ld, list) else [ld]
+            for item in items:
+                if isinstance(item, dict):
+                    graph = item.get("@graph", [])
+                    items_inner = graph if graph else [item]
+                    for node in items_inner:
+                        if not isinstance(node, dict):
+                            continue
+                        addr_node = node.get("address") or {}
+                        if isinstance(addr_node, str) and addr_node:
+                            address = addr_node
+                            break
+                        if isinstance(addr_node, dict):
+                            street = addr_node.get("streetAddress") or ""
+                            locality = addr_node.get("addressLocality") or ""
+                            parts = [p for p in [locality, street] if p]
+                            if parts:
+                                address = ", ".join(parts)
+                                break
+                    if address:
+                        break
+        except Exception:
+            pass
+        if address:
+            break
 
-    # --- Hours ---
-    hours_match = re.search(
-        r"(?:работаем|часы работы|режим работы|открыты|время работы)[^<]{0,10}[:\s]*([^\n<]{5,60})",
-        html,
-        re.IGNORECASE,
-    )
-    if not hours_match:
-        hours_match = re.search(
-            r"\b(пн|вт|ср|чт|пт|сб|вс|пн[-–]вс|пн[-–]пт|пн[-–]чт|ежедн)[^<]{0,40}(?:\d{1,2}:\d{2})[^<]{0,40}",
-            html,
+    # 2. Regex on plain text — explicit street keyword required (word boundary safe)
+    if not address:
+        city_pat = (
+            r"(?:Москва|Санкт-Петербург|СПб|Новосибирск|Екатеринбург|Казань|"
+            r"Нижний\s+Новгород|Красноярск|Челябинск|Омск|Самара|Ростов-на-Дону|"
+            r"Уфа|Краснодар|Пермь|Воронеж)"
+        )
+        # Street keyword must start at a word boundary to avoid matching mid-word
+        street_pat = (
+            r"(?:\bул\.\s*|\bулица\s+|\bпросп?\.\s*|\bпроспект\s+|\bпер\.\s*|"
+            r"\bпереулок\s+|\bш\.\s*|\bшоссе\s+|\bбул\.\s*|\bбульвар\s+|"
+            r"\bнаб\.\s*|\bнабережная\s+|\bпл\.\s*|\bплощадь\s+|\bаллея\s+)"
+            r"[А-Яа-яЁё][А-Яа-яЁё\- ]{1,40},?\s*д?\.?\s*\d+"
+        )
+        # First: city + street
+        m = re.search(
+            rf"({city_pat})[,\s]{{1,20}}({street_pat})",
+            text_plain,
             re.IGNORECASE,
         )
-    hours = hours_match.group(1 if hours_match and hours_match.lastindex else 0).strip() if hours_match else ""
-    hours = re.sub(r"<[^>]+>", "", hours).strip()
+        if m:
+            address = f"{m.group(1)}, {m.group(2)}"
+            address = re.sub(r"\s+", " ", address).strip()
+        else:
+            # Just street pattern
+            m = re.search(street_pat, text_plain, re.IGNORECASE)
+            if m:
+                # Try to find city name just before it (within 80 chars)
+                start = max(0, m.start() - 80)
+                prefix = text_plain[start:m.start()]
+                city_m = re.search(city_pat, prefix, re.IGNORECASE)
+                if city_m:
+                    address = f"{city_m.group(0)}, {m.group(0)}"
+                else:
+                    address = m.group(0)
+                address = re.sub(r"\s+", " ", address).strip()
+
+    # 3. Bare StreetName, N pattern (Tilda/common sites like "Никитинская, 17")
+    #    Strategy: find the phone number in original text (with punctuation), grab ±400 chars
+    if not address and phone:
+        phone_digits = re.sub(r"\D", "", phone)
+        # Build a loose pattern from last 10 digits (allows spaces/dashes between)
+        def _phone_search_pat(digits: str) -> str:
+            # Escape and join with optional separators
+            return r"[\s\-\(\)]*".join(re.escape(c) for c in digits[-10:])
+        idx = -1
+        pm = re.search(_phone_search_pat(phone_digits), text_plain)
+        if pm:
+            idx = pm.start()
+        if idx >= 0:
+            chunk = text_plain[max(0, idx - 300): idx + 400]
+            city_pat_loc = (
+                r"(?:Москва|Санкт-Петербург|СПб|Новосибирск|Екатеринбург|Казань|"
+                r"Нижний\s+Новгород|Красноярск|Челябинск|Омск|Самара|Ростов-на-Дону|"
+                r"Уфа|Краснодар|Пермь|Воронеж)"
+            )
+            # <CyrillicWord(s)>, <Number> — must end with typical street suffix OR be short
+            m = re.search(
+                r"([А-ЯЁ][а-яёА-ЯЁ\-]{3,25}(?:\s+[А-ЯЁ][а-яёА-ЯЁ\-]{2,15})?)"
+                r",\s*(\d{1,3}[а-яА-Я]?(?:\s*[/\\]\s*\d+)?)"
+                r"(?=\s|,|\.|\Z)",
+                chunk,
+            )
+            if m:
+                street_candidate = f"{m.group(1)}, {m.group(2)}"
+                city_m = re.search(city_pat_loc, chunk, re.IGNORECASE)
+                if city_m:
+                    address = f"{city_m.group(0)}, {street_candidate}"
+                else:
+                    address = street_candidate
+                address = re.sub(r"\s+", " ", address).strip()
+
+    # 4. Fallback: look in HTML (in case address is inside a tag attribute or hidden)
+    if not address:
+        m = re.search(
+            r"(?:ул\.|улица|просп?\.|проспект|пер\.|переулок)[\s\S]{3,60}?\d+",
+            html,
+        )
+        if m:
+            address = re.sub(r"<[^>]+>", "", m.group(0))
+            address = re.sub(r"\s+", " ", address).strip()
+
+    # --- Hours ---
+    hours = ""
+    # Patterns for time ranges
+    time_range_pat = r"\d{1,2}[:.]\d{2}\s*[-–—]\s*\d{1,2}[:.]\d{2}"
+    day_prefix_pat = (
+        r"(?:ежедневно|пн[-–]вс|пн[-–]пт|пн[-–]чт|пн[-–]сб|"
+        r"понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|"
+        r"пн|вт|ср|чт|пт|сб|вс)"
+    )
+
+    # 1. Try JSON-LD openingHours
+    for ld_block in parser.ld_json_blocks:
+        try:
+            ld = _json.loads(ld_block)
+            items = ld if isinstance(ld, list) else [ld]
+            for item in items:
+                if isinstance(item, dict):
+                    oh = item.get("openingHours") or item.get("openingHoursSpecification")
+                    if oh:
+                        if isinstance(oh, list):
+                            hours = "; ".join(str(x) for x in oh[:3])
+                        else:
+                            hours = str(oh)
+                        break
+        except Exception:
+            pass
+        if hours:
+            break
+
+    # 2. Look for day prefix + time range in plain text
+    if not hours:
+        m = re.search(
+            rf"({day_prefix_pat})[^<\n]{{0,30}}({time_range_pat})",
+            text_plain,
+            re.IGNORECASE,
+        )
+        if m:
+            # Grab from day-prefix start through end of time range only
+            hours_raw = text_plain[m.start(): m.end()].strip()
+            # Truncate after the time range (remove any trailing non-hours text)
+            hours_raw = re.split(r"[\n\r\t]", hours_raw)[0].strip()
+            # Cut at first non-hours character after time pattern (letters/JS)
+            hours_raw = re.sub(r"\s+[a-zA-Z_\(\{][^\s]*.*$", "", hours_raw).strip()
+            hours = re.sub(r"\s+", " ", hours_raw)[:80]
+
+    # 3. Look for near working-hours keywords + time range
+    if not hours:
+        for label_pat in [
+            r"(?:работаем|часы\s+работы|режим\s+работы|открыты|время\s+работы)[^\n<]{0,5}[:\s]*",
+            r"(?:график\s+работы)[^\n<]{0,5}[:\s]*",
+        ]:
+            m = re.search(
+                label_pat + rf"([^\n<]{{3,80}}?{time_range_pat}[^\n<]{{0,30}})",
+                text_plain,
+                re.IGNORECASE,
+            )
+            if m:
+                hours = re.sub(r"\s+", " ", m.group(1)).strip()
+                break
+
+    # 4. Fallback: just a time range with optional day prefix nearby
+    if not hours:
+        m = re.search(time_range_pat, text_plain)
+        if m:
+            start = max(0, m.start() - 40)
+            prefix_chunk = text_plain[start: m.end() + 5].strip()
+            day_m = re.search(day_prefix_pat, prefix_chunk, re.IGNORECASE)
+            if day_m:
+                hours = re.sub(r"\s+", " ", prefix_chunk).strip()[:80]
+            else:
+                hours = re.sub(r"\s+", " ", m.group(0)).strip()
+
+    # 5. Bare "ежедневно" if nothing else (but still try to append time from nearby)
+    if not hours:
+        m = re.search(r"ежедневно", text_plain, re.IGNORECASE)
+        if m:
+            nearby = text_plain[m.start(): m.start() + 60]
+            t = re.search(time_range_pat, nearby)
+            if t:
+                hours = re.sub(r"\s+", " ", text_plain[m.start(): m.start() + t.end()]).strip()
+            else:
+                hours = "Ежедневно"
+
+    hours = re.sub(r"\s+", " ", hours).strip()
+
+    # --- venue_format ---
+    # Infer from content; never return literal "lounge"
+    venue_format = ""
+    content_lower = (title + " " + description + " " + text_plain[:2000]).lower()
+    if "кальян" in content_lower:
+        venue_format = "Кальян-лаунж"
+    elif "лаунж" in content_lower or "lounge" in content_lower:
+        venue_format = "Лаунж"
+    elif "бар" in content_lower:
+        venue_format = "Бар"
+    elif "ресторан" in content_lower:
+        venue_format = "Ресторан"
+    elif "кафе" in content_lower:
+        venue_format = "Кафе"
+
+    # --- tagline vs summary ---
+    summary = description  # long description (og:description / meta)
+
+    # Build a distinct tagline
+    tagline = ""
+    # Option 1: if og_title contains " | " or " — " or " - " use the part after separator
+    for sep in (" | ", " — ", " - ", " – "):
+        if sep in title:
+            parts = title.split(sep, 1)
+            candidate = parts[1].strip() if len(parts[0]) >= len(parts[1]) else parts[0].strip()
+            if candidate and candidate != summary and len(candidate) <= 80:
+                tagline = candidate
+                break
+
+    # Option 2: build "Кальян-лаунж · <street>" if we have address
+    if not tagline or tagline == summary:
+        vf = venue_format or "Лаунж"
+        street_m = re.search(
+            r"(?:ул\.|улица|просп?\.|проспект|пер\.|переулок)\s*[А-Яа-яЁё][А-Яа-яЁё\- ]{1,30}",
+            address,
+            re.IGNORECASE,
+        )
+        if street_m:
+            tagline = f"{vf} · {street_m.group(0).strip()}"
+        elif address:
+            short_addr = address[:40].rsplit(" ", 1)[0] if len(address) > 40 else address
+            tagline = f"{vf} · {short_addr}"
+
+    # Option 3: truncate summary at word boundary (max 60 chars)
+    if not tagline or tagline == summary:
+        if summary:
+            if len(summary) > 60:
+                trunc = summary[:60].rsplit(" ", 1)[0]
+                tagline = trunc + "…" if trunc != summary else summary[:57] + "…"
+            else:
+                # Make it shorter so it differs from full summary
+                tagline = summary[:40].rsplit(" ", 1)[0] + "…" if len(summary) > 40 else ""
+
+    # Ensure tagline != summary
+    if tagline == summary:
+        tagline = title[:60] if title != summary else ""
+
+    # --- Strip tracking params from URLs ---
+    def _clean_url(u: str) -> str:
+        if not u:
+            return u
+        try:
+            parts = _uparse.urlparse(u)
+            qs = _uparse.parse_qs(parts.query, keep_blank_values=True)
+            clean_qs = {
+                k: v for k, v in qs.items()
+                if not k.startswith(("utm_", "ysclid", "yclid", "_openstat", "from", "fbclid"))
+            }
+            new_query = _uparse.urlencode(clean_qs, doseq=True)
+            return _uparse.urlunparse(parts._replace(query=new_query))
+        except Exception:
+            return u
 
     # --- Images ---
     parsed_base = _uparse.urlparse(final_url)
@@ -9682,7 +10009,7 @@ def _parse_lounge_url_internal(url: str) -> dict:
             return "https:" + src
         return _uparse.urljoin(base_origin, src)
 
-    cover_url_remote = absolutize(parser.og_image) if parser.og_image else ""
+    cover_url_remote = _clean_url(absolutize(parser.og_image)) if parser.og_image else ""
 
     extra_images = []
     for src in parser.images:
@@ -9691,8 +10018,9 @@ def _parse_lounge_url_internal(url: str) -> dict:
         if not any(ext_lower.endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp")):
             continue
         if "tildacdn" in abs_src or "thb.tildacdn" in abs_src or parsed_base.netloc in abs_src:
-            if abs_src != cover_url_remote and abs_src not in extra_images:
-                extra_images.append(abs_src)
+            clean = _clean_url(abs_src)
+            if clean != cover_url_remote and clean not in extra_images:
+                extra_images.append(clean)
         if len(extra_images) >= 8:
             break
 
@@ -9703,9 +10031,12 @@ def _parse_lounge_url_internal(url: str) -> dict:
     return {
         "title": title,
         "description": description,
+        "tagline": tagline,
+        "summary": summary,
         "phone": phone,
         "address": address,
         "hours": hours,
+        "venue_format": venue_format,
         "cover_url_remote": cover_url_remote,
         "avatar_url_remote": avatar_url_remote,
         "extra_image_urls": extra_images[:8],
@@ -9827,8 +10158,8 @@ async def admin_web_lounge_new_post(
                 avatar_dest = os.path.join(static_dir, f"avatar.{ext}")
                 _shutil.copy2(dest, avatar_dest)
                 avatar_url_local = f"{static_url_base}/avatar.{ext}"
-            else:
-                photo_urls_local.append(local_url)
+            # ALL downloaded images go into the gallery (cover included at position 0)
+            photo_urls_local.append(local_url)
             idx += 1
 
     if avatar_url_remote and avatar_url_remote != cover_url_remote:
