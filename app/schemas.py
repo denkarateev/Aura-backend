@@ -441,6 +441,7 @@ class EventIn(BaseModel):
     price_text: Optional[str] = None
     booking_url: Optional[str] = None
     tags: List[str] = []
+    is_featured: bool = False
 
 
 class EventOut(EventIn):
@@ -1450,3 +1451,28 @@ class EventPhotoOut(BaseModel):
 class LoungePushIn(BaseModel):
     title: str = Field(..., min_length=1, max_length=80)
     body: str = Field(..., min_length=1, max_length=200)
+
+
+# MARK: - Home Offers (personalized home screen, 2026-05-29)
+
+class HomeOfferPromoOut(BaseModel):
+    id: int
+    title: str
+    discount_text: Optional[str] = None
+    icon_name: Optional[str] = None
+
+
+class HomeOfferLoungeOut(BaseModel):
+    brand_id: str
+    brand_title: str
+    logo_url: Optional[str] = None
+    visit_count: int
+    bonus_balance: int
+    loyalty_summary: str
+    promos: List[HomeOfferPromoOut] = []
+    is_featured: bool = False
+
+
+class HomeOffersOut(BaseModel):
+    lounges: List[HomeOfferLoungeOut]
+    source: str  # "visits" | "featured_fallback"

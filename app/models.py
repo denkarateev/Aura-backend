@@ -346,6 +346,9 @@ class Event(Base):
     # SQLAlchemy сам соберёт в `{a,b}` синтаксис. JSON-обёртка убрана
     # (раньше пытались писать '[]' в text[] и получали InvalidTextRepresentation).
     tags = Column(ARRAY(Text), nullable=False, default=list, server_default="{}")
+    # is_featured: единственное активное мероприятие, показываемое на главном экране.
+    # Added via startup ALTER TABLE IF NOT EXISTS.
+    is_featured = Column(Boolean, nullable=False, default=False, server_default="false")
     created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

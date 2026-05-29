@@ -254,6 +254,9 @@ from app.schemas import (
     LoungeHighlightPhotoOut,
     EventPhotoOut,
     LoungePushIn,
+    HomeOfferPromoOut,
+    HomeOfferLoungeOut,
+    HomeOffersOut,
 )
 from app.services.subscriptions import get_active_tier, require_tier
 
@@ -1213,6 +1216,7 @@ def _event_to_out(event: Event, current_user_id: Optional[int], db: Session) -> 
         price_text=event.price_text,
         booking_url=event.booking_url,
         tags=list(event.tags or []),
+        is_featured=bool(getattr(event, "is_featured", False)),
         going_count=going_count,
         is_going=is_going,
     )
@@ -1246,6 +1250,7 @@ def _apply_event_payload(event: Event, payload: EventIn, current_user: User):
     event.price_text = (payload.price_text or "").strip() or None
     event.booking_url = (payload.booking_url or "").strip() or None
     event.tags = _clean_event_tags(payload.tags)  # Python list → text[] на проде
+    event.is_featured = bool(payload.is_featured)
     event.updated_by_user_id = current_user.id
     event.updated_at = datetime.utcnow()
 
@@ -2032,6 +2037,7 @@ def startup():
                 "ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_by_user_id INTEGER REFERENCES users(id)",
                 "ALTER TABLE events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
                 "ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT FALSE",
             ]:
                 conn.exec_driver_sql(ddl)
             conn.exec_driver_sql(
@@ -2090,6 +2096,67 @@ def startup():
                 ON lounge_bundle_visits(master_id, visited_at)
                 """
             )
+
+    # MARK: JCFEST 2026 seed (idempotent — ON CONFLICT DO UPDATE keeps data fresh)
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                # Pick the lowest admin user id as fallback for created_by_user_id.
+                _admin_row = conn.execute(
+                    sa_text("SELECT id FROM users WHERE is_admin = true ORDER BY id ASC LIMIT 1")
+                ).first()
+                _jcfest_creator_id = _admin_row[0] if _admin_row else None
+                conn.execute(
+                    sa_text(
+                        """
+                        INSERT INTO events (
+                            id, title, subtitle, kind, mood,
+                            lounge_id, venue_title, starts_at, ends_at,
+                            cover_image_url, price_text, booking_url,
+                            tags, is_featured,
+                            created_by_user_id, updated_by_user_id,
+                            created_at, updated_at
+                        ) VALUES (
+                            'evt_jcfest2026',
+                            'JOHNCALLIANO FEST 2026',
+                            'FROM RUSSIA WITH LOVE · 11 июля, НКП «Русь» · самое дымное событие лета · 18+',
+                            'party',
+                            'warm',
+                            NULL,
+                            'НКП «Русь», Москва',
+                            '2026-07-11 14:00:00',
+                            '2026-07-11 23:59:00',
+                            'http://188.253.19.166:8000/static/events/jcfest_2026.jpg',
+                            'По билетам',
+                            'https://jcfest.ru',
+                            ARRAY['фестиваль','open-air','2026'],
+                            TRUE,
+                            :creator_id,
+                            :creator_id,
+                            NOW(),
+                            NOW()
+                        )
+                        ON CONFLICT (id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            subtitle = EXCLUDED.subtitle,
+                            kind = EXCLUDED.kind,
+                            mood = EXCLUDED.mood,
+                            venue_title = EXCLUDED.venue_title,
+                            starts_at = EXCLUDED.starts_at,
+                            ends_at = EXCLUDED.ends_at,
+                            price_text = EXCLUDED.price_text,
+                            booking_url = EXCLUDED.booking_url,
+                            tags = EXCLUDED.tags,
+                            is_featured = EXCLUDED.is_featured,
+                            updated_at = NOW()
+                        """
+                    ),
+                    {"creator_id": _jcfest_creator_id},
+                )
+        except Exception as _jcfest_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("JCFEST 2026 seed skipped: %s", _jcfest_exc)
+
     db = SessionLocal()
     try:
         sync_admin_allowlist(db)
@@ -3208,6 +3275,24 @@ def list_events(
     rows = q.order_by(Event.starts_at.asc(), Event.created_at.desc()).all()
     current_user_id = user.id if user else None
     return [_event_to_out(event, current_user_id, db) for event in rows]
+
+
+@app.get("/events/featured")
+def get_featured_event(
+    db: Session = Depends(get_db),
+):
+    """Public — returns the single active featured event or null."""
+    now = datetime.utcnow()
+    event = (
+        db.query(Event)
+        .filter(
+            Event.is_featured == True,  # noqa: E712
+            (Event.ends_at == None) | (Event.ends_at >= now),  # noqa: E711
+        )
+        .order_by(Event.starts_at.asc())
+        .first()
+    )
+    return {"event": _event_to_out(event, None, db) if event else None}
 
 
 @app.get("/events/{event_id}", response_model=EventOut)
@@ -5932,6 +6017,163 @@ def my_lounge_bonuses(
         total_balance=sum(r.bonus_balance for r in rows),
         total_rub=sum(r.bonus_balance // 10 for r in rows),
     )
+
+
+@app.get("/me/home-offers", response_model=HomeOffersOut, tags=["home"])
+def me_home_offers(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Personalized home screen offers — top 6 lounges by visit count.
+    Falls back to featured/promo lounges for new users.
+    """
+    current_user = get_required_user(user)
+    now = datetime.utcnow()
+
+    # Helper: resolve brand_title + logo_url from lounge_catalog.profile_json
+    def _resolve_brand_info(brand_id: str):
+        row = db.execute(
+            sa_text("SELECT profile_json FROM lounge_catalog WHERE brand_id = :bid AND is_active = true"),
+            {"bid": brand_id},
+        ).first()
+        title = display_title_from_brand_id(brand_id)
+        logo_url = None
+        if row and row[0]:
+            pj = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            title = (
+                pj.get("title")
+                or pj.get("name")
+                or title
+            )
+            logo_url = (
+                pj.get("logoImageURL")
+                or pj.get("avatarURL")
+                or pj.get("logo_url")
+                or pj.get("avatar_url")
+                or None
+            )
+        return title, logo_url
+
+    # Helper: build loyalty_summary string
+    def _loyalty_summary(brand_id: str, bonus_balance: int) -> str:
+        prog = db.query(LoungeLoyaltyProgram).filter(LoungeLoyaltyProgram.brand_id == brand_id).first()
+        if not prog:
+            return f"Бонусы за визиты · {bonus_balance} баллов"
+        if prog.mode == "percent_of_bill":
+            return f"Кэшбэк {prog.bill_percent}% · {bonus_balance} баллов"
+        # fixed mode
+        return f"{prog.per_visit_bonus} баллов за визит · {bonus_balance} баллов"
+
+    # Helper: check if brand has active featured slot
+    def _is_brand_featured(brand_id: str) -> bool:
+        return db.query(FeaturedSlot).filter(
+            FeaturedSlot.brand_id == brand_id,
+            FeaturedSlot.status == "active",
+            FeaturedSlot.starts_at <= now,
+            FeaturedSlot.expires_at >= now,
+        ).first() is not None
+
+    # Helper: get up to 3 active promos for a brand
+    def _get_promos(brand_id: str) -> List[HomeOfferPromoOut]:
+        promos = (
+            db.query(LoungePromo)
+            .filter(LoungePromo.brand_id == brand_id, LoungePromo.active == True)  # noqa: E712
+            .order_by(LoungePromo.sort_order.asc(), LoungePromo.id.asc())
+            .limit(3)
+            .all()
+        )
+        return [
+            HomeOfferPromoOut(
+                id=p.id,
+                title=p.title,
+                discount_text=p.discount_text,
+                icon_name=p.icon_name,
+            )
+            for p in promos
+        ]
+
+    # --- PRIMARY: top lounges by visit count ---
+    loyalty_rows = (
+        db.query(LoungeGuestLoyalty)
+        .filter(LoungeGuestLoyalty.user_id == current_user.id)
+        .order_by(LoungeGuestLoyalty.visit_count.desc())
+        .limit(6)
+        .all()
+    )
+
+    if loyalty_rows:
+        lounges = []
+        for lgl in loyalty_rows:
+            brand_title, logo_url = _resolve_brand_info(lgl.brand_id)
+            lounges.append(
+                HomeOfferLoungeOut(
+                    brand_id=lgl.brand_id,
+                    brand_title=brand_title,
+                    logo_url=logo_url,
+                    visit_count=lgl.visit_count,
+                    bonus_balance=lgl.bonus_balance,
+                    loyalty_summary=_loyalty_summary(lgl.brand_id, lgl.bonus_balance),
+                    promos=_get_promos(lgl.brand_id),
+                    is_featured=_is_brand_featured(lgl.brand_id),
+                )
+            )
+        return HomeOffersOut(lounges=lounges, source="visits")
+
+    # --- FALLBACK: new user — pick lounges with active featured slot OR active promo ---
+    featured_brand_ids = [
+        row[0] for row in db.execute(
+            sa_text(
+                """
+                SELECT DISTINCT brand_id FROM featured_slots
+                WHERE status = 'active' AND starts_at <= :now AND expires_at >= :now
+                ORDER BY brand_id
+                LIMIT 6
+                """
+            ),
+            {"now": now},
+        ).fetchall()
+    ]
+    promo_brand_ids = [
+        row[0] for row in db.execute(
+            sa_text(
+                """
+                SELECT DISTINCT brand_id FROM lounge_promos
+                WHERE active = true
+                ORDER BY brand_id
+                LIMIT 6
+                """
+            )
+        ).fetchall()
+    ]
+    # Merge: featured first, then promo, deduplicated, up to 6
+    seen = set()
+    candidate_ids = []
+    for bid in featured_brand_ids + promo_brand_ids:
+        if bid not in seen:
+            seen.add(bid)
+            candidate_ids.append(bid)
+        if len(candidate_ids) >= 6:
+            break
+
+    if not candidate_ids:
+        return HomeOffersOut(lounges=[], source="visits")
+
+    lounges = []
+    for brand_id in candidate_ids:
+        brand_title, logo_url = _resolve_brand_info(brand_id)
+        lounges.append(
+            HomeOfferLoungeOut(
+                brand_id=brand_id,
+                brand_title=brand_title,
+                logo_url=logo_url,
+                visit_count=0,
+                bonus_balance=0,
+                loyalty_summary=_loyalty_summary(brand_id, 0),
+                promos=_get_promos(brand_id),
+                is_featured=(brand_id in set(featured_brand_ids)),
+            )
+        )
+    return HomeOffersOut(lounges=lounges, source="featured_fallback")
 
 
 # YooKassa notification IPs — webhook requests must come from these ranges.
