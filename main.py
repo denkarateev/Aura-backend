@@ -2827,6 +2827,57 @@ def startup():
         finally:
             _bfdb.close()
 
+    # MARK: analytics_events — продуктовая воронка / retention (2026-05-29)
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS analytics_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                        anon_id TEXT NOT NULL,
+                        session_id TEXT,
+                        name TEXT NOT NULL,
+                        props JSONB,
+                        platform TEXT,
+                        app_version TEXT,
+                        client_ts TIMESTAMPTZ,
+                        server_ts TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_analytics_events_name_ts
+                    ON analytics_events (name, server_ts DESC)
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_analytics_events_anon_id
+                    ON analytics_events (anon_id)
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_analytics_events_user_id
+                    ON analytics_events (user_id)
+                    WHERE user_id IS NOT NULL
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_analytics_events_server_ts
+                    ON analytics_events (server_ts DESC)
+                    """
+                )
+        except Exception as _ae_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "analytics_events migration skipped: %s", _ae_exc
+            )
+
 # -------------------------------------------------------------------
 # LEGAL — Privacy Policy & Terms of Use (152-FZ / App Store compliance)
 # No auth required. Served as HTML for WKWebView / Safari.
@@ -11255,4 +11306,408 @@ def catalog_lounges(db: Session = Depends(get_db)):
         sa_text("SELECT profile_json FROM lounge_catalog WHERE is_active = true ORDER BY updated_at DESC")
     ).fetchall()
     return {"lounges": [row[0] for row in rows]}
+
+
+# -------------------------------------------------------------------
+# PRODUCT ANALYTICS — события от iOS-клиента (2026-05-29)
+# POST /analytics/events  — батч-приём, auth опционален
+# GET  /analytics/funnel  — воронка + retention, только admin
+# GET  /admin-web/analytics — CRM-дашборд воронки
+# -------------------------------------------------------------------
+
+_ANALYTICS_MAX_BATCH = 100
+_ANALYTICS_MAX_PROPS_BYTES = 4096
+
+
+@limiter.limit("120/minute")
+@app.post("/analytics/events", tags=["analytics"])
+def post_analytics_events(
+    request: Request,
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    """
+    Batch-приём событий от iOS. auth опционален — если токен валиден, проставляем user_id.
+
+    Body:
+    {
+      "anon_id":     "device-uuid-string",
+      "session_id":  "optional-session-id",
+      "platform":    "ios",
+      "app_version": "1.2.3",
+      "events": [
+        { "name": "app_open", "props": {...}, "client_ts": "2026-05-29T10:00:00Z" },
+        ...
+      ]
+    }
+    """
+    anon_id = (payload.get("anon_id") or "").strip()
+    if not anon_id:
+        raise HTTPException(422, "anon_id required")
+
+    session_id = payload.get("session_id") or None
+    platform = (payload.get("platform") or None)
+    app_version = (payload.get("app_version") or None)
+    events_raw = payload.get("events") or []
+
+    if not isinstance(events_raw, list):
+        raise HTTPException(422, "events must be array")
+
+    # Обрезаем батч до лимита
+    events_raw = events_raw[:_ANALYTICS_MAX_BATCH]
+
+    user_id = user.id if user else None
+    now_ts = datetime.utcnow()
+
+    inserted = 0
+    for ev in events_raw:
+        if not isinstance(ev, dict):
+            continue
+        name = (ev.get("name") or "").strip()
+        if not name:
+            continue
+
+        # Обрезаем слишком большие props
+        props_raw = ev.get("props")
+        props_json = None
+        if props_raw and isinstance(props_raw, dict):
+            try:
+                props_str = json.dumps(props_raw, ensure_ascii=False)
+                if len(props_str.encode("utf-8")) > _ANALYTICS_MAX_PROPS_BYTES:
+                    props_json = None  # отбрасываем, не ломаем батч
+                else:
+                    props_json = props_raw
+            except Exception:
+                props_json = None
+
+        # Парсим client_ts
+        client_ts = None
+        client_ts_raw = ev.get("client_ts")
+        if client_ts_raw:
+            try:
+                from datetime import timezone
+                # ISO8601 с Z или +offset
+                ct = client_ts_raw.replace("Z", "+00:00")
+                client_ts = datetime.fromisoformat(ct).astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                client_ts = None
+
+        db.execute(
+            sa_text(
+                """
+                INSERT INTO analytics_events
+                    (user_id, anon_id, session_id, name, props, platform, app_version, client_ts, server_ts)
+                VALUES
+                    (:user_id, :anon_id, :session_id, :name, :props, :platform, :app_version, :client_ts, :server_ts)
+                """
+            ),
+            {
+                "user_id": user_id,
+                "anon_id": anon_id,
+                "session_id": session_id,
+                "name": name,
+                "props": json.dumps(props_json) if props_json is not None else None,
+                "platform": platform,
+                "app_version": app_version,
+                "client_ts": client_ts,
+                "server_ts": now_ts,
+            },
+        )
+        inserted += 1
+
+    db.commit()
+    return {"accepted": inserted}
+
+
+@app.get("/analytics/funnel", tags=["analytics"])
+def get_analytics_funnel(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_admin_user),
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+):
+    """
+    Воронка конверсии + D1/D7 retention. Только для admin.
+    ?from=2026-05-01T00:00:00&to=2026-05-29T23:59:59
+    По умолчанию последние 7 дней.
+    """
+    now = datetime.utcnow()
+    try:
+        dt_from = datetime.fromisoformat(from_) if from_ else now - timedelta(days=7)
+    except Exception:
+        dt_from = now - timedelta(days=7)
+    try:
+        dt_to = datetime.fromisoformat(to) if to else now
+    except Exception:
+        dt_to = now
+
+    # Воронка: уникальные «кто» (COALESCE user_id::text, anon_id) по шагам
+    funnel_steps = [
+        "app_open",
+        "onboarding_complete",
+        "signup_success",
+        "first_mix_generated",
+        "lounge_checkin",
+        "referral_redeemed",
+    ]
+
+    step_counts = {}
+    for step in funnel_steps:
+        row = db.execute(
+            sa_text(
+                """
+                SELECT COUNT(DISTINCT COALESCE(user_id::text, anon_id))
+                FROM analytics_events
+                WHERE name = :name
+                  AND server_ts >= :from_ts
+                  AND server_ts <= :to_ts
+                """
+            ),
+            {"name": step, "from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        step_counts[step] = row[0] if row else 0
+
+    # Конверсии между шагами
+    funnel_out = []
+    for i, step in enumerate(funnel_steps):
+        cnt = step_counts[step]
+        prev_cnt = step_counts[funnel_steps[i - 1]] if i > 0 else cnt
+        conv = round(cnt / prev_cnt * 100, 1) if prev_cnt > 0 else 0.0
+        funnel_out.append({
+            "step": step,
+            "users": cnt,
+            "conversion_from_prev": conv if i > 0 else None,
+        })
+
+    # D1 retention: доля «кто», вернувшихся через 1 день после первого app_open в диапазоне
+    def _retention(days: int) -> float:
+        base_row = db.execute(
+            sa_text(
+                """
+                SELECT COUNT(DISTINCT COALESCE(user_id::text, anon_id))
+                FROM analytics_events
+                WHERE name = 'app_open'
+                  AND server_ts >= :from_ts
+                  AND server_ts <= :to_ts - interval ':days days'
+                """
+                .replace(":days days", f"{days} days")
+            ),
+            {"from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        base = base_row[0] if base_row else 0
+        if base == 0:
+            return 0.0
+
+        # Находим «кто» вернулся через days дней
+        returned_row = db.execute(
+            sa_text(
+                f"""
+                SELECT COUNT(DISTINCT actor)
+                FROM (
+                    SELECT COALESCE(user_id::text, anon_id) AS actor,
+                           MIN(server_ts) AS first_open
+                    FROM analytics_events
+                    WHERE name = 'app_open'
+                      AND server_ts >= :from_ts
+                      AND server_ts <= :to_ts - interval '{days} days'
+                    GROUP BY 1
+                ) first_opens
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM analytics_events ae2
+                    WHERE ae2.name = 'app_open'
+                      AND COALESCE(ae2.user_id::text, ae2.anon_id) = first_opens.actor
+                      AND ae2.server_ts >= first_opens.first_open + interval '{days} days'
+                      AND ae2.server_ts < first_opens.first_open + interval '{days + 1} days'
+                )
+                """
+            ),
+            {"from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        returned = returned_row[0] if returned_row else 0
+        return round(returned / base * 100, 1)
+
+    d1 = _retention(1)
+    d7 = _retention(7)
+
+    # Топ событий за период
+    top_events_rows = db.execute(
+        sa_text(
+            """
+            SELECT name, COUNT(*) as cnt
+            FROM analytics_events
+            WHERE server_ts >= :from_ts AND server_ts <= :to_ts
+            GROUP BY name
+            ORDER BY cnt DESC
+            LIMIT 20
+            """
+        ),
+        {"from_ts": dt_from, "to_ts": dt_to},
+    ).fetchall()
+    top_events = [{"name": r[0], "count": r[1]} for r in top_events_rows]
+
+    return {
+        "period": {"from": dt_from.isoformat(), "to": dt_to.isoformat()},
+        "funnel": funnel_out,
+        "retention": {"d1_pct": d1, "d7_pct": d7},
+        "top_events": top_events,
+    }
+
+
+# ---------------------------------------------------------------
+# GET /admin-web/analytics — CRM воронка и retention
+# ---------------------------------------------------------------
+@app.get("/admin-web/analytics", response_class=HTMLResponse, tags=["admin-web"])
+def admin_web_analytics(
+    request: Request,
+    db: Session = Depends(get_db),
+    flash_ok: str = Query(default=None),
+    flash_err: str = Query(default=None),
+):
+    admin = _admin_web_user(request, db)
+    if not admin:
+        return RedirectResponse(url="/admin-web/login", status_code=302)
+
+    now = datetime.utcnow()
+    dt_from = now - timedelta(days=7)
+    dt_to = now
+
+    # Воронка
+    funnel_steps = [
+        ("app_open", "App Open"),
+        ("onboarding_complete", "Онбординг завершён"),
+        ("signup_success", "Регистрация"),
+        ("first_mix_generated", "Первый микс"),
+        ("lounge_checkin", "Чекин в лаунж"),
+        ("referral_redeemed", "Реферал активирован"),
+    ]
+
+    funnel_data = []
+    prev_cnt = None
+    for step_name, step_label in funnel_steps:
+        row = db.execute(
+            sa_text(
+                """
+                SELECT COUNT(DISTINCT COALESCE(user_id::text, anon_id))
+                FROM analytics_events
+                WHERE name = :name
+                  AND server_ts >= :from_ts
+                  AND server_ts <= :to_ts
+                """
+            ),
+            {"name": step_name, "from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        cnt = row[0] if row else 0
+        conv = round(cnt / prev_cnt * 100, 1) if prev_cnt and prev_cnt > 0 else None
+        bar_pct = round(cnt / funnel_data[0]["count"] * 100) if funnel_data and funnel_data[0]["count"] > 0 else (100 if cnt > 0 else 0)
+        funnel_data.append({
+            "name": step_name,
+            "label": step_label,
+            "count": cnt,
+            "conv": conv,
+            "bar_pct": bar_pct,
+        })
+        prev_cnt = cnt if cnt > 0 else prev_cnt
+
+    # Retention D1 / D7
+    def _ret_crm(days: int) -> float:
+        base_row = db.execute(
+            sa_text(
+                f"""
+                SELECT COUNT(DISTINCT COALESCE(user_id::text, anon_id))
+                FROM analytics_events
+                WHERE name = 'app_open'
+                  AND server_ts >= :from_ts
+                  AND server_ts <= :to_ts - interval '{days} days'
+                """
+            ),
+            {"from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        base = base_row[0] if base_row else 0
+        if base == 0:
+            return 0.0
+        returned_row = db.execute(
+            sa_text(
+                f"""
+                SELECT COUNT(DISTINCT actor)
+                FROM (
+                    SELECT COALESCE(user_id::text, anon_id) AS actor,
+                           MIN(server_ts) AS first_open
+                    FROM analytics_events
+                    WHERE name = 'app_open'
+                      AND server_ts >= :from_ts
+                      AND server_ts <= :to_ts - interval '{days} days'
+                    GROUP BY 1
+                ) first_opens
+                WHERE EXISTS (
+                    SELECT 1 FROM analytics_events ae2
+                    WHERE ae2.name = 'app_open'
+                      AND COALESCE(ae2.user_id::text, ae2.anon_id) = first_opens.actor
+                      AND ae2.server_ts >= first_opens.first_open + interval '{days} days'
+                      AND ae2.server_ts < first_opens.first_open + interval '{days + 1} days'
+                )
+                """
+            ),
+            {"from_ts": dt_from, "to_ts": dt_to},
+        ).fetchone()
+        returned = returned_row[0] if returned_row else 0
+        return round(returned / base * 100, 1)
+
+    d1 = _ret_crm(1)
+    d7 = _ret_crm(7)
+
+    # Топ событий за 7 дней
+    top_rows = db.execute(
+        sa_text(
+            """
+            SELECT name, COUNT(*) as cnt
+            FROM analytics_events
+            WHERE server_ts >= :from_ts AND server_ts <= :to_ts
+            GROUP BY name
+            ORDER BY cnt DESC
+            LIMIT 20
+            """
+        ),
+        {"from_ts": dt_from, "to_ts": dt_to},
+    ).fetchall()
+    top_events = [{"name": r[0], "count": r[1]} for r in top_rows]
+
+    # Всего событий за 7 дней
+    total_row = db.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM analytics_events WHERE server_ts >= :from_ts AND server_ts <= :to_ts"
+        ),
+        {"from_ts": dt_from, "to_ts": dt_to},
+    ).fetchone()
+    total_events = total_row[0] if total_row else 0
+
+    # Уникальные устройства за 7 дней
+    uniq_row = db.execute(
+        sa_text(
+            """
+            SELECT COUNT(DISTINCT COALESCE(user_id::text, anon_id))
+            FROM analytics_events
+            WHERE server_ts >= :from_ts AND server_ts <= :to_ts
+            """
+        ),
+        {"from_ts": dt_from, "to_ts": dt_to},
+    ).fetchone()
+    unique_actors = uniq_row[0] if uniq_row else 0
+
+    ctx = {
+        "active_nav": "analytics",
+        "admin_email": admin.email,
+        "flash_ok": flash_ok,
+        "flash_err": flash_err,
+        "funnel": funnel_data,
+        "d1": d1,
+        "d7": d7,
+        "top_events": top_events,
+        "total_events": total_events,
+        "unique_actors": unique_actors,
+        "period_label": f"{dt_from.strftime('%d.%m')} — {dt_to.strftime('%d.%m.%Y')}",
+    }
+    return templates.TemplateResponse(request, "analytics.html", ctx)
 

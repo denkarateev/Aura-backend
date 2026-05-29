@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Аналитика воронки — Ember Admin{% endblock %}
+{% block breadcrumb %}<span class="current">Воронка</span>{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div class="page-header-left">
+    <div class="page-h1">Продуктовая аналитика</div>
+    <div class="page-h1-sub">Воронка и Retention за 7 дней &mdash; {{ period_label }}</div>
+  </div>
+</div>
+
+{% if flash_ok %}<div class="flash flash-ok">{{ flash_ok }}</div>{% endif %}
+{% if flash_err %}<div class="flash flash-err">{{ flash_err }}</div>{% endif %}
+
+<!-- KPI STATS -->
+<div class="stats-grid" style="grid-template-columns: repeat(4,1fr); margin-bottom:24px;">
+  <div class="stat-card">
+    <div class="stat-label">Событий за 7д</div>
+    <div class="stat-value">{{ total_events }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Уник. устройств</div>
+    <div class="stat-value muted">{{ unique_actors }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">D1 Retention</div>
+    <div class="stat-value {% if d1 >= 25 %}{% elif d1 >= 10 %}warm{% else %}red{% endif %}">{{ d1 }}%</div>
+    <div class="stat-delta neutral">вернулись на след. день</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">D7 Retention</div>
+    <div class="stat-value {% if d7 >= 15 %}{% elif d7 >= 5 %}warm{% else %}red{% endif %}">{{ d7 }}%</div>
+    <div class="stat-delta neutral">вернулись на 7-й день</div>
+  </div>
+</div>
+
+<!-- FUNNEL -->
+<div class="table-wrap" style="margin-bottom: 24px;">
+  <div class="table-header">
+    <div class="table-header-left">
+      <div class="table-title">Воронка конверсии</div>
+      <div class="table-subtitle">уникальные пользователи / устройства по шагам</div>
+    </div>
+  </div>
+  <div style="padding: 20px 24px;">
+    {% for step in funnel %}
+    <div style="margin-bottom: 18px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span class="badge badge-gray" style="font-size:11px; font-family: 'SF Mono', monospace;">{{ step.name }}</span>
+          <span style="font-size:13px; font-weight:600; color:var(--text);">{{ step.label }}</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:16px;">
+          {% if step.conv is not none %}
+          <span style="font-size:11.5px; color:{% if step.conv >= 50 %}var(--accent){% elif step.conv >= 20 %}var(--warm){% else %}var(--red){% endif %}; font-weight:700;">
+            {{ step.conv }}% от предыдущего
+          </span>
+          {% endif %}
+          <span style="font-size:22px; font-weight:900; color:var(--accent); font-variant-numeric:tabular-nums; min-width:52px; text-align:right;">{{ step.count }}</span>
+        </div>
+      </div>
+      <div style="height:8px; border-radius:999px; background:rgba(245,245,242,0.06); overflow:hidden;">
+        <div style="height:100%; width:{{ step.bar_pct }}%; background:{% if step.bar_pct >= 60 %}var(--accent){% elif step.bar_pct >= 30 %}var(--warm){% else %}var(--red){% endif %}; border-radius:999px; transition:width 0.4s;"></div>
+      </div>
+    </div>
+    {% endfor %}
+    {% if funnel|length == 0 or funnel[0].count == 0 %}
+    <div class="empty">
+      <div class="empty-icon">&#9641;</div>
+      <div class="empty-title">Нет данных</div>
+      <div class="empty-sub">iOS-клиент ещё не отправил ни одного события. Убедитесь, что POST /analytics/events подключён.</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- TOP EVENTS -->
+<div class="table-wrap">
+  <div class="table-header">
+    <div class="table-header-left">
+      <div class="table-title">Топ событий за 7 дней</div>
+      <div class="table-subtitle">все типы, по количеству вызовов</div>
+    </div>
+  </div>
+  {% if top_events %}
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Событие</th>
+        <th style="text-align:right;">Кол-во</th>
+        <th style="text-align:right;">% от топ-1</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% set top_count = top_events[0].count if top_events else 1 %}
+      {% for ev in top_events %}
+      <tr>
+        <td style="color:var(--muted-dim); width:36px;">{{ loop.index }}</td>
+        <td><span class="mono">{{ ev.name }}</span></td>
+        <td class="num">{{ ev.count }}</td>
+        <td style="text-align:right; width:100px;">
+          {% set pct = (ev.count / top_count * 100)|round|int %}
+          <div style="display:inline-flex; align-items:center; gap:8px;">
+            <div style="width:60px; height:4px; border-radius:999px; background:rgba(245,245,242,0.06); overflow:hidden;">
+              <div style="height:100%; width:{{ pct }}%; background:var(--accent); border-radius:999px;"></div>
+            </div>
+            <span style="font-size:11px; color:var(--muted); min-width:32px;">{{ pct }}%</span>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    <div class="empty-icon">&#9641;</div>
+    <div class="empty-title">Нет событий</div>
+    <div class="empty-sub">Данных за последние 7 дней нет.</div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
