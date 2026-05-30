@@ -7041,6 +7041,7 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optiona
         "work_history": wh,
         "tip_phone": getattr(m, "tip_phone", None),
         "tips_total": tips_total,
+        "user_id": getattr(m, "user_id", None),
     }
 
 

@@ -717,6 +717,7 @@ class MasterOut(BaseModel):
     work_history: List[MasterWorkplaceOut] = []
     tip_phone: Optional[str] = None
     tips_total: int = 0
+    user_id: Optional[int] = None
 
     class Config:
         from_attributes = True
