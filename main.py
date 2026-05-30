@@ -8054,20 +8054,22 @@ def list_tobacco_brands(
     category: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Distinct brands list with flavor counts. Public — no auth required."""
-    where = ["TRUE"]
-    params: dict = {}
-    if category:
-        where.append("category = :category")
-        params["category"] = category
-    clause = " AND ".join(where)
+    """Distinct brands list with flavor counts. Public — no auth required.
+
+    NB: колонка `category` в tobacco_flavors хранит ВКУСОВУЮ категорию флейвора
+    (fruit/berry/citrus/tobacco/...), а НЕ тип продукта. Поэтому фильтровать и
+    группировать бренды по ней нельзя:
+      • `GROUP BY brand, category` плодил дубли (BlackBurn с 7 вкусами → 7 строк),
+        из-за чего в SwiftUI ForEach бренды «пропадали» (дублирующиеся id).
+      • `?category=tobacco` отдавал лишь 7 брендов, у которых был хоть один
+        флейвор с taste='tobacco' (Darkside/BlackBurn выпадали).
+    Возвращаем DISTINCT бренды (GROUP BY brand). Параметр `category` принимаем
+    для обратной совместимости, но НЕ фильтруем по нему."""
     rows = db.execute(
         sa_text(
-            f"SELECT brand, COALESCE(category, 'tobacco') as category, COUNT(*) as flavor_count "
-            f"FROM tobacco_flavors WHERE {clause} "
-            f"GROUP BY brand, category ORDER BY brand"
+            "SELECT brand, 'tobacco' AS category, COUNT(*) AS flavor_count "
+            "FROM tobacco_flavors GROUP BY brand ORDER BY brand"
         ),
-        params,
     ).mappings().all()
     items = [TobaccoBrandOut(**dict(r)) for r in rows]
     return TobaccoBrandListOut(items=items, total=len(items))
