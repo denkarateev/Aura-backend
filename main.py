@@ -6019,6 +6019,39 @@ def my_lounge_bonuses(
     )
 
 
+@app.get("/me/visits", tags=["loyalty"])
+def my_visit_history(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """История посещений (чек-инов) текущего юзера для экрана «История посещений».
+    Возвращает баллы (bonus_awarded), НЕ рубли. Юзер: «не рубли а бонусы»."""
+    current_user = get_required_user(user)
+    rows = (
+        db.query(LoungeVisit)
+        .filter(LoungeVisit.user_id == current_user.id)
+        .order_by(LoungeVisit.created_at.desc())
+        .limit(300)
+        .all()
+    )
+    items = [
+        {
+            "id": v.id,
+            "brand_id": v.brand_id,
+            "brand_title": display_title_from_brand_id(v.brand_id),
+            "bill_amount": int(v.bill_amount or 0),
+            "bonus_awarded": int(v.bonus_awarded or 0),
+            "created_at": (v.created_at.isoformat() + "Z") if v.created_at else None,
+        }
+        for v in rows
+    ]
+    return {
+        "items": items,
+        "total": len(items),
+        "total_bonus": sum(int(v.bonus_awarded or 0) for v in rows),
+    }
+
+
 @app.get("/me/home-offers", response_model=HomeOffersOut, tags=["home"])
 def me_home_offers(
     db: Session = Depends(get_db),
