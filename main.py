@@ -86,6 +86,7 @@ from app.models import (
     MasterLoungeRequest,
     MasterReview,
     MasterShift,
+    MasterTip,
     MasterWorkHistory,
     Mix,
     MixIngredient,
@@ -257,6 +258,7 @@ from app.schemas import (
     HomeOfferPromoOut,
     HomeOfferLoungeOut,
     HomeOffersOut,
+    MasterTipIn,
 )
 from app.services.subscriptions import get_active_tier, require_tier
 
@@ -2943,6 +2945,41 @@ def startup():
             import logging as _lg
             _lg.getLogger(__name__).warning(
                 "analytics_events migration skipped: %s", _ae_exc
+            )
+
+    # MARK: master tips v1 — SBP phone column + master_tips table (2026-05-31)
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                # Add SBP phone column to masters for tip transfer
+                conn.exec_driver_sql(
+                    """
+                    ALTER TABLE masters
+                    ADD COLUMN IF NOT EXISTS tip_phone TEXT
+                    """
+                )
+                # Create master_tips fact-recording table
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS master_tips (
+                        id SERIAL PRIMARY KEY,
+                        master_id VARCHAR NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+                        guest_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                        amount INTEGER NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_master_tips_master_id
+                    ON master_tips (master_id)
+                    """
+                )
+        except Exception as _tips_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "master_tips migration skipped: %s", _tips_exc
             )
 
 # -------------------------------------------------------------------
@@ -6981,6 +7018,13 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optiona
             MasterFollower.master_id == m.id,
             MasterFollower.user_id == current_user_id,
         ).first() is not None
+    # Compute tips_total from master_tips table
+    tips_total = 0
+    if db is not None:
+        tips_row = db.query(func.sum(MasterTip.amount)).filter(
+            MasterTip.master_id == m.id
+        ).scalar()
+        tips_total = int(tips_row or 0)
     return {
         "id": m.id,
         "handle": m.handle,
@@ -6995,6 +7039,8 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optiona
         "is_verified": m.is_verified or False,
         "is_following": is_following,
         "work_history": wh,
+        "tip_phone": getattr(m, "tip_phone", None),
+        "tips_total": tips_total,
     }
 
 
@@ -7207,11 +7253,107 @@ def update_master(
             master.bio = payload.bio
         if payload.avatar_url is not None:
             master.avatar_url = payload.avatar_url
+        if payload.tip_phone is not None:
+            master.tip_phone = payload.tip_phone
     if payload.current_lounge_id is not None:
         master.current_lounge_id = payload.current_lounge_id
     db.commit()
     db.refresh(master)
-    return MasterOut(**_master_to_out(master))
+    return MasterOut(**_master_to_out(master, current_user.id, db))
+
+
+# ── Master avatar upload (multipart) ─────────────────────────────────────────
+
+@app.post("/masters/{master_id}/avatar")
+def upload_master_profile_avatar(
+    master_id: str,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload an avatar for a specific master profile via multipart/form-data.
+
+    Auth (any one of):
+      • current_user.id == master.user_id (own master)
+      • current_user.is_admin
+      • can_manage_brand for master.current_lounge_id (lounge manager)
+
+    Returns {"avatar_url": "<url>"}.
+    """
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    is_own = (master.user_id is not None and master.user_id == current_user.id)
+    is_admin = bool(current_user.is_admin)
+    is_lounge_manager = (
+        not is_own
+        and not is_admin
+        and master.current_lounge_id is not None
+        and can_manage_brand(current_user, master.current_lounge_id, db)
+    )
+    if not is_own and not is_admin and not is_lounge_manager:
+        raise HTTPException(403, "Not authorized to upload avatar for this master")
+    raw = file.file.read()
+    mime_type = file.content_type or "image/jpeg"
+    url = _save_avatar_bytes(current_user.id, raw, mime_type)
+    master.avatar_url = url
+    db.commit()
+    return {"avatar_url": url}
+
+
+# ── Master tips (v1 — record fact, iOS prompts SBP transfer) ─────────────────
+
+@app.post("/masters/{master_id}/tip")
+def leave_master_tip(
+    master_id: str,
+    payload: MasterTipIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record a tip left by a guest for a master.
+
+    Auth: any logged-in user.
+    Body: {"amount": int} — validated 1..100000.
+    Returns: {"ok": true, "tip_phone": "<phone or null>", "amount": <amount>, "master_name": "<display_name>"}.
+
+    v1: No real money movement. tip_phone is the master's SBP phone;
+    the iOS app uses it to prompt an SBP bank transfer.
+    """
+    current_user = get_required_user(user)
+    if payload.amount < 1 or payload.amount > 100000:
+        raise HTTPException(400, "amount must be between 1 and 100000")
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    tip = MasterTip(
+        master_id=master_id,
+        guest_user_id=current_user.id,
+        amount=payload.amount,
+    )
+    db.add(tip)
+    db.commit()
+    # Optional push to master — non-blocking
+    if master.user_id is not None:
+        try:
+            from app.push import send_push_fanout_async
+            import asyncio as _asyncio_tip
+            _asyncio_tip.run(send_push_fanout_async(
+                db,
+                [master.user_id],
+                "Чаевые",
+                f"\U0001f4b8 Тебе оставили чаевые +{payload.amount}₽",
+                payload={"type": "master_tip", "master_id": master_id, "amount": payload.amount},
+            ))
+        except Exception:
+            pass
+    tip_phone = getattr(master, "tip_phone", None)
+    return {
+        "ok": True,
+        "tip_phone": tip_phone,
+        "amount": payload.amount,
+        "master_name": master.display_name,
+    }
 
 
 # ── Master lounge approval requests ───────────────────────────────────────────

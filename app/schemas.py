@@ -715,6 +715,8 @@ class MasterOut(BaseModel):
     is_verified: bool
     is_following: bool = False
     work_history: List[MasterWorkplaceOut] = []
+    tip_phone: Optional[str] = None
+    tips_total: int = 0
 
     class Config:
         from_attributes = True
@@ -744,6 +746,7 @@ class MasterUpdateIn(BaseModel):
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
     current_lounge_id: Optional[str] = None
+    tip_phone: Optional[str] = None
 
 
 # Work history
@@ -1476,3 +1479,9 @@ class HomeOfferLoungeOut(BaseModel):
 class HomeOffersOut(BaseModel):
     lounges: List[HomeOfferLoungeOut]
     source: str  # "visits" | "featured_fallback"
+
+
+# MARK: - Master tips (v1 — record fact, iOS prompts SBP transfer)
+
+class MasterTipIn(BaseModel):
+    amount: int

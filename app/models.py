@@ -563,6 +563,8 @@ class Master(Base):
     is_verified = Column(Boolean, default=False, nullable=False, server_default="false")
     reviews_count = Column(Integer, default=0, nullable=False, server_default="0")
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=True)
+    # SBP phone for tips (v1 — record fact, iOS prompts SBP transfer to this phone)
+    tip_phone = Column(Text, nullable=True)
 
     work_history = relationship(
         "MasterWorkHistory",
@@ -572,6 +574,11 @@ class Master(Base):
     )
     reviews = relationship(
         "MasterReview",
+        back_populates="master",
+        cascade="all, delete-orphan",
+    )
+    tips = relationship(
+        "MasterTip",
         back_populates="master",
         cascade="all, delete-orphan",
     )
@@ -592,6 +599,23 @@ class MasterWorkHistory(Base):
     to_date = Column(Date, nullable=True)              # NULL = currently working here
 
     master = relationship("Master", back_populates="work_history")
+
+
+class MasterTip(Base):
+    """
+    A recorded tip left by a guest for a master.
+    v1: records fact only — no real money movement through us.
+    iOS uses tip_phone from MasterOut to prompt an SBP transfer.
+    """
+    __tablename__ = "master_tips"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    guest_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    amount = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    master = relationship("Master", back_populates="tips")
 
 
 class MasterLoungeRequest(Base):
