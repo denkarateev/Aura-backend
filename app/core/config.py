@@ -22,6 +22,30 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 15
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "hooka3://bundle_success")
+# Deep link the tip checkout WebView returns to once the guest finishes paying.
+YOOKASSA_TIP_RETURN_URL = os.getenv("YOOKASSA_TIP_RETURN_URL", "hooka3://tip_success")
+
+# YooKassa Payouts (Выплаты) — SBP payout of accumulated tips to masters.
+# SEPARATE product/gateway from acquiring above: own agreement + own keys.
+# Master withdrawals are gated behind these — if either is empty the payout
+# endpoints return 503 (feature flag), so deploying without them is safe.
+YOOKASSA_PAYOUT_ACCOUNT_ID = os.getenv("YOOKASSA_PAYOUT_ACCOUNT_ID", "")
+YOOKASSA_PAYOUT_SECRET_KEY = os.getenv("YOOKASSA_PAYOUT_SECRET_KEY", "")
+
+# Master tips — platform commission (%) withheld from each tip. The master's
+# withdrawable balance is credited NET of this. Change via env, no redeploy.
+TIP_PLATFORM_COMMISSION_PERCENT = float(os.getenv("TIP_PLATFORM_COMMISSION_PERCENT", "10"))
+# Minimum single withdrawal (RUB) — SBP payouts have practical lower bounds.
+TIP_MIN_PAYOUT_RUB = int(os.getenv("TIP_MIN_PAYOUT_RUB", "100"))
+
+# CRM AI insights — an LLM that reads the guest base + scoring and writes a
+# situational analysis + concrete retention actions ("кого вернуть и что дать").
+# OpenAI-compatible Chat Completions: works with OpenAI, OpenRouter, or any
+# compatible gateway (incl. Kie.ai if it exposes an OpenAI-compatible URL).
+# GATED: empty LLM_API_KEY → the AI endpoint returns 503 (deploy stays safe).
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.openai.com/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 # 2GIS Catalog API — real-time venue busyness ("congestion").
 # Get a demo key at https://platform.2gis.ru (self-service, instant).

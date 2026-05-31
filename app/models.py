@@ -563,7 +563,8 @@ class Master(Base):
     is_verified = Column(Boolean, default=False, nullable=False, server_default="false")
     reviews_count = Column(Integer, default=0, nullable=False, server_default="0")
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=True)
-    # SBP phone for tips (v1 — record fact, iOS prompts SBP transfer to this phone)
+    # SBP phone used as the DESTINATION for tip payouts (Выплаты через СБП).
+    # No longer shown to guests — tips now come in via YooKassa acquiring.
     tip_phone = Column(Text, nullable=True)
 
     work_history = relationship(
@@ -579,6 +580,11 @@ class Master(Base):
     )
     tips = relationship(
         "MasterTip",
+        back_populates="master",
+        cascade="all, delete-orphan",
+    )
+    payouts = relationship(
+        "MasterPayout",
         back_populates="master",
         cascade="all, delete-orphan",
     )
@@ -603,19 +609,51 @@ class MasterWorkHistory(Base):
 
 class MasterTip(Base):
     """
-    A recorded tip left by a guest for a master.
-    v1: records fact only — no real money movement through us.
-    iOS uses tip_phone from MasterOut to prompt an SBP transfer.
+    A tip paid by a guest to a master.
+
+    v2: real money. The guest pays via YooKassa acquiring; the row is created
+    only once the payment is confirmed (`status="succeeded"`, `payment_id` set),
+    crediting the master's withdrawable balance with `net_amount`.
+
+    `status="legacy"` marks pre-v2 rows recorded as facts only (the guest had
+    already transferred manually) — they show in lifetime earnings but DO NOT
+    count toward the withdrawable balance.
     """
     __tablename__ = "master_tips"
 
     id = Column(Integer, primary_key=True)
     master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
     guest_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    amount = Column(Integer, nullable=False)
+    amount = Column(Integer, nullable=False)                 # gross — what the guest paid
+    commission_amount = Column(Integer, nullable=False, default=0, server_default="0")
+    net_amount = Column(Integer, nullable=False, default=0, server_default="0")  # credited to master
+    status = Column(String(20), nullable=False, default="succeeded", server_default="succeeded", index=True)
+    payment_id = Column(String, unique=True, nullable=True)  # YooKassa acquiring payment id (NULL for legacy)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     master = relationship("Master", back_populates="tips")
+
+
+class MasterPayout(Base):
+    """
+    A withdrawal of accumulated tip balance, paid to the master via YooKassa
+    SBP payout (Выплаты). Gated behind YOOKASSA_PAYOUT_* config; rows are
+    created pending (which reserves balance) and finalised by the payout webhook.
+    """
+    __tablename__ = "master_payouts"
+
+    id = Column(Integer, primary_key=True)
+    master_id = Column(String, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True)
+    amount = Column(Integer, nullable=False)                 # net RUB withdrawn
+    status = Column(String(20), nullable=False, default="pending", server_default="pending", index=True)
+    payout_id = Column(String, unique=True, nullable=True)   # YooKassa payout id
+    sbp_phone = Column(Text, nullable=True)
+    sbp_bank_id = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    settled_at = Column(DateTime, nullable=True)
+
+    master = relationship("Master", back_populates="payouts")
 
 
 class MasterLoungeRequest(Base):

@@ -41,9 +41,14 @@ from app.core.config import (
     RATING_LEVELS,
     REWARD_RULES,
     SECRET_KEY,
+    TIP_MIN_PAYOUT_RUB,
+    TIP_PLATFORM_COMMISSION_PERCENT,
+    YOOKASSA_PAYOUT_ACCOUNT_ID,
+    YOOKASSA_PAYOUT_SECRET_KEY,
     YOOKASSA_RETURN_URL,
     YOOKASSA_SECRET_KEY,
     YOOKASSA_SHOP_ID,
+    YOOKASSA_TIP_RETURN_URL,
     load_brand_manager_usernames,
 )
 from app.core.database import Base, SessionLocal, engine
@@ -84,6 +89,7 @@ from app.models import (
     Master,
     MasterFollower,
     MasterLoungeRequest,
+    MasterPayout,
     MasterReview,
     MasterShift,
     MasterTip,
@@ -148,6 +154,13 @@ from app.schemas import (
     MasterLoungeRequestIn,
     MasterLoungeRequestOut,
     MasterOut,
+    MasterPayoutIn,
+    MasterPayoutListOut,
+    MasterPayoutOut,
+    MasterTipBalanceOut,
+    MasterTipPaymentOut,
+    MasterTipStatusOut,
+    SbpBankOut,
     MasterReviewCreateIn,
     MasterReviewOut,
     MasterReviewsListOut,
@@ -221,6 +234,12 @@ from app.schemas import (
     LoungeCrmRegularsOut,
     GuestVisitRowOut,
     LoungeCrmGuestCardOut,
+    GuestScoreOut,
+    RetentionRecOut,
+    CrmSegmentCountOut,
+    CrmWinbackGuestOut,
+    LoungeCrmInsightsOut,
+    CrmAiInsightsOut,
     GuestBalanceOut,
     RedeemIn,
     RedemptionRowOut,
@@ -2980,6 +2999,62 @@ def startup():
             import logging as _lg
             _lg.getLogger(__name__).warning(
                 "master_tips migration skipped: %s", _tips_exc
+            )
+
+    # MARK: master tips v2 — real money: YooKassa acquiring in + SBP payout out
+    # (2026-05-31). Adds money columns to master_tips, backfills existing rows
+    # as 'legacy' (manual transfers — never count toward withdrawable balance),
+    # and creates the master_payouts table for withdrawals.
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE master_tips ADD COLUMN IF NOT EXISTS commission_amount INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.exec_driver_sql(
+                    "ALTER TABLE master_tips ADD COLUMN IF NOT EXISTS net_amount INTEGER NOT NULL DEFAULT 0"
+                )
+                # Add status WITHOUT a default so existing rows stay NULL, then
+                # tag them 'legacy'. New rows set status explicitly in code.
+                conn.exec_driver_sql(
+                    "ALTER TABLE master_tips ADD COLUMN IF NOT EXISTS status VARCHAR(20)"
+                )
+                conn.exec_driver_sql(
+                    "ALTER TABLE master_tips ADD COLUMN IF NOT EXISTS payment_id VARCHAR"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE master_tips SET status = 'legacy' WHERE status IS NULL"
+                )
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_master_tips_payment_id "
+                    "ON master_tips (payment_id) WHERE payment_id IS NOT NULL"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_master_tips_status ON master_tips (status)"
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS master_payouts (
+                        id SERIAL PRIMARY KEY,
+                        master_id VARCHAR NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+                        amount INTEGER NOT NULL,
+                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        payout_id VARCHAR UNIQUE,
+                        sbp_phone TEXT,
+                        sbp_bank_id TEXT,
+                        error TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT now(),
+                        settled_at TIMESTAMP
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_master_payouts_master_id ON master_payouts (master_id)"
+                )
+        except Exception as _tips2_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "master_tips v2 migration skipped: %s", _tips2_exc
             )
 
 # -------------------------------------------------------------------
@@ -5806,6 +5881,182 @@ def _require_yookassa():
         raise HTTPException(503, "YooKassa is not configured on the server")
 
 
+# ── YooKassa Payouts (Выплаты) — SBP payout of tips. Feature-flagged. ─────────
+# A SEPARATE gateway from acquiring with its own credentials. The SDK's
+# Configuration is a global singleton, so instead of swapping it (which would
+# race with concurrent acquiring calls) we subclass ApiClient and inject the
+# payout credentials on the instance — ApiClient snapshots creds at __init__
+# and never re-reads the global, so this is fully isolated.
+
+def _payouts_enabled() -> bool:
+    return bool(_YOOKASSA_ENABLED and YOOKASSA_PAYOUT_ACCOUNT_ID and YOOKASSA_PAYOUT_SECRET_KEY)
+
+
+def _require_yookassa_payout():
+    if not _payouts_enabled():
+        raise HTTPException(503, "YooKassa payouts (Выплаты) are not configured on the server")
+
+
+def _normalize_sbp_phone(raw: Optional[str]) -> str:
+    """Digits only, RU-normalised (leading 8 → 7). YooKassa wants no '+'."""
+    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits
+
+
+def _payout_api_client():
+    """ApiClient authenticated with the dedicated payout gateway credentials."""
+    from yookassa.client import ApiClient
+
+    class _PayoutClient(ApiClient):
+        def __init__(self):
+            super().__init__()  # snapshots acquiring config (must be set)
+            self.shop_id = YOOKASSA_PAYOUT_ACCOUNT_ID
+            self.shop_password = YOOKASSA_PAYOUT_SECRET_KEY
+            self.auth_token = None
+
+    return _PayoutClient()
+
+
+def _create_sbp_payout(amount_rub: int, phone_digits: str, bank_id: str,
+                       description: str, metadata: dict, idempotency_key: str):
+    """Create a YooKassa SBP payout. Returns the parsed PayoutResponse."""
+    from yookassa.domain.common.http_verb import HttpVerb
+    from yookassa.domain.request import PayoutRequest
+    from yookassa.domain.response import PayoutResponse
+
+    client = _payout_api_client()
+    params = {
+        "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+        "payout_destination_data": {
+            "type": "sbp",
+            "phone": phone_digits,
+            "bank_id": bank_id,
+        },
+        "description": (description or "")[:128],
+        "metadata": metadata or {},
+    }
+    body = PayoutRequest(params)
+    headers = {"Idempotence-Key": str(idempotency_key)}
+    raw = client.request(HttpVerb.POST, "/payouts", None, headers, body)
+    return PayoutResponse(raw)
+
+
+def _fetch_sbp_banks() -> list:
+    """List of SBP participant banks for the withdrawal picker."""
+    from yookassa.domain.common.http_verb import HttpVerb
+
+    client = _payout_api_client()
+    raw = client.request(HttpVerb.GET, "/sbp_banks")
+    items = (raw or {}).get("items", []) if isinstance(raw, dict) else []
+    out = []
+    for it in items:
+        bid = (it or {}).get("bank_id")
+        name = (it or {}).get("name")
+        if bid and name:
+            out.append({"bank_id": bid, "name": name})
+    return out
+
+
+# ── Master tip ledger helpers ────────────────────────────────────────────────
+
+def _tip_commission(gross_amount: int) -> int:
+    pct = float(TIP_PLATFORM_COMMISSION_PERCENT or 0)
+    return int(gross_amount * pct / 100.0)
+
+
+def _credit_master_tip(db: Session, payment_id: str, master_id: str,
+                       guest_user_id, gross_amount: int):
+    """Idempotently record a succeeded tip and credit the master's net balance.
+    Returns (MasterTip, created: bool). Safe against double-credit (unique
+    payment_id) and concurrent webhook+poll races."""
+    existing = db.query(MasterTip).filter(MasterTip.payment_id == payment_id).first()
+    if existing:
+        return existing, False
+    commission = _tip_commission(gross_amount)
+    tip = MasterTip(
+        master_id=master_id,
+        guest_user_id=guest_user_id,
+        amount=gross_amount,
+        commission_amount=commission,
+        net_amount=gross_amount - commission,
+        status="succeeded",
+        payment_id=payment_id,
+    )
+    db.add(tip)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        existing = db.query(MasterTip).filter(MasterTip.payment_id == payment_id).first()
+        if existing:
+            return existing, False
+        raise
+    db.refresh(tip)
+    return tip, True
+
+
+def _notify_master_of_tip(db: Session, master: Master, gross_amount: int):
+    """Best-effort push to a master that a tip arrived. Never blocks the flow."""
+    if master is None or master.user_id is None:
+        return
+    try:
+        from app.push import send_push_fanout_async
+        import asyncio as _asyncio_tip
+        _asyncio_tip.run(send_push_fanout_async(
+            db,
+            [master.user_id],
+            "Чаевые",
+            f"\U0001f4b8 Тебе оставили чаевые +{gross_amount}₽",
+            payload={"type": "master_tip", "master_id": master.id, "amount": gross_amount},
+        ))
+    except Exception:
+        pass
+
+
+def _master_tip_balance_dict(db: Session, master_id: str) -> dict:
+    """Compute a master's tip balance. available = net of succeeded tips minus
+    (pending + succeeded) payouts, so in-flight withdrawals reserve funds."""
+    def _sum(col, *filters):
+        return int(db.query(func.coalesce(func.sum(col), 0)).filter(*filters).scalar() or 0)
+
+    gross_total = _sum(MasterTip.amount, MasterTip.master_id == master_id,
+                       MasterTip.status.in_(["succeeded", "legacy"]))
+    net_total = _sum(MasterTip.net_amount, MasterTip.master_id == master_id,
+                     MasterTip.status == "succeeded")
+    commission_total = _sum(MasterTip.commission_amount, MasterTip.master_id == master_id,
+                            MasterTip.status == "succeeded")
+    reserved = _sum(MasterPayout.amount, MasterPayout.master_id == master_id,
+                    MasterPayout.status.in_(["pending", "succeeded"]))
+    withdrawn = _sum(MasterPayout.amount, MasterPayout.master_id == master_id,
+                     MasterPayout.status == "succeeded")
+    return {
+        "gross_total": gross_total,
+        "net_total": net_total,
+        "commission_total": commission_total,
+        "available": max(0, net_total - reserved),
+        "pending_payout": max(0, reserved - withdrawn),
+        "withdrawn": withdrawn,
+        "commission_percent": float(TIP_PLATFORM_COMMISSION_PERCENT or 0),
+        "min_payout_rub": int(TIP_MIN_PAYOUT_RUB),
+        "payouts_enabled": _payouts_enabled(),
+    }
+
+
+def _payout_to_out(p: MasterPayout) -> MasterPayoutOut:
+    return MasterPayoutOut(
+        id=p.id,
+        amount=p.amount,
+        status=p.status,
+        sbp_phone=p.sbp_phone,
+        sbp_bank_id=p.sbp_bank_id,
+        error=p.error,
+        created_at=p.created_at,
+        settled_at=p.settled_at,
+    )
+
+
 def bundle_to_out(bundle: LoungeBundle) -> BundleOut:
     return BundleOut(
         id=bundle.id,
@@ -6318,14 +6569,51 @@ async def yookassa_bundle_webhook_async(
 
     event = payload.get("event")
     obj = payload.get("object") or {}
-    payment_id = obj.get("id")
-    if not payment_id:
-        return {"status": "ok", "message": "no payment id"}
+    obj_id = obj.get("id")
+    if not obj_id:
+        return {"status": "ok", "message": "no object id"}
+
+    meta = obj.get("metadata") or {}
+    meta_type = meta.get("type")
+
+    # --- Master tip withdrawals (payouts) ---
+    if event in ("payout.succeeded", "payout.canceled"):
+        payout_row = db.query(MasterPayout).filter(MasterPayout.payout_id == obj_id).first()
+        if not payout_row:
+            return {"status": "ok", "message": "unknown payout"}
+        if event == "payout.succeeded" and payout_row.status != "succeeded":
+            payout_row.status = "succeeded"
+            payout_row.settled_at = datetime.utcnow()
+            db.commit()
+        elif event == "payout.canceled" and payout_row.status != "canceled":
+            payout_row.status = "canceled"
+            payout_row.error = "canceled by provider"
+            db.commit()
+        return {"status": "ok", "message": f"payout {payout_row.status}", "payout_id": payout_row.id}
 
     if event != "payment.succeeded":
         print(f"[yookassa_webhook] ignoring event={event}")
         return {"status": "ok", "message": f"ignored {event}"}
 
+    payment_id = obj_id
+
+    # --- Master tip payment (acquiring) ---
+    if meta_type == "master_tip":
+        master_id = meta.get("master_id")
+        try:
+            gross = int(float((obj.get("amount") or {}).get("value", meta.get("amount", "0"))))
+        except Exception:
+            gross = int(float(meta.get("amount", "0") or 0))
+        guest_user_id = int(meta["guest_user_id"]) if meta.get("guest_user_id") else None
+        if not master_id or gross <= 0:
+            return {"status": "error", "message": "bad tip metadata"}
+        tip, created = _credit_master_tip(db, payment_id, master_id, guest_user_id, gross)
+        if created:
+            master = db.query(Master).filter(Master.id == master_id).first()
+            _notify_master_of_tip(db, master, gross)
+        return {"status": "ok", "message": "tip credited", "tip_id": tip.id}
+
+    # --- Bundle purchase (existing flow) ---
     # Idempotent create — if we already have the bundle, do nothing
     existing = db.query(LoungeBundle).filter(
         LoungeBundle.purchase_receipt_id == payment_id,
@@ -6333,7 +6621,6 @@ async def yookassa_bundle_webhook_async(
     if existing:
         return {"status": "ok", "message": "already finalised", "bundle_id": existing.id}
 
-    meta = obj.get("metadata") or {}
     user_id_str = meta.get("user_id")
     tier = meta.get("tier")
     if not user_id_str or not tier:
@@ -6999,6 +7286,19 @@ def unlink_telegram(
 
 # ── Masters CRUD ─────────────────────────────────────────────────────────────
 
+_PUBLIC_BASE = "http://188.253.19.166:8000"
+
+
+def _abs_media_url(url: Optional[str]) -> Optional[str]:
+    """Make a stored media path absolute. Master/user avatars are saved as
+    relative paths (/static/uploads/...); iOS AsyncImage needs a host or the
+    image silently fails to load. Covers/events are already absolute, so only
+    prepend the host when the value is a site-relative path starting with '/'."""
+    if url and url.startswith("/"):
+        return f"{_PUBLIC_BASE}{url}"
+    return url
+
+
 def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optional[Session] = None) -> dict:
     """Convert Master ORM row to MasterOut-compatible dict.
     Adapts production column names (from_date/to_date) to iOS DTO names."""
@@ -7022,14 +7322,15 @@ def _master_to_out(m: Master, current_user_id: Optional[int] = None, db: Optiona
     tips_total = 0
     if db is not None:
         tips_row = db.query(func.sum(MasterTip.amount)).filter(
-            MasterTip.master_id == m.id
+            MasterTip.master_id == m.id,
+            MasterTip.status.in_(["succeeded", "legacy"]),
         ).scalar()
         tips_total = int(tips_row or 0)
     return {
         "id": m.id,
         "handle": m.handle,
         "display_name": m.display_name,
-        "avatar_url": m.avatar_url,
+        "avatar_url": _abs_media_url(m.avatar_url),
         "bio": m.bio,
         "current_lounge_id": m.current_lounge_id,
         "rating": float(m.rating or 0.0),
@@ -7303,23 +7604,22 @@ def upload_master_profile_avatar(
     return {"avatar_url": url}
 
 
-# ── Master tips (v1 — record fact, iOS prompts SBP transfer) ─────────────────
+# ── Master tips v2 (real money — YooKassa acquiring in + SBP payout out) ──────
 
-@app.post("/masters/{master_id}/tip")
-def leave_master_tip(
+@app.post("/masters/{master_id}/tip", response_model=MasterTipPaymentOut)
+def create_master_tip_payment(
     master_id: str,
     payload: MasterTipIn,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Record a tip left by a guest for a master.
+    """Start a tip payment via YooKassa acquiring (эквайринг).
 
-    Auth: any logged-in user.
-    Body: {"amount": int} — validated 1..100000.
-    Returns: {"ok": true, "tip_phone": "<phone or null>", "amount": <amount>, "master_name": "<display_name>"}.
-
-    v1: No real money movement. tip_phone is the master's SBP phone;
-    the iOS app uses it to prompt an SBP bank transfer.
+    Auth: any logged-in user. Body: {"amount": int} — validated 1..100000.
+    Returns payment_id + confirmation_url; the iOS client opens the URL in a
+    WebView, then polls GET /masters/tips/{payment_id}/status. The tip is only
+    recorded — and the master's balance credited — once the payment succeeds
+    (via that poll or the webhook), never on the client's word.
     """
     current_user = get_required_user(user)
     if payload.amount < 1 or payload.amount > 100000:
@@ -7327,34 +7627,205 @@ def leave_master_tip(
     master = db.query(Master).filter(Master.id == master_id).first()
     if not master:
         raise HTTPException(404, "Master not found")
-    tip = MasterTip(
-        master_id=master_id,
-        guest_user_id=current_user.id,
-        amount=payload.amount,
+    _require_yookassa()
+
+    amount_rub = payload.amount
+    idempotence_key = f"tip-{current_user.id}-{master_id}-{int(datetime.utcnow().timestamp())}"
+    try:
+        yp = YooKassaPayment.create({
+            "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": YOOKASSA_TIP_RETURN_URL},
+            "capture": True,
+            "description": f"Чаевые мастеру {master.display_name} — Hooka3"[:128],
+            "metadata": {
+                "type": "master_tip",
+                "master_id": master_id,
+                "guest_user_id": str(current_user.id),
+                "amount": str(amount_rub),
+                "source": "ios_app",
+            },
+        }, idempotence_key)
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+
+    return MasterTipPaymentOut(
+        payment_id=yp.id,
+        confirmation_url=yp.confirmation.confirmation_url,
+        amount_rub=amount_rub,
+        master_name=master.display_name,
     )
-    db.add(tip)
-    db.commit()
-    # Optional push to master — non-blocking
-    if master.user_id is not None:
+
+
+@app.get("/masters/tips/{payment_id}/status", response_model=MasterTipStatusOut)
+def get_master_tip_status(
+    payment_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Polled by the iOS client after the tip WebView closes. On a succeeded
+    payment it credits the master's balance idempotently and returns credited=true."""
+    get_required_user(user)
+    _require_yookassa()
+    try:
+        yp = YooKassaPayment.find_one(payment_id)
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+
+    meta = yp.metadata or {}
+    credited = False
+    tip_id = None
+    if bool(yp.paid) and yp.status == "succeeded" and meta.get("type") == "master_tip":
+        master_id = meta.get("master_id")
         try:
-            from app.push import send_push_fanout_async
-            import asyncio as _asyncio_tip
-            _asyncio_tip.run(send_push_fanout_async(
-                db,
-                [master.user_id],
-                "Чаевые",
-                f"\U0001f4b8 Тебе оставили чаевые +{payload.amount}₽",
-                payload={"type": "master_tip", "master_id": master_id, "amount": payload.amount},
-            ))
+            gross = int(float(yp.amount.value)) if yp.amount else int(float(meta.get("amount", "0")))
         except Exception:
-            pass
-    tip_phone = getattr(master, "tip_phone", None)
-    return {
-        "ok": True,
-        "tip_phone": tip_phone,
-        "amount": payload.amount,
-        "master_name": master.display_name,
-    }
+            gross = int(float(meta.get("amount", "0") or 0))
+        guest_user_id = int(meta["guest_user_id"]) if meta.get("guest_user_id") else None
+        tip, created = _credit_master_tip(db, payment_id, master_id, guest_user_id, gross)
+        credited = True
+        tip_id = tip.id
+        if created:
+            master = db.query(Master).filter(Master.id == master_id).first()
+            _notify_master_of_tip(db, master, gross)
+
+    return MasterTipStatusOut(
+        payment_id=payment_id,
+        status=yp.status,
+        paid=bool(yp.paid),
+        credited=credited,
+        tip_id=tip_id,
+    )
+
+
+def _ensure_master_owner_or_admin(master: Master, current_user: User):
+    if not _is_master_owner(master, current_user) and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized for this master's tips")
+
+
+@app.get("/masters/{master_id}/tips/balance", response_model=MasterTipBalanceOut)
+def get_master_tip_balance(
+    master_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Master's tip balance + withdrawal limits. Owner or admin only."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    _ensure_master_owner_or_admin(master, current_user)
+    return MasterTipBalanceOut(**_master_tip_balance_dict(db, master_id))
+
+
+@app.get("/masters/payouts/sbp-banks", response_model=List[SbpBankOut])
+def list_sbp_banks(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """SBP participant banks for the withdrawal picker. Empty list when payouts
+    are not yet configured (the iOS withdrawal screen stays disabled)."""
+    get_required_user(user)
+    if not _payouts_enabled():
+        return []
+    try:
+        return [SbpBankOut(**b) for b in _fetch_sbp_banks()]
+    except Exception as exc:
+        raise HTTPException(502, f"YooKassa error: {exc}")
+
+
+@app.get("/masters/{master_id}/payouts", response_model=MasterPayoutListOut)
+def list_master_payouts(
+    master_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Withdrawal history + current balance. Owner or admin only."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    _ensure_master_owner_or_admin(master, current_user)
+    rows = db.query(MasterPayout).filter(
+        MasterPayout.master_id == master_id
+    ).order_by(MasterPayout.created_at.desc()).all()
+    return MasterPayoutListOut(
+        items=[_payout_to_out(p) for p in rows],
+        balance=MasterTipBalanceOut(**_master_tip_balance_dict(db, master_id)),
+    )
+
+
+@app.post("/masters/{master_id}/payouts", response_model=MasterPayoutOut)
+def request_master_payout(
+    master_id: str,
+    payload: MasterPayoutIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Withdraw accumulated tips to the master via YooKassa SBP payout.
+    Owner or admin only. Gated behind YOOKASSA_PAYOUT_* (503 if not configured).
+
+    The pending row is created BEFORE the YooKassa call so it reserves the
+    balance; a failed call flips it to canceled (freeing the funds), and the
+    payout webhook finalises async outcomes."""
+    current_user = get_required_user(user)
+    master = db.query(Master).filter(Master.id == master_id).first()
+    if not master:
+        raise HTTPException(404, "Master not found")
+    _ensure_master_owner_or_admin(master, current_user)
+    _require_yookassa_payout()
+
+    amount = int(payload.amount)
+    if amount < int(TIP_MIN_PAYOUT_RUB):
+        raise HTTPException(400, f"Минимальная сумма вывода — {int(TIP_MIN_PAYOUT_RUB)}₽")
+
+    bal = _master_tip_balance_dict(db, master_id)
+    if amount > bal["available"]:
+        raise HTTPException(400, f"Недостаточно средств: доступно {bal['available']}₽")
+
+    phone = _normalize_sbp_phone(payload.sbp_phone or master.tip_phone)
+    if len(phone) < 11:
+        raise HTTPException(400, "Укажите корректный телефон СБП получателя")
+    bank_id = (payload.sbp_bank_id or "").strip()
+    if not bank_id:
+        raise HTTPException(400, "Выберите банк СБП для вывода")
+
+    # Reserve balance with a pending row, then call YooKassa.
+    payout = MasterPayout(
+        master_id=master_id,
+        amount=amount,
+        status="pending",
+        sbp_phone=phone,
+        sbp_bank_id=bank_id,
+    )
+    db.add(payout)
+    db.flush()  # assigns payout.id without releasing the transaction
+
+    idempotence_key = f"tip-payout-{master_id}-{payout.id}"
+    try:
+        yp = _create_sbp_payout(
+            amount, phone, bank_id,
+            f"Вывод чаевых — {master.display_name}",
+            {"type": "master_payout", "master_id": master_id, "payout_row_id": str(payout.id)},
+            idempotence_key,
+        )
+    except Exception as exc:
+        payout.status = "canceled"
+        payout.error = str(exc)[:500]
+        db.commit()
+        raise HTTPException(502, f"YooKassa payout error: {exc}")
+
+    payout.payout_id = getattr(yp, "id", None)
+    status = getattr(yp, "status", "pending")
+    if status == "succeeded":
+        payout.status = "succeeded"
+        payout.settled_at = datetime.utcnow()
+    elif status == "canceled":
+        payout.status = "canceled"
+        payout.error = "canceled by provider"
+    # else: stays pending — the payout webhook finalises it.
+    db.commit()
+    db.refresh(payout)
+    return _payout_to_out(payout)
 
 
 # ── Master lounge approval requests ───────────────────────────────────────────
@@ -8379,7 +8850,7 @@ from app.services import leaderboard as _leaderboard_svc
 def _user_avatar_url(user: Optional[User]) -> Optional[str]:
     if not user:
         return None
-    return user.avatar_url
+    return _abs_media_url(user.avatar_url)
 
 
 def _ranked_row_to_entry(
@@ -8621,6 +9092,37 @@ duel_manager = DuelConnectionManager()
 # MARK: CRM endpoints — owner analytics (2026-05-26)
 # -------------------------------------------------------------------
 
+# ── CRM scoring helpers ───────────────────────────────────────────────────────
+
+def _lounge_avg_bill(db: Session, brand_id: str) -> int:
+    """Average non-zero receipt for the lounge — baseline for the monetary score."""
+    row = db.query(func.avg(LoungeVisit.bill_amount)).filter(
+        LoungeVisit.brand_id == brand_id,
+        LoungeVisit.bill_amount > 0,
+    ).scalar()
+    return int(row or 0)
+
+
+def _build_guest_score_out(*, visits_count, total_spent, avg_bill, last_visit_at,
+                           first_visit_at, bonus_balance, lounge_avg_bill,
+                           now=None) -> GuestScoreOut:
+    from app.services.crm_scoring import score_guest
+    s = score_guest(
+        visits_count=visits_count, total_spent=total_spent, avg_bill=avg_bill,
+        last_visit_at=last_visit_at, first_visit_at=first_visit_at,
+        bonus_balance=bonus_balance, lounge_avg_bill=lounge_avg_bill, now=now,
+    )
+    return GuestScoreOut(
+        score=s["score"],
+        segment=s["segment"],
+        segment_title=s["segment_title"],
+        segment_emoji=s["segment_emoji"],
+        segment_color=s["segment_color"],
+        recency_days=s["recency_days"],
+        recommendation=RetentionRecOut(**s["recommendation"]),
+    )
+
+
 @app.get("/lounges/{brand_id}/crm/stats", response_model=LoungeCrmStatsOut, tags=["crm"])
 @limiter.limit("60/minute")
 def lounge_crm_stats(
@@ -8762,6 +9264,8 @@ def lounge_crm_regulars(
     total = agg.count()
     rows = agg.offset(offset).limit(limit).all()
 
+    lounge_avg = _lounge_avg_bill(db, brand_id)
+    now = datetime.utcnow()
     items = []
     for row in rows:
         guest = db.query(User).filter(User.id == row.user_id).first()
@@ -8773,6 +9277,16 @@ def lounge_crm_regulars(
         ).first()
         bonus_balance = (loyalty_row.bonus_balance or 0) if loyalty_row else 0
         avg_bill = (row.total_spent // row.visits_count) if row.visits_count else 0
+        scoring = _build_guest_score_out(
+            visits_count=row.visits_count,
+            total_spent=row.total_spent or 0,
+            avg_bill=avg_bill,
+            last_visit_at=row.last_visit_at,
+            first_visit_at=None,  # tenure not needed for score/segment
+            bonus_balance=bonus_balance,
+            lounge_avg_bill=lounge_avg,
+            now=now,
+        )
         items.append(LoungeCrmRegularOut(
             user_id=row.user_id,
             username=guest.username or f"user_{row.user_id}",
@@ -8782,6 +9296,7 @@ def lounge_crm_regulars(
             last_visit_at=row.last_visit_at,
             avg_bill=avg_bill,
             bonus_balance=bonus_balance,
+            scoring=scoring,
         ))
 
     return LoungeCrmRegularsOut(items=items, total=total, limit=limit, offset=offset)
@@ -8866,6 +9381,16 @@ def lounge_crm_guest_card(
         for m in last_mixes_q
     ]
 
+    scoring = _build_guest_score_out(
+        visits_count=visits_count,
+        total_spent=total_spent,
+        avg_bill=avg_bill,
+        last_visit_at=last_visit_at,
+        first_visit_at=first_visit_at,
+        bonus_balance=bonus_balance,
+        lounge_avg_bill=_lounge_avg_bill(db, brand_id),
+    )
+
     return LoungeCrmGuestCardOut(
         user_id=guest_user_id,
         username=guest.username or f"user_{guest_user_id}",
@@ -8879,6 +9404,229 @@ def lounge_crm_guest_card(
         favorite_brands=favorite_brands,
         last_mixes=last_mixes,
         recent_visits=recent_visits,
+        scoring=scoring,
+    )
+
+
+@app.get("/lounges/{brand_id}/crm/insights", response_model=LoungeCrmInsightsOut, tags=["crm"])
+@limiter.limit("60/minute")
+def lounge_crm_insights(
+    request: Request,
+    brand_id: str,
+    winback_limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Retention cockpit: segment breakdown of the whole guest base + a
+    prioritised "кого вернуть" list, each with a concrete offer. Owner-only,
+    tier >= pro. Scores every guest who ever visited this lounge."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
+
+    from app.services.crm_scoring import (
+        score_guest, SEGMENT_META, WINBACK_SEGMENTS,
+        SEGMENT_AT_RISK, SEGMENT_HIBERNATING, SEGMENT_LOST,
+    )
+
+    agg = (
+        db.query(
+            LoungeVisit.user_id,
+            func.count(LoungeVisit.id).label("visits_count"),
+            func.sum(LoungeVisit.bill_amount).label("total_spent"),
+            func.max(LoungeVisit.created_at).label("last_visit_at"),
+            func.min(LoungeVisit.created_at).label("first_visit_at"),
+        )
+        .filter(LoungeVisit.brand_id == brand_id)
+        .group_by(LoungeVisit.user_id)
+        .all()
+    )
+
+    lounge_avg = _lounge_avg_bill(db, brand_id)
+    now = datetime.utcnow()
+    bonus_map = {
+        lr.user_id: (lr.bonus_balance or 0)
+        for lr in db.query(LoungeGuestLoyalty).filter(
+            LoungeGuestLoyalty.brand_id == brand_id
+        ).all()
+    }
+
+    seg_counts = {k: 0 for k in SEGMENT_META.keys()}
+    total_guests = active_guests = at_risk_count = asleep_count = score_sum = 0
+    winback_candidates = []  # (segment_priority, -value, row, avg_bill, visits, scored)
+
+    for row in agg:
+        total_guests += 1
+        visits_count = row.visits_count or 0
+        total_spent = row.total_spent or 0
+        avg_bill = (total_spent // visits_count) if visits_count else 0
+        scored = score_guest(
+            visits_count=visits_count, total_spent=total_spent, avg_bill=avg_bill,
+            last_visit_at=row.last_visit_at, first_visit_at=row.first_visit_at,
+            bonus_balance=bonus_map.get(row.user_id, 0), lounge_avg_bill=lounge_avg, now=now,
+        )
+        seg = scored["segment"]
+        seg_counts[seg] = seg_counts.get(seg, 0) + 1
+        score_sum += scored["score"]
+        if scored["recency_days"] <= 30:
+            active_guests += 1
+        if seg == SEGMENT_AT_RISK:
+            at_risk_count += 1
+        if seg in (SEGMENT_HIBERNATING, SEGMENT_LOST):
+            asleep_count += 1
+        if seg in WINBACK_SEGMENTS:
+            winback_candidates.append((WINBACK_SEGMENTS.index(seg), -avg_bill, row, avg_bill, visits_count, scored))
+
+    # at_risk first, then hibernating, then lost; within a segment, higher value first.
+    winback_candidates.sort(key=lambda t: (t[0], t[1]))
+    to_win_back = []
+    potential = 0
+    for _prio, _nv, row, avg_bill, visits_count, scored in winback_candidates[:winback_limit]:
+        guest = db.query(User).filter(User.id == row.user_id).first()
+        if not guest:
+            continue
+        potential += avg_bill
+        to_win_back.append(CrmWinbackGuestOut(
+            user_id=row.user_id,
+            username=guest.username or f"user_{row.user_id}",
+            avatar_url=guest.avatar_url,
+            score=scored["score"],
+            segment=scored["segment"],
+            segment_title=scored["segment_title"],
+            segment_color=scored["segment_color"],
+            recency_days=scored["recency_days"],
+            visits_count=visits_count,
+            avg_bill=avg_bill,
+            recommendation=RetentionRecOut(**scored["recommendation"]),
+        ))
+
+    segments = [
+        CrmSegmentCountOut(
+            segment=k, title=SEGMENT_META[k]["title"],
+            emoji=SEGMENT_META[k]["emoji"], color=SEGMENT_META[k]["color"],
+            count=seg_counts.get(k, 0),
+        )
+        for k in SEGMENT_META.keys()
+    ]
+
+    return LoungeCrmInsightsOut(
+        total_guests=total_guests,
+        active_guests=active_guests,
+        at_risk_count=at_risk_count,
+        asleep_count=asleep_count,
+        avg_score=(int(score_sum / total_guests) if total_guests else 0),
+        potential_winback_revenue=potential,
+        segments=segments,
+        to_win_back=to_win_back,
+    )
+
+
+@app.post("/lounges/{brand_id}/crm/ai-insights", response_model=CrmAiInsightsOut, tags=["crm"])
+@limiter.limit("12/hour")
+def lounge_crm_ai_insights(
+    request: Request,
+    brand_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """AI («нейронка») analysis of the guest base + a concrete retention action
+    plan. Owner-only, tier >= pro. Gated behind LLM_API_KEY (503 if unset).
+    Rate-limited — each call hits a paid LLM."""
+    current_user = get_required_user(user)
+    if not can_manage_brand(current_user, brand_id):
+        raise HTTPException(403, "Business access required")
+    if not current_user.is_admin:
+        require_tier(db, brand_id, "pro")
+
+    from app.services.crm_ai import ai_enabled, analyze_guest_base, AIError
+    if not ai_enabled():
+        raise HTTPException(503, "AI-аналитика не настроена на сервере (нет LLM-ключа)")
+
+    from app.services.crm_scoring import score_guest, SEGMENT_META, WINBACK_SEGMENTS
+
+    agg = (
+        db.query(
+            LoungeVisit.user_id,
+            func.count(LoungeVisit.id).label("vc"),
+            func.sum(LoungeVisit.bill_amount).label("ts"),
+            func.max(LoungeVisit.created_at).label("last"),
+            func.min(LoungeVisit.created_at).label("first"),
+        )
+        .filter(LoungeVisit.brand_id == brand_id)
+        .group_by(LoungeVisit.user_id)
+        .all()
+    )
+    if not agg:
+        raise HTTPException(400, "Недостаточно данных: по заведению ещё нет визитов")
+
+    lounge_avg = _lounge_avg_bill(db, brand_id)
+    now = datetime.utcnow()
+    bonus_map = {
+        lr.user_id: (lr.bonus_balance or 0)
+        for lr in db.query(LoungeGuestLoyalty).filter(
+            LoungeGuestLoyalty.brand_id == brand_id
+        ).all()
+    }
+
+    seg_counts = {k: 0 for k in SEGMENT_META.keys()}
+    total = active = score_sum = 0
+    winback = []
+    for row in agg:
+        vc = row.vc or 0
+        ts = row.ts or 0
+        ab = (ts // vc) if vc else 0
+        s = score_guest(
+            visits_count=vc, total_spent=ts, avg_bill=ab,
+            last_visit_at=row.last, first_visit_at=row.first,
+            bonus_balance=bonus_map.get(row.user_id, 0), lounge_avg_bill=lounge_avg, now=now,
+        )
+        seg_counts[s["segment"]] += 1
+        score_sum += s["score"]
+        total += 1
+        if s["recency_days"] <= 30:
+            active += 1
+        if s["segment"] in WINBACK_SEGMENTS:
+            winback.append((WINBACK_SEGMENTS.index(s["segment"]), -ab, {
+                "сегмент": s["segment_title"],
+                "дней_без_визита": s["recency_days"],
+                "визитов": vc,
+                "средний_чек": ab,
+                "рекоменд_оффер": s["recommendation"]["action"],
+                "бонус_руб": s["recommendation"]["bonus_rub"],
+            }))
+
+    winback.sort(key=lambda t: (t[0], t[1]))
+    sample_guests = [w[2] for w in winback[:10]]
+    summary = {
+        "всего_гостей": total,
+        "активных_30д": active,
+        "средний_балл_здоровья_0_100": int(score_sum / total) if total else 0,
+        "средний_чек_по_заведению": lounge_avg,
+    }
+    segments = [
+        {"сегмент": SEGMENT_META[k]["title"], "количество": seg_counts[k]}
+        for k in SEGMENT_META if seg_counts[k]
+    ]
+
+    try:
+        result = analyze_guest_base(
+            lounge_title=brand_id,
+            summary=summary,
+            segments=segments,
+            sample_guests=sample_guests,
+            commission_percent=float(TIP_PLATFORM_COMMISSION_PERCENT or 0),
+        )
+    except AIError as exc:
+        raise HTTPException(502, f"AI error: {exc}")
+
+    return CrmAiInsightsOut(
+        enabled=True,
+        analysis=result["analysis"],
+        actions=result["actions"],
+        model=result.get("model"),
+        generated_at=now.isoformat(),
     )
 
 

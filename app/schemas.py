@@ -1156,6 +1156,28 @@ class LoungeCrmStatsOut(BaseModel):
     top_weekdays: List[WeekdayBucket]
 
 
+# MARK: - CRM guest scoring + retention (2026-05-31)
+
+class RetentionRecOut(BaseModel):
+    """Concrete "what to give this guest to bring them back" suggestion."""
+    action: str               # short imperative, e.g. "Верни сейчас"
+    detail: str               # one-paragraph rationale + tactic
+    offer_type: str           # vip | bonus | complimentary | welcome | winback | winback_aggressive | reactivation
+    bonus_rub: int            # suggested incentive in RUB (0 = non-monetary)
+    channel: str              # push | ...
+    urgency: str              # low | medium | high
+
+
+class GuestScoreOut(BaseModel):
+    score: int                # 0-100 health score
+    segment: str              # champion | loyal | big_spender | promising | at_risk | hibernating | lost
+    segment_title: str        # RU label for the badge
+    segment_emoji: str
+    segment_color: str        # hex
+    recency_days: int         # days since last visit
+    recommendation: RetentionRecOut
+
+
 class LoungeCrmRegularOut(BaseModel):
     user_id: int
     username: str
@@ -1165,6 +1187,7 @@ class LoungeCrmRegularOut(BaseModel):
     last_visit_at: datetime
     avg_bill: int
     bonus_balance: int
+    scoring: Optional[GuestScoreOut] = None
 
 
 class LoungeCrmRegularsOut(BaseModel):
@@ -1194,6 +1217,51 @@ class LoungeCrmGuestCardOut(BaseModel):
     favorite_brands: Optional[List[str]] = None
     last_mixes: List[dict] = []
     recent_visits: List[GuestVisitRowOut] = []
+    scoring: Optional[GuestScoreOut] = None
+
+
+# MARK: - CRM insights ("кого вернуть") — segment breakdown + win-back list
+
+class CrmSegmentCountOut(BaseModel):
+    segment: str
+    title: str
+    emoji: str
+    color: str
+    count: int
+
+
+class CrmWinbackGuestOut(BaseModel):
+    user_id: int
+    username: str
+    avatar_url: Optional[str] = None
+    score: int
+    segment: str
+    segment_title: str
+    segment_color: str
+    recency_days: int
+    visits_count: int
+    avg_bill: int
+    recommendation: RetentionRecOut
+
+
+class LoungeCrmInsightsOut(BaseModel):
+    total_guests: int
+    active_guests: int               # last visit ≤ 30 дней
+    at_risk_count: int
+    asleep_count: int                # спящие + потерянные
+    avg_score: int
+    potential_winback_revenue: int   # сумма средних чеков целей возврата
+    segments: List[CrmSegmentCountOut]
+    to_win_back: List[CrmWinbackGuestOut]
+
+
+class CrmAiInsightsOut(BaseModel):
+    """LLM ("нейронка") analysis of the guest base + retention action plan."""
+    enabled: bool
+    analysis: str = ""
+    actions: List[str] = []
+    model: Optional[str] = None
+    generated_at: Optional[str] = None
 
 
 # MARK: - Bonus Redemption (2026-05-26)
@@ -1482,7 +1550,63 @@ class HomeOffersOut(BaseModel):
     source: str  # "visits" | "featured_fallback"
 
 
-# MARK: - Master tips (v1 — record fact, iOS prompts SBP transfer)
+# MARK: - Master tips v2 (real money — YooKassa acquiring in + SBP payout out)
 
 class MasterTipIn(BaseModel):
+    amount: int                       # gross tip in RUB, validated 1..100000
+
+
+class MasterTipPaymentOut(BaseModel):
+    """Returned by POST /masters/{id}/tip — the iOS client opens
+    confirmation_url in a WebView, then polls the status endpoint."""
+    payment_id: str
+    confirmation_url: str
+    amount_rub: int
+    master_name: str
+
+
+class MasterTipStatusOut(BaseModel):
+    payment_id: str
+    status: str                       # pending | waiting_for_capture | succeeded | canceled
+    paid: bool
+    credited: bool = False            # true once the master's balance was credited
+    tip_id: Optional[int] = None
+
+
+class MasterTipBalanceOut(BaseModel):
+    gross_total: int                  # lifetime tips received (incl. legacy) — for "заработано"
+    net_total: int                    # credited to master after commission (succeeded only)
+    commission_total: int             # platform's cut so far
+    available: int                    # available to withdraw now
+    pending_payout: int               # withdrawals in flight
+    withdrawn: int                    # already paid out
+    commission_percent: float
+    min_payout_rub: int
+    payouts_enabled: bool             # false → withdrawal UI shows "скоро"
+
+
+class MasterPayoutIn(BaseModel):
     amount: int
+    sbp_bank_id: str                  # SBP participant id (12 alnum), from /masters/payouts/sbp-banks
+    sbp_phone: Optional[str] = None   # defaults to the master's saved tip_phone
+
+
+class MasterPayoutOut(BaseModel):
+    id: int
+    amount: int
+    status: str                       # pending | succeeded | canceled
+    sbp_phone: Optional[str] = None
+    sbp_bank_id: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime
+    settled_at: Optional[datetime] = None
+
+
+class MasterPayoutListOut(BaseModel):
+    items: List[MasterPayoutOut]
+    balance: MasterTipBalanceOut
+
+
+class SbpBankOut(BaseModel):
+    bank_id: str
+    name: str
