@@ -280,7 +280,7 @@ from app.schemas import (
     HomeOffersOut,
     MasterTipIn,
 )
-from app.services.subscriptions import check_event_limit, check_push_limit, get_active_tier, require_tier
+from app.services.subscriptions import check_event_limit, check_guest_limit, check_push_limit, get_active_tier, require_tier
 
 # -------------------------------------------------------------------
 # UTILS
@@ -4524,6 +4524,11 @@ def register_lounge_checkin(
         LoungeGuestLoyalty.user_id == guest_user.id,
     ).first()
     if not loyalty:
+        # Гейт лимита гостей QR-лояльности на Free (G3, 2026-07-07) — считается
+        # только для НОВОГО гостя (пары brand_id+user ещё нет в базе).
+        # Существующие гости чекинятся без ограничений всегда.
+        if not current_user.is_admin and guest_user.id != 1:
+            check_guest_limit(db, brand_id)
         loyalty = LoungeGuestLoyalty(
             brand_id=brand_id,
             user_id=guest_user.id,

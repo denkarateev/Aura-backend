@@ -21,6 +21,12 @@ check_push_limit(db, brand_id) -> None
     access at all (start), or the lounge already sent >= PUSH_LIMITS[tier]
     broadcast pushes this calendar month (G2, 2026-07-07).
     A tier limit of None means unlimited; 0 means no access.
+
+check_guest_limit(db, brand_id) -> None
+    Raises HTTPException(402) if the lounge already has >= GUEST_LIMITS[tier]
+    distinct QR-loyalty guests for its current billing tier (G3, 2026-07-07).
+    Only meant to be called when onboarding a NEW guest — existing guests
+    must always be able to check in. A tier limit of None means unlimited.
 """
 
 from __future__ import annotations
@@ -44,6 +50,10 @@ EVENT_LIMITS = {"start": 1, "lite": 3, "pro": None, "network": None, "partner": 
 # Monthly subscriber-push cap per tier — push gate (G2, 2026-07-07).
 # 0 = no access at all (start); None = unlimited (network, partner).
 PUSH_LIMITS = {"start": 0, "lite": 2, "pro": 8, "network": None, "partner": None}
+
+# Distinct QR-loyalty guests cap per tier — guest gate (G3, 2026-07-07).
+# None = unlimited.
+GUEST_LIMITS = {"start": 50, "lite": None, "pro": None, "network": None, "partner": None}
 
 
 def _tier_rank(tier: str) -> int:
@@ -210,6 +220,63 @@ def check_push_limit(db: Session, brand_id: str) -> None:
                 "message": (
                     f"Лимит пушей на тарифе {tier} исчерпан "
                     f"({sent_this_month}/{limit} в этом месяце)."
+                ),
+            },
+        )
+
+
+def check_guest_limit(db: Session, brand_id: str) -> None:
+    """
+    Raise HTTP 402 if the lounge is already at (or over) its distinct
+    QR-loyalty guest cap for the current billing tier (G3, 2026-07-07).
+
+    Guest count = COUNT(DISTINCT LoungeGuestLoyalty.user_id) WHERE
+    brand_id == brand_id. A tier with GUEST_LIMITS[tier] is None is treated
+    as unlimited and always passes without querying the count.
+
+    IMPORTANT: only call this when onboarding a NEW guest (i.e. before
+    creating a brand-new LoungeGuestLoyalty row for a brand_id+user_id pair
+    that doesn't exist yet). Existing guests must always be able to check
+    in, regardless of the lounge's tier or guest count.
+
+    Usage in endpoint (get-or-create pattern, before creating the new row):
+        if not loyalty:
+            if not current_user.is_admin and guest_user.id != 1:
+                check_guest_limit(db, brand_id)
+            loyalty = LoungeGuestLoyalty(...)
+    """
+    # Import here to avoid circular import at module level (see get_active_tier).
+    from app.models import LoungeGuestLoyalty
+
+    tier = get_active_tier(db, brand_id)
+    limit = GUEST_LIMITS.get(tier)
+    if limit is None:
+        return  # unlimited on this tier
+
+    guest_count = (
+        db.query(func.count(func.distinct(LoungeGuestLoyalty.user_id)))
+        .filter(LoungeGuestLoyalty.brand_id == brand_id)
+        .scalar()
+    )
+    if guest_count >= limit:
+        required_tier = next(
+            (
+                t
+                for t in TIER_ORDER
+                if GUEST_LIMITS.get(t) is None or GUEST_LIMITS[t] > limit
+            ),
+            "lite",
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "upgrade_required",
+                "required_tier": required_tier,
+                "current_tier": tier,
+                "message": (
+                    f"Лимит {limit} гостей на тарифе {tier} исчерпан "
+                    f"({guest_count}/{limit}) — оформите {required_tier} или выше, "
+                    "чтобы подключать новых гостей к QR-лояльности без ограничений."
                 ),
             },
         )
