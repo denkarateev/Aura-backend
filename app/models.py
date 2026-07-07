@@ -1023,3 +1023,25 @@ class LoungeAdminMeta(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# MARK: - Push broadcast log (G2, 2026-07-07)
+
+class LoungePushLog(Base):
+    """
+    One row per successful subscriber-push broadcast a lounge sends via
+    POST /lounges/{brand_id}/push. Used only to enforce the monthly push
+    cap per billing tier — see PUSH_LIMITS / check_push_limit() in
+    app/services/subscriptions.py. A row is written only after a push
+    actually goes out; never on a 402 gate rejection.
+
+    sent_count — number of devices APNs actually delivered to (the return
+                 value of send_push_fanout_async); falls back to 1 if that
+                 count is unavailable/zero.
+    """
+    __tablename__ = "lounge_push_log"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    sent_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    sent_count = Column(Integer, nullable=False, default=0, server_default="0")

@@ -79,6 +79,7 @@ from app.models import (
     LoungeOwnerCredentials,
     LoungePromo,
     LoungePromotedSlot,
+    LoungePushLog,
     LoungeSubscription,
     LoungeVisit,
     DeviceToken,
@@ -279,7 +280,7 @@ from app.schemas import (
     HomeOffersOut,
     MasterTipIn,
 )
-from app.services.subscriptions import check_event_limit, get_active_tier, require_tier
+from app.services.subscriptions import check_event_limit, check_push_limit, get_active_tier, require_tier
 
 # -------------------------------------------------------------------
 # UTILS
@@ -2587,6 +2588,42 @@ def startup():
             _lg.getLogger(__name__).warning(
                 "lounge_billing_subscriptions migration skipped (likely race with another worker): %s",
                 _billing_migration_exc,
+            )
+
+    # MARK: lounge_push_log — monthly push-broadcast counter (G2, 2026-07-07)
+    # Wrapped in try/except — same race-with-another-worker rationale as
+    # lounge_billing_subscriptions above (multiple gunicorn workers run
+    # startup() concurrently).
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS lounge_push_log (
+                        id SERIAL PRIMARY KEY,
+                        brand_id VARCHAR(128) NOT NULL,
+                        sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        sent_count INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lounge_push_log_brand
+                    ON lounge_push_log(brand_id)
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lounge_push_log_sent_at
+                    ON lounge_push_log(sent_at)
+                    """
+                )
+        except Exception as _push_log_migration_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "lounge_push_log migration skipped (likely race with another worker): %s",
+                _push_log_migration_exc,
             )
 
     # MARK: featured_slots — paid featured placements (2026-05-27)
@@ -5033,8 +5070,9 @@ def refresh_lounge_busyness(
 
 
 # MARK: Lounge Broadcast Push — POST /lounges/{brand_id}/push (2026-05-28)
-# Premium feature: Network or Partner tier only. Sends APNs push to all
-# lounge subscribers. Returns {"sent": N}.
+# Gated by monthly push cap per billing tier (G2, 2026-07-07): start=0 (no
+# access), lite=2/mo, pro=8/mo, network/partner=unlimited. Sends APNs push
+# to all lounge subscribers. Returns {"sent": N}.
 @app.post("/lounges/{brand_id}/push", tags=["lounges"])
 def lounge_broadcast_push(
     brand_id: str,
@@ -5046,21 +5084,20 @@ def lounge_broadcast_push(
 
     Requires:
     - Bearer auth (lounge owner / manager)
-    - Lounge billing tier >= network (network or partner)
+    - Lounge billing tier >= lite, with a monthly cap (lite=2, pro=8,
+      network/partner=unlimited) enforced by check_push_limit(). Staff
+      (is_admin) accounts bypass the gate, same convention as every other
+      tier-gated endpoint in this file.
     """
     current_user = get_required_user(user)
     if not can_manage_brand(current_user, brand_id, db):
         raise HTTPException(403, "Business access required")
 
-    # Tier gate — require_tier raises HTTP 402 when tier is too low.
-    # We normalise that to a 403 with a machine-readable detail so iOS
-    # can show an upsell screen instead of a generic error.
-    try:
-        require_tier(db, brand_id, "network")
-    except HTTPException as _exc:
-        if _exc.status_code == 402:
-            raise HTTPException(403, detail="tier_required:network")
-        raise
+    # Tier + monthly-quota gate (G2, 2026-07-07) — check_push_limit raises
+    # HTTP 402 when the tier has no push access (start) or the lounge is
+    # already at its monthly push cap for the current tier.
+    if not current_user.is_admin:
+        check_push_limit(db, brand_id)
 
     subs = (
         db.query(LoungeSubscription)
@@ -5074,7 +5111,7 @@ def lounge_broadcast_push(
         try:
             import asyncio as _asyncio
             from app.push import send_push_fanout_async
-            _asyncio.run(
+            delivered = _asyncio.run(
                 send_push_fanout_async(
                     db,
                     uid_list,
@@ -5085,6 +5122,16 @@ def lounge_broadcast_push(
             )
         except Exception as _e:
             print(f"[push] lounge-broadcast failed for {brand_id}: {_e}")
+        else:
+            # Log only on a successful send — feeds the monthly cap counter
+            # in check_push_limit(). Never logged on a 402/403 gate failure.
+            db.add(
+                LoungePushLog(
+                    brand_id=brand_id,
+                    sent_count=delivered if delivered else 1,
+                )
+            )
+            db.commit()
 
     return {"sent": len(uid_list)}
 
