@@ -10759,6 +10759,7 @@ def admin_web_login_page(request: Request):
 # POST /admin-web/login
 # ---------------------------------------------------------------
 @app.post("/admin-web/login", response_class=HTMLResponse, tags=["admin-web"])
+@limiter.limit("5/minute")
 async def admin_web_login_submit(
     request: Request,
     db: Session = Depends(get_db),
@@ -12097,10 +12098,14 @@ async def admin_web_create_owner(
 
     try:
         creds = ensure_lounge_owner(brand_id, db)
-        flash_msg = f"Доступ создан: {creds['email']} / {creds['password']}"
-        return RedirectResponse(
-            url=f"/admin-web/lounges/{brand_id}?flash_ok={urllib.parse.quote(flash_msg)}",
-            status_code=302,
+        return templates.TemplateResponse(
+            request,
+            "owner_credentials.html",
+            {
+                "brand_id": brand_id,
+                "email": creds["email"],
+                "password": creds["password"],
+            },
         )
     except Exception as exc:
         return RedirectResponse(
@@ -12141,10 +12146,15 @@ async def admin_web_reset_owner_password(
     creds_row.password_plain = new_password
     db.commit()
 
-    flash_msg = f"Пароль сброшен. Новый: {new_password}"
-    return RedirectResponse(
-        url=f"/admin-web/lounges/{brand_id}?flash_ok={urllib.parse.quote(flash_msg)}",
-        status_code=302,
+    owner_email = creds_row.email if creds_row.email else ""
+    return templates.TemplateResponse(
+        request,
+        "owner_credentials.html",
+        {
+            "brand_id": brand_id,
+            "email": owner_email,
+            "password": new_password,
+        },
     )
 
 

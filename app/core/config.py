@@ -7,12 +7,13 @@ try:
 except ImportError:
     pass
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:pass@localhost:5433/hookahmix"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env is required")
 
-SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY env is required")
 ALGORITHM = "HS256"
 # Legacy constant — kept for any code that imports it directly.
 # New code should use app.core.security.ACCESS_TOKEN_EXPIRE_MINUTES (15 min).
