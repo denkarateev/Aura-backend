@@ -279,7 +279,7 @@ from app.schemas import (
     HomeOffersOut,
     MasterTipIn,
 )
-from app.services.subscriptions import get_active_tier, require_tier
+from app.services.subscriptions import check_event_limit, get_active_tier, require_tier
 
 # -------------------------------------------------------------------
 # UTILS
@@ -3429,6 +3429,8 @@ def create_event(
     if payload.lounge_id:
         if not can_manage_brand(current_user, payload.lounge_id):
             raise HTTPException(403, "Business access required")
+        if not current_user.is_admin:
+            check_event_limit(db, payload.lounge_id)  # brand_id = lounge_id создаваемого события
     elif not current_user.is_admin:
         raise HTTPException(403, "Admin only for non-lounge events")
 

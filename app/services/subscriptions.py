@@ -10,6 +10,11 @@ get_active_tier(db, brand_id) -> str
 require_tier(db, brand_id, minimum) -> None
     Raises HTTPException(402) if the lounge's active tier is below `minimum`.
     Tier order: start < lite < pro < network < partner.
+
+check_event_limit(db, brand_id) -> None
+    Raises HTTPException(402) if the lounge already has >= EVENT_LIMITS[tier]
+    active afisha events for its current billing tier (G1, 2026-07-07).
+    A tier limit of None means unlimited.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:
@@ -25,6 +31,9 @@ if TYPE_CHECKING:
 
 # Ordered tier list — index = tier rank (higher = better)
 TIER_ORDER = ["start", "lite", "pro", "network", "partner"]
+
+# Active-events cap per tier — afisha gate (G1, 2026-07-07). None = unlimited.
+EVENT_LIMITS = {"start": 1, "lite": 3, "pro": None, "network": None, "partner": None}
 
 
 def _tier_rank(tier: str) -> int:
@@ -71,5 +80,55 @@ def require_tier(db: Session, brand_id: str, minimum: str) -> None:
                 "error": "upgrade_required",
                 "required_tier": minimum,
                 "current_tier": current,
+            },
+        )
+
+
+def check_event_limit(db: Session, brand_id: str) -> None:
+    """
+    Raise HTTP 402 if the lounge is already at (or over) its active-events
+    cap for the current billing tier.
+
+    "Active" = Event.lounge_id == brand_id AND
+               (Event.ends_at IS NULL OR Event.ends_at > now()).
+    A tier with EVENT_LIMITS[tier] is None is treated as unlimited and
+    always passes without querying the count.
+
+    Usage in endpoint (after can_manage_brand, before creating the Event):
+        if not current_user.is_admin:
+            check_event_limit(db, brand_id)
+    """
+    # Import here to avoid circular import at module level (see get_active_tier).
+    from app.models import Event
+
+    tier = get_active_tier(db, brand_id)
+    limit = EVENT_LIMITS.get(tier)
+    if limit is None:
+        return  # unlimited on this tier
+
+    now = datetime.utcnow()
+    active_count = (
+        db.query(func.count(Event.id))
+        .filter(
+            Event.lounge_id == brand_id,
+            (Event.ends_at == None) | (Event.ends_at > now),  # noqa: E711
+        )
+        .scalar()
+    )
+    if active_count >= limit:
+        required_tier = next(
+            (
+                t
+                for t in TIER_ORDER
+                if EVENT_LIMITS.get(t) is None or EVENT_LIMITS[t] > limit
+            ),
+            "lite",
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "upgrade_required",
+                "required_tier": required_tier,
+                "current_tier": tier,
             },
         )
