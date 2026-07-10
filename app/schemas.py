@@ -1610,3 +1610,42 @@ class MasterPayoutListOut(BaseModel):
 class SbpBankOut(BaseModel):
     bank_id: str
     name: str
+
+
+# ---------------------------------------------------------------------------
+# Open Table / "Открытый стол" (PK1, 2026-07-10)
+# ---------------------------------------------------------------------------
+
+class OpenTableCreateIn(BaseModel):
+    mix_title: Optional[str] = Field(None, max_length=256)
+    seats_free: int = Field(2, ge=1, le=10)
+    note: Optional[str] = Field(None, max_length=1000)
+    ttl_hours: int = Field(2, ge=1, le=3)
+
+
+class OpenTableJoinOut(BaseModel):
+    id: int
+    table_id: int
+    user: UserSearchOut
+    joined_at: datetime
+    arrived: bool = False
+    is_covisit: bool = False
+
+
+class OpenTableOut(BaseModel):
+    id: int
+    brand_id: str
+    brand_title: str
+    host: UserSearchOut
+    mix_title: Optional[str] = None
+    seats_free: int
+    note: Optional[str] = None
+    created_at: datetime
+    expires_at: datetime
+    closed_at: Optional[datetime] = None
+    is_expired: bool = False
+    joins_count: int = 0
+
+
+class OpenTableDetailOut(OpenTableOut):
+    joins: List[OpenTableJoinOut] = []

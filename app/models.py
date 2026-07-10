@@ -1045,3 +1045,67 @@ class LoungePushLog(Base):
     brand_id = Column(String(128), nullable=False, index=True)
     sent_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     sent_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+# MARK: - Open Table / "Открытый стол" (PK1, 2026-07-10)
+#
+# Host opens a table right after checking in at a lounge — "я тут, налетай".
+# Friends/subscribers of that lounge see it in GET /open-tables/nearby and
+# can record an "иду" intent (OpenTableJoin). When that same guest is later
+# QR-checked-in at the same brand_id (POST /lounges/{brand_id}/checkin),
+# the hook there flips arrived/is_covisit and awards both sides угольков —
+# see the covisit block inside register_lounge_checkin() in main.py.
+#
+# brand_id is a plain slug string (no `brands` table exists in this schema —
+# every other lounge-scoped model here, e.g. LoungeVisit/LoungeSubscription,
+# stores brand_id the same unconstrained way), so it intentionally has no
+# ForeignKey.
+
+class OpenTable(Base):
+    """
+    One "открытый стол" broadcast by a host at a lounge. Lazily treated as
+    inactive once expires_at has passed or closed_at is set — no cron
+    flips a status column; every read path (nearby/get) recomputes this at
+    query/response time.
+    """
+    __tablename__ = "open_tables"
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(String(128), nullable=False, index=True)
+    host_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    mix_title = Column(String(256), nullable=True)
+    seats_free = Column(Integer, nullable=False, default=2, server_default="2")
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    closed_at = Column(DateTime, nullable=True)
+
+    host = relationship("User", foreign_keys=[host_user_id])
+
+
+class OpenTableJoin(Base):
+    """
+    One user's "иду" intent for an OpenTable. Unique per (table_id, user_id)
+    so a repeat POST /open-tables/{id}/join is an idempotent no-op instead of
+    a duplicate row.
+
+    arrived     — flips True once this guest is QR-checked-in at the same
+                  brand while still False (see checkin hook in main.py).
+    is_covisit  — set alongside arrived=True; kept as a separate flag so a
+                  future "arrived without covisit bonus" path (e.g. bonus
+                  already capped) can still mark presence without implying
+                  the reward fired.
+    """
+    __tablename__ = "open_table_joins"
+
+    id = Column(Integer, primary_key=True)
+    table_id = Column(Integer, ForeignKey("open_tables.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    joined_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    arrived = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_covisit = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    __table_args__ = (UniqueConstraint("table_id", "user_id", name="uq_open_table_join"),)
+
+    table = relationship("OpenTable", foreign_keys=[table_id])
+    user = relationship("User", foreign_keys=[user_id])

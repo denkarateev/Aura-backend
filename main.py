@@ -98,6 +98,8 @@ from app.models import (
     Mix,
     MixIngredient,
     MonthlyVote,
+    OpenTable,
+    OpenTableJoin,
     User,
     UserActivity,
     UserFollow,
@@ -279,6 +281,10 @@ from app.schemas import (
     HomeOfferLoungeOut,
     HomeOffersOut,
     MasterTipIn,
+    OpenTableCreateIn,
+    OpenTableDetailOut,
+    OpenTableJoinOut,
+    OpenTableOut,
 )
 from app.services.subscriptions import check_event_limit, check_guest_limit, check_push_limit, get_active_tier, require_tier
 
@@ -3094,6 +3100,66 @@ def startup():
                 "master_tips v2 migration skipped: %s", _tips2_exc
             )
 
+    # MARK: open_tables / open_table_joins — PK1 "Открытый стол" (2026-07-10)
+    # Wrapped in try/except — same race-with-another-worker rationale as
+    # lounge_billing_subscriptions above (multiple gunicorn workers run
+    # startup() concurrently).
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS open_tables (
+                        id SERIAL PRIMARY KEY,
+                        brand_id VARCHAR(128) NOT NULL,
+                        host_user_id INTEGER NOT NULL REFERENCES users(id),
+                        mix_title VARCHAR(256),
+                        seats_free INTEGER NOT NULL DEFAULT 2,
+                        note TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT now(),
+                        expires_at TIMESTAMP NOT NULL,
+                        closed_at TIMESTAMP
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_tables_brand_id ON open_tables (brand_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_tables_host_user_id ON open_tables (host_user_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_tables_expires_at ON open_tables (expires_at)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_tables_created_at ON open_tables (created_at DESC)"
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS open_table_joins (
+                        id SERIAL PRIMARY KEY,
+                        table_id INTEGER NOT NULL REFERENCES open_tables(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        joined_at TIMESTAMP NOT NULL DEFAULT now(),
+                        arrived BOOLEAN NOT NULL DEFAULT FALSE,
+                        is_covisit BOOLEAN NOT NULL DEFAULT FALSE,
+                        CONSTRAINT uq_open_table_join UNIQUE (table_id, user_id)
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_table_joins_table_id ON open_table_joins (table_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_open_table_joins_user_id ON open_table_joins (user_id)"
+                )
+        except Exception as _open_table_mig_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "open_tables migration skipped (likely race with another worker): %s",
+                _open_table_mig_exc,
+            )
+
 # -------------------------------------------------------------------
 # LEGAL — Privacy Policy & Terms of Use (152-FZ / App Store compliance)
 # No auth required. Served as HTML for WKWebView / Safari.
@@ -4659,6 +4725,62 @@ def register_lounge_checkin(
 
     db.commit()
 
+    # MARK: PK1 — Open Table co-visit hook (2026-07-10). If this guest has a
+    # pending "иду" (arrived=False) join on an open table at this brand,
+    # mark it arrived + is_covisit and award both host and guest +25
+    # угольков once via the same record_progress_event() mechanism the
+    # checkin bonus above uses. Runs AFTER the main checkin db.commit()
+    # above, so the checkin itself is already durably saved — wrapped in
+    # its own try/except so a bug here can never break the checkin
+    # response (only rolls back its own uncommitted covisit changes).
+    try:
+        pending_open_table_rows = db.query(OpenTableJoin, OpenTable).join(
+            OpenTable, OpenTableJoin.table_id == OpenTable.id
+        ).filter(
+            OpenTableJoin.user_id == guest_user.id,
+            OpenTableJoin.arrived.is_(False),
+            OpenTable.brand_id == brand_id,
+            OpenTable.closed_at.is_(None),
+        ).all()
+
+        if pending_open_table_rows:
+            guest_covisit_rewarded = False
+            covisit_venue_title = display_title_from_brand_id(brand_id)
+            for join_row, table_row in pending_open_table_rows:
+                join_row.arrived = True
+                join_row.is_covisit = True
+
+                if table_row.host_user_id != guest_user.id and table_row.host:
+                    record_progress_event(
+                        user=table_row.host,
+                        db=db,
+                        event_type="open_table_covisit_host",
+                        title="Открытый стол — пришёл гость",
+                        description=f"+25 угольков: гость подтянулся в {covisit_venue_title}",
+                        points_delta=25,
+                        rating_delta=0,
+                    )
+
+                if not guest_covisit_rewarded:
+                    record_progress_event(
+                        user=guest_user,
+                        db=db,
+                        event_type="open_table_covisit_guest",
+                        title="Открытый стол — ты пришёл",
+                        description=f"+25 угольков за совместный визит в {covisit_venue_title}",
+                        points_delta=25,
+                        rating_delta=0,
+                    )
+                    guest_covisit_rewarded = True
+
+            db.commit()
+    except Exception as _open_table_covisit_exc:
+        db.rollback()
+        print(
+            f"[checkin] open_table covisit hook failed guest={guest_user.id} "
+            f"brand={brand_id}: {_open_table_covisit_exc}"
+        )
+
     loyalty_out = build_lounge_loyalty_out(brand_id, guest_user, db)
     is_level_up = previous_tier.title != loyalty_out.tier.title
     message = (
@@ -4777,6 +4899,257 @@ def _try_redeem_bundle_visit(
         compensation_rub=bundle.compensation_per_visit_rub,
         master_id=master_id,
     )
+
+
+# ===============================================================
+# OPEN TABLE — PK1 "Открытый стол" (2026-07-10)
+# Host signals "я тут, налетай" right after checking in at a lounge;
+# subscribers of that lounge see it in GET /open-tables/nearby and can
+# record an "иду" intent via POST /open-tables/{id}/join. Co-visit
+# detection + bonus award lives in the checkin hook inside
+# register_lounge_checkin() above (search "PK1 — Open Table co-visit hook").
+# ===============================================================
+
+def _open_table_common_fields(
+    table: OpenTable,
+    db: Session,
+    host_user: Optional[User] = None,
+    joins_count: Optional[int] = None,
+) -> dict:
+    host_user = host_user or table.host
+    if host_user is None:
+        host_user = db.query(User).filter(User.id == table.host_user_id).first()
+    host_out = (
+        user_search_to_out(host_user)
+        if host_user
+        else UserSearchOut(id=table.host_user_id, username="", display_name=None)
+    )
+    if joins_count is None:
+        joins_count = db.query(OpenTableJoin).filter(
+            OpenTableJoin.table_id == table.id
+        ).count()
+
+    now = datetime.utcnow()
+    return dict(
+        id=table.id,
+        brand_id=table.brand_id,
+        brand_title=display_title_from_brand_id(table.brand_id),
+        host=host_out,
+        mix_title=table.mix_title,
+        seats_free=table.seats_free,
+        note=table.note,
+        created_at=table.created_at,
+        expires_at=table.expires_at,
+        closed_at=table.closed_at,
+        is_expired=bool(table.closed_at is not None or table.expires_at <= now),
+        joins_count=joins_count,
+    )
+
+
+def open_table_to_out(
+    table: OpenTable,
+    db: Session,
+    host_user: Optional[User] = None,
+    joins_count: Optional[int] = None,
+) -> OpenTableOut:
+    return OpenTableOut(**_open_table_common_fields(table, db, host_user, joins_count))
+
+
+def open_table_join_to_out(join: OpenTableJoin, user_obj: Optional[User] = None) -> OpenTableJoinOut:
+    user_obj = user_obj or join.user
+    user_out = (
+        user_search_to_out(user_obj)
+        if user_obj
+        else UserSearchOut(id=join.user_id, username="", display_name=None)
+    )
+    return OpenTableJoinOut(
+        id=join.id,
+        table_id=join.table_id,
+        user=user_out,
+        joined_at=join.joined_at,
+        arrived=join.arrived,
+        is_covisit=join.is_covisit,
+    )
+
+
+@app.post("/lounges/{brand_id}/open-tables", response_model=OpenTableOut)
+def create_open_table(
+    brand_id: str,
+    payload: OpenTableCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """PK1 — host opens a table right after checking in ("я тут, налетай").
+    Requires a LoungeVisit for this brand in the last 6h — that row is
+    written by POST /lounges/{brand_id}/checkin — otherwise 403. Only one
+    active (not closed, not expired) table per host per brand; a second
+    attempt while one is still open is 409.
+    """
+    host = get_required_user(user)
+    now = datetime.utcnow()
+
+    recent_visit = db.query(LoungeVisit).filter(
+        LoungeVisit.brand_id == brand_id,
+        LoungeVisit.user_id == host.id,
+        LoungeVisit.created_at >= now - timedelta(hours=6),
+    ).first()
+    if not recent_visit:
+        raise HTTPException(403, "сначала отметься в заведении")
+
+    existing = db.query(OpenTable).filter(
+        OpenTable.brand_id == brand_id,
+        OpenTable.host_user_id == host.id,
+        OpenTable.closed_at.is_(None),
+        OpenTable.expires_at > now,
+    ).first()
+    if existing:
+        raise HTTPException(409, "У тебя уже есть открытый стол в этом заведении")
+
+    table = OpenTable(
+        brand_id=brand_id,
+        host_user_id=host.id,
+        mix_title=(payload.mix_title or "").strip() or None,
+        seats_free=payload.seats_free,
+        note=(payload.note or "").strip() or None,
+        created_at=now,
+        expires_at=now + timedelta(hours=payload.ttl_hours),
+    )
+    db.add(table)
+    db.commit()
+    db.refresh(table)
+
+    return open_table_to_out(table, db, host_user=host, joins_count=0)
+
+
+@app.get("/open-tables/nearby", response_model=List[OpenTableOut])
+def list_nearby_open_tables(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Open (not closed, not expired) tables at lounges the current user is
+    subscribed to (LoungeSubscription), newest first, capped at 20. Expiry
+    is filtered lazily (expires_at > now) — no cron ever writes closed_at."""
+    current_user = get_required_user(user)
+    now = datetime.utcnow()
+
+    subscribed_brand_ids = [
+        row[0] for row in db.query(LoungeSubscription.brand_id).filter(
+            LoungeSubscription.user_id == current_user.id,
+        ).all()
+    ]
+    if not subscribed_brand_ids:
+        return []
+
+    tables = db.query(OpenTable).filter(
+        OpenTable.brand_id.in_(subscribed_brand_ids),
+        OpenTable.closed_at.is_(None),
+        OpenTable.expires_at > now,
+    ).order_by(OpenTable.created_at.desc()).limit(20).all()
+
+    return [open_table_to_out(t, db) for t in tables]
+
+
+@app.get("/open-tables/{table_id}", response_model=OpenTableDetailOut)
+def get_open_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Details + full join list. Does NOT 404 once expires_at has passed —
+    is_expired reflects that lazily so a host can still review who joined
+    after the window closed; only /join enforces the expiry gate (410)."""
+    get_required_user(user)
+
+    table = db.query(OpenTable).filter(OpenTable.id == table_id).first()
+    if not table:
+        raise HTTPException(404, "Стол не найден")
+
+    joins = db.query(OpenTableJoin).filter(
+        OpenTableJoin.table_id == table.id
+    ).order_by(OpenTableJoin.joined_at.asc()).all()
+
+    fields = _open_table_common_fields(table, db, joins_count=len(joins))
+    return OpenTableDetailOut(
+        **fields,
+        joins=[open_table_join_to_out(j) for j in joins],
+    )
+
+
+@app.post("/open-tables/{table_id}/join", response_model=OpenTableJoinOut)
+def join_open_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Record an "иду" intent. Idempotent — a repeat join for the same
+    (table, user) pair returns the existing row with 200 instead of erroring."""
+    current_user = get_required_user(user)
+
+    table = db.query(OpenTable).filter(OpenTable.id == table_id).first()
+    if not table:
+        raise HTTPException(404, "Стол не найден")
+
+    if table.host_user_id == current_user.id:
+        raise HTTPException(400, "Нельзя присоединиться к своему столу")
+
+    now = datetime.utcnow()
+    if table.closed_at is not None or table.expires_at <= now:
+        raise HTTPException(410, "Стол уже закрыт")
+
+    existing = db.query(OpenTableJoin).filter(
+        OpenTableJoin.table_id == table.id,
+        OpenTableJoin.user_id == current_user.id,
+    ).first()
+    if existing:
+        return open_table_join_to_out(existing, current_user)
+
+    join = OpenTableJoin(
+        table_id=table.id,
+        user_id=current_user.id,
+        joined_at=now,
+    )
+    db.add(join)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Race: two concurrent join calls for the same (table, user) pair.
+        # Second one loses the insert — treat it as the idempotent case.
+        db.rollback()
+        existing = db.query(OpenTableJoin).filter(
+            OpenTableJoin.table_id == table.id,
+            OpenTableJoin.user_id == current_user.id,
+        ).first()
+        if existing:
+            return open_table_join_to_out(existing, current_user)
+        raise
+    db.refresh(join)
+
+    return open_table_join_to_out(join, current_user)
+
+
+@app.post("/open-tables/{table_id}/close", response_model=OpenTableOut)
+def close_open_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Only the host (or is_admin) can close a table. Idempotent — closing an
+    already-closed table just returns its current state."""
+    current_user = get_required_user(user)
+
+    table = db.query(OpenTable).filter(OpenTable.id == table_id).first()
+    if not table:
+        raise HTTPException(404, "Стол не найден")
+
+    if table.host_user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(403, "Закрыть стол может только хост")
+
+    if table.closed_at is None:
+        table.closed_at = datetime.utcnow()
+        db.commit()
+        db.refresh(table)
+
+    return open_table_to_out(table, db)
 
 
 @app.get("/lounges/{brand_id}/analytics", response_model=LoungeAnalyticsOut)
