@@ -1649,3 +1649,20 @@ class OpenTableOut(BaseModel):
 
 class OpenTableDetailOut(OpenTableOut):
     joins: List[OpenTableJoinOut] = []
+
+
+# ---------------------------------------------------------------------------
+# Open Table eligibility (PK4, 2026-07-13)
+# GET /open-tables/eligibility — server-side "can this guest open a table"
+# check, so the iOS "Открыть покур" button doesn't have to guess from a
+# stale local checkin flag. One schema, two mutually-exclusive shapes:
+#   - brand_id given:    can_open / has_active_table / active_table_id set,
+#                         eligible_brands is null.
+#   - brand_id omitted:  eligible_brands set, the other three are null.
+# ---------------------------------------------------------------------------
+
+class OpenTableEligibilityOut(BaseModel):
+    can_open: Optional[bool] = None
+    has_active_table: Optional[bool] = None
+    active_table_id: Optional[int] = None
+    eligible_brands: Optional[List[str]] = None

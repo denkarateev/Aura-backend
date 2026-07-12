@@ -283,6 +283,7 @@ from app.schemas import (
     MasterTipIn,
     OpenTableCreateIn,
     OpenTableDetailOut,
+    OpenTableEligibilityOut,
     OpenTableJoinOut,
     OpenTableOut,
 )
@@ -4972,6 +4973,33 @@ def open_table_join_to_out(join: OpenTableJoin, user_obj: Optional[User] = None)
     )
 
 
+# PK4 (2026-07-13) — shared gates behind "can this guest open a table".
+# Extracted from create_open_table so GET /open-tables/eligibility can answer
+# the same question the POST enforces, without duplicating the queries.
+def _has_fresh_checkin(db: Session, user_id: int, brand_id: str, hours: int = 6) -> bool:
+    """True if `user_id` has a LoungeVisit at `brand_id` within the last
+    `hours` hours. That row is written by POST /lounges/{brand_id}/checkin."""
+    now = datetime.utcnow()
+    recent_visit = db.query(LoungeVisit).filter(
+        LoungeVisit.brand_id == brand_id,
+        LoungeVisit.user_id == user_id,
+        LoungeVisit.created_at >= now - timedelta(hours=hours),
+    ).first()
+    return recent_visit is not None
+
+
+def _get_active_open_table(db: Session, host_user_id: int, brand_id: str) -> Optional[OpenTable]:
+    """The host's current active (not closed, not expired) table at
+    `brand_id`, if any — a host may only have one open at a time per brand."""
+    now = datetime.utcnow()
+    return db.query(OpenTable).filter(
+        OpenTable.brand_id == brand_id,
+        OpenTable.host_user_id == host_user_id,
+        OpenTable.closed_at.is_(None),
+        OpenTable.expires_at > now,
+    ).first()
+
+
 @app.post("/lounges/{brand_id}/open-tables", response_model=OpenTableOut)
 def create_open_table(
     brand_id: str,
@@ -4988,21 +5016,10 @@ def create_open_table(
     host = get_required_user(user)
     now = datetime.utcnow()
 
-    recent_visit = db.query(LoungeVisit).filter(
-        LoungeVisit.brand_id == brand_id,
-        LoungeVisit.user_id == host.id,
-        LoungeVisit.created_at >= now - timedelta(hours=6),
-    ).first()
-    if not recent_visit:
+    if not _has_fresh_checkin(db, host.id, brand_id):
         raise HTTPException(403, "сначала отметься в заведении")
 
-    existing = db.query(OpenTable).filter(
-        OpenTable.brand_id == brand_id,
-        OpenTable.host_user_id == host.id,
-        OpenTable.closed_at.is_(None),
-        OpenTable.expires_at > now,
-    ).first()
-    if existing:
+    if _get_active_open_table(db, host.id, brand_id):
         raise HTTPException(409, "У тебя уже есть открытый стол в этом заведении")
 
     table = OpenTable(
@@ -5047,6 +5064,58 @@ def list_nearby_open_tables(
     ).order_by(OpenTable.created_at.desc()).limit(20).all()
 
     return [open_table_to_out(t, db) for t in tables]
+
+
+# PK4 (2026-07-13) — declared before /open-tables/{table_id} (same reason
+# /open-tables/nearby is above): FastAPI/Starlette matches routes in
+# declaration order, so a GET /open-tables/{table_id} registered first would
+# swallow "eligibility" as table_id and 422 instead of reaching this handler.
+@app.get("/open-tables/eligibility", response_model=OpenTableEligibilityOut)
+def get_open_table_eligibility(
+    brand_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """PK4 — server-side "can this guest open a table" check backing the iOS
+    "Открыть покур" button, so it doesn't rely on a local/stale checkin flag.
+    Reuses the exact gates POST /lounges/{brand_id}/open-tables enforces:
+    _has_fresh_checkin (LoungeVisit within 6h) and _get_active_open_table
+    (one open table per host per brand).
+
+    With brand_id: eligibility for that one lounge — can_open is true only
+    when the checkin is fresh AND there's no already-active table.
+    Without brand_id: brand_ids this user checked into within the last 6h
+    (distinct, newest visit first, capped at 10) — for a picker when the
+    caller doesn't know which lounge yet.
+    """
+    current_user = get_required_user(user)
+
+    if brand_id:
+        active_table = _get_active_open_table(db, current_user.id, brand_id)
+        has_active_table = active_table is not None
+        can_open = (not has_active_table) and _has_fresh_checkin(db, current_user.id, brand_id)
+        return OpenTableEligibilityOut(
+            can_open=can_open,
+            has_active_table=has_active_table,
+            active_table_id=active_table.id if active_table else None,
+        )
+
+    now = datetime.utcnow()
+    rows = (
+        db.query(
+            LoungeVisit.brand_id,
+            func.max(LoungeVisit.created_at).label("last_visit_at"),
+        )
+        .filter(
+            LoungeVisit.user_id == current_user.id,
+            LoungeVisit.created_at >= now - timedelta(hours=6),
+        )
+        .group_by(LoungeVisit.brand_id)
+        .order_by(func.max(LoungeVisit.created_at).desc())
+        .limit(10)
+        .all()
+    )
+    return OpenTableEligibilityOut(eligible_brands=[row.brand_id for row in rows])
 
 
 @app.get("/open-tables/{table_id}", response_model=OpenTableDetailOut)
