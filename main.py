@@ -5035,6 +5035,40 @@ def create_open_table(
     db.commit()
     db.refresh(table)
 
+    try:
+        import asyncio as _asyncio
+        import logging
+        from app.push import send_push_fanout_async
+
+        subscriber_ids = db.query(LoungeSubscription.user_id).filter(
+            LoungeSubscription.brand_id == brand_id,
+            LoungeSubscription.user_id != host.id,
+        ).distinct().limit(200).all()
+        uid_list = [uid for (uid,) in subscriber_ids]
+        if uid_list:
+            venue_title = display_title_from_brand_id(brand_id)
+            push_body = f"@{host.username} открыл стол — присоединяйся!"
+            if table.mix_title:
+                push_body += f" Микс: {table.mix_title}."
+            _asyncio.run(send_push_fanout_async(
+                db,
+                uid_list,
+                f"{venue_title} · Открытый стол",
+                push_body,
+                payload={
+                    "type": "open_table",
+                    "table_id": table.id,
+                    "lounge_id": brand_id,
+                },
+            ))
+    except Exception as push_e:
+        logging.warning(
+            "[push] open-table notify failed host=%s brand=%s: %s",
+            host.id,
+            brand_id,
+            push_e,
+        )
+
     return open_table_to_out(table, db, host_user=host, joins_count=0)
 
 
