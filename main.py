@@ -4780,6 +4780,7 @@ def register_lounge_checkin(
             rating_delta=0,
         ))
 
+    should_award_repeat_visit = False
     # Первый визит → 50 общих угольков как мотивация посещать новые заведения.
     if is_first_visit:
         emit_award(
@@ -4792,6 +4793,9 @@ def register_lounge_checkin(
             rating_delta=0,
             event_key=f"first_visit:{guest_user.id}:{brand_id}",
         )
+    else:
+        # Emission itself runs after the primary check-in commit below.
+        should_award_repeat_visit = True
     # --- end bonus accrual ---
     if not personalization:
         personalization = LoungeGuestPersonalization(
@@ -4828,6 +4832,39 @@ def register_lounge_checkin(
     ))
 
     db.commit()
+
+    # Повторный визит → 25 общих огоньков. Награда идёт после основного
+    # коммита чек-ина: её сбой не должен ломать ответ QR-чек-ина.
+    if should_award_repeat_visit:
+        try:
+            # Тот же приём МСК, что в daily digest: в БД timestamps UTC-naive.
+            repeat_visit_date = (datetime.utcnow() + timedelta(hours=3)).date().isoformat()
+            repeat_visit_key = f"repeat_visit:{guest_user.id}:{brand_id}:{repeat_visit_date}"
+            repeat_visits_today = db.query(UserActivity.id).filter(
+                UserActivity.event_key.like(
+                    f"repeat_visit:{guest_user.id}:%:{repeat_visit_date}"
+                )
+            ).count()
+
+            # Не более двух наград за повторные визиты во все заведения за МСК-день.
+            if repeat_visits_today < 2:
+                emit_award(
+                    user=guest_user,
+                    db=db,
+                    event_type="lounge_repeat_visit",
+                    title=f"Повторный визит в {display_title_from_brand_id(brand_id)}",
+                    description="+25 огоньков за повторный визит",
+                    points_delta=25,
+                    rating_delta=0,
+                    event_key=repeat_visit_key,
+                )
+                db.commit()
+        except Exception as _repeat_visit_award_exc:
+            db.rollback()
+            print(
+                f"[checkin] repeat visit award failed guest={guest_user.id} "
+                f"brand={brand_id}: {_repeat_visit_award_exc}"
+            )
 
     # MARK: PK1 — Open Table co-visit hook (2026-07-10). If this guest has a
     # pending "иду" (arrived=False) join on an open table at this brand,
