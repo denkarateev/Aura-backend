@@ -675,6 +675,83 @@ def record_progress_event(
     return activity
 
 
+def emit_award(
+    user: Optional[User],
+    db: Session,
+    event_type: str,
+    title: str,
+    description: Optional[str],
+    points_delta: int,
+    rating_delta: int,
+    event_key: str | None = None,
+):
+    """Record an award once for an optional idempotency event key."""
+    if not user:
+        return None
+
+    # PostgreSQL has the partial unique index from startup(). Reserve the
+    # activity row first, so a concurrent worker cannot also update points.
+    if event_key and db.get_bind().dialect.name == "postgresql":
+        activity_id = db.execute(
+            sa_text(
+                """
+                INSERT INTO user_activities
+                    (user_id, event_type, title, description, points_delta,
+                     rating_delta, event_key, created_at)
+                VALUES
+                    (:user_id, :event_type, :title, :description, :points_delta,
+                     :rating_delta, :event_key, :created_at)
+                ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING
+                RETURNING id
+                """
+            ),
+            {
+                "user_id": user.id,
+                "event_type": event_type,
+                "title": title,
+                "description": description,
+                "points_delta": points_delta,
+                "rating_delta": rating_delta,
+                "event_key": event_key,
+                "created_at": datetime.utcnow(),
+            },
+        ).scalar_one_or_none()
+        if activity_id is None:
+            return None
+
+        progress = ensure_user_progress(user, db)
+        progress.points += points_delta
+        progress.rating += rating_delta
+        progress.updated_at = datetime.utcnow()
+        return db.get(UserActivity, activity_id)
+
+    # SQLite is used for local tests. Its fallback deliberately performs the
+    # duplicate check before the normal ORM write; production uses the atomic
+    # PostgreSQL branch above.
+    if event_key and db.query(UserActivity.id).filter(
+        UserActivity.event_key == event_key
+    ).first():
+        return None
+
+    progress = ensure_user_progress(user, db)
+    progress.points += points_delta
+    progress.rating += rating_delta
+    progress.updated_at = datetime.utcnow()
+
+    activity = UserActivity(
+        user_id=user.id,
+        event_type=event_type,
+        title=title,
+        description=description,
+        points_delta=points_delta,
+        rating_delta=rating_delta,
+        event_key=event_key,
+    )
+    db.add(activity)
+    db.flush()
+    return activity
+
+
 def award_event(
     user: Optional[User],
     event_type: str,
@@ -2392,6 +2469,31 @@ def startup():
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS share_flavors BOOLEAN NOT NULL DEFAULT TRUE
                 """
+            )
+
+    # MARK: user_activities.event_key — TOK-2 idempotent award ledger (2026-07-15)
+    # Concurrent workers can both enter startup, so a benign DDL race must not
+    # prevent the application from starting.
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    ALTER TABLE user_activities
+                    ADD COLUMN IF NOT EXISTS event_key VARCHAR(255)
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_user_activities_event_key
+                    ON user_activities(event_key) WHERE event_key IS NOT NULL
+                    """
+                )
+        except Exception as _event_key_migration_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "user_activities.event_key migration skipped (likely race with another worker): %s",
+                _event_key_migration_exc,
             )
 
     # MARK: lounge_guest_loyalty.bonus_balance — per-lounge bonus wallet (2026-05-26)
@@ -4680,7 +4782,7 @@ def register_lounge_checkin(
 
     # Первый визит → 50 общих угольков как мотивация посещать новые заведения.
     if is_first_visit:
-        record_progress_event(
+        emit_award(
             user=guest_user,
             db=db,
             event_type="lounge_first_visit",
@@ -4688,6 +4790,7 @@ def register_lounge_checkin(
             description="+50 угольков за знакомство с новым заведением",
             points_delta=50,
             rating_delta=0,
+            event_key=f"first_visit:{guest_user.id}:{brand_id}",
         )
     # --- end bonus accrual ---
     if not personalization:

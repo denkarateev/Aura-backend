@@ -237,6 +237,7 @@ class UserActivity(Base):
     description = Column(Text)
     points_delta = Column(Integer, default=0, nullable=False)
     rating_delta = Column(Integer, default=0, nullable=False)
+    event_key = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="activities")
