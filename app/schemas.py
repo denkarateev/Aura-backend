@@ -518,6 +518,23 @@ class WalletBurnOut(BaseModel):
     new_hooka_balance: float
 
 
+class ShopPurchaseIn(BaseModel):
+    item_id: str
+
+
+class ShopCatalogItemOut(BaseModel):
+    id: str
+    title: str
+    cost: int
+    category: str
+
+
+class ShopPurchaseOut(BaseModel):
+    item_id: str
+    already_purchased: bool
+    new_ugolki_balance: int
+
+
 
 class DuelCreateIn(BaseModel):
     brand_id: str

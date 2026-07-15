@@ -69,6 +69,16 @@ BUNDLE_TIERS = {
     "group":    {"hookahs": 12,  "price_rub": 14000, "comp_rub": 1000, "days": 30, "seats": 4, "title": "Пак для компании"},
 }
 
+# Server-authoritative profile shop. Item IDs intentionally mirror the iOS
+# catalog; only future purchases use these prices.
+SHOP_ITEMS: dict[str, dict] = {
+    "lime_frame": {"title": "Lime рамка", "cost": 150, "category": "Стиль"},
+    "frame_neon": {"title": "Неоновая рамка", "cost": 250, "category": "Стиль"},
+    "theme_citrus": {"title": "Лаймовая тема", "cost": 250, "category": "Стиль"},
+    "bg_smoke": {"title": "Дымовой фон", "cost": 400, "category": "Стиль"},
+    "streak_freeze_1d": {"title": "Заморозка стрика", "cost": 250, "category": "Бусты"},
+}
+
 REWARD_RULES = {
     "daily_login": {
         "title": "Ежедневный вход",

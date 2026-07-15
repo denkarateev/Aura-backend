@@ -192,6 +192,9 @@ from app.schemas import (
     WalletBalanceOut,
     WalletMintOut,
     WalletBurnOut,
+    ShopCatalogItemOut,
+    ShopPurchaseIn,
+    ShopPurchaseOut,
     UserOut,
     UserProgressOut,
     UserUpdate,
@@ -7733,8 +7736,85 @@ def wallet_mint(user: User = Depends(get_current_user), db: Session = Depends(ge
     ugolki = max(progress.points, 0)
     return WalletMintOut(success=True, amount=ugolki, new_ugolki_balance=ugolki, new_hooka_balance=round(ugolki / 100.0, 2), tx_hash=None)
 
+
+
+@app.get("/shop/catalog", response_model=List[ShopCatalogItemOut])
+def shop_catalog():
+    """Public prices for the iOS profile-shop renderer."""
+    return [
+        ShopCatalogItemOut(id=item_id, **item)
+        for item_id, item in SHOP_ITEMS.items()
+    ]
+
+
+@app.post("/shop/purchase", response_model=ShopPurchaseOut)
+def shop_purchase(
+    payload: ShopPurchaseIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    item = SHOP_ITEMS.get(payload.item_id)
+    if not item:
+        raise HTTPException(404, "Неизвестный товар магазина.")
+
+    event_key = f"shop:{user.id}:{payload.item_id}"
+
+    # Lock the balance row before checking either balance or ownership. In
+    # PostgreSQL this serializes concurrent purchases for this user; checking
+    # the ledger after the lock lets a retry be a true no-op even if the
+    # balance is now below the item cost.
+    progress = db.query(UserProgress).filter(
+        UserProgress.user_id == user.id
+    ).with_for_update().first()
+    if progress is None:
+        progress = ensure_user_progress(user, db)
+        db.flush()
+
+    if db.query(UserActivity.id).filter(UserActivity.event_key == event_key).first():
+        return ShopPurchaseOut(
+            item_id=payload.item_id,
+            already_purchased=True,
+            new_ugolki_balance=progress.points,
+        )
+
+    cost = item["cost"]
+    if progress.points < cost:
+        raise HTTPException(
+            402,
+            f"Недостаточно огоньков: есть {progress.points}, нужно {cost}.",
+        )
+
+    activity = emit_award(
+        user=user,
+        db=db,
+        event_type="shop_purchase",
+        title=f"Покупка: {item['title']}",
+        description=f"Магазин: {payload.item_id}",
+        points_delta=-cost,
+        rating_delta=0,
+        event_key=event_key,
+    )
+    if activity is None:
+        # Defensive fallback for a duplicate event inserted after the local
+        # lookup (the PostgreSQL unique index is the final idempotency guard).
+        db.refresh(progress)
+        return ShopPurchaseOut(
+            item_id=payload.item_id,
+            already_purchased=True,
+            new_ugolki_balance=progress.points,
+        )
+
+    db.commit()
+    return ShopPurchaseOut(
+        item_id=payload.item_id,
+        already_purchased=False,
+        new_ugolki_balance=progress.points,
+    )
+
 @app.post("/wallet/burn", response_model=WalletBurnOut)
 def wallet_burn(amount: int = Query(..., gt=0), reason: str = Query(default="spend"), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not any(item["cost"] == amount for item in SHOP_ITEMS.values()):
+        raise HTTPException(400, "Сумма списания не соответствует цене товара магазина.")
     progress = ensure_user_progress(user, db)
     if amount > progress.points:
         raise HTTPException(400, f"Not enough: have {progress.points}, need {amount}")
@@ -7746,16 +7826,6 @@ def wallet_burn(amount: int = Query(..., gt=0), reason: str = Query(default="spe
 
 @app.post("/admin/users/{user_id}/set-rating")
 def admin_set_rating(user_id: int, rating: int = Query(...), admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
-    target = db.query(User).filter(User.id == user_id).first()
-    if not target:
-        raise HTTPException(404, "User not found")
-    progress = ensure_user_progress(target, db)
-    progress.rating = rating
-    db.commit()
-    return {"user_id": user_id, "new_rating": rating, "level_title": level_title_for_rating(rating)}
-
-@app.post("/admin/users/{user_id}/set-points")
-def admin_set_points(user_id: int, points: int = Query(...), admin: User = Depends(get_admin_user), db: Session = Depends(get_db)):
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(404, "User not found")
