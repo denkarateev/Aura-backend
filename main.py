@@ -4868,9 +4868,9 @@ def register_lounge_checkin(
 
     # MARK: PK1 — Open Table co-visit hook (2026-07-10). If this guest has a
     # pending "иду" (arrived=False) join on an open table at this brand,
-    # mark it arrived + is_covisit and award both host and guest +25
-    # угольков once via the same record_progress_event() mechanism the
-    # checkin bonus above uses. Runs AFTER the main checkin db.commit()
+    # mark it arrived + is_covisit and award both host and guest +40
+    # угольков. Rewards are idempotent per pair + venue + Moscow month.
+    # Runs AFTER the main checkin db.commit()
     # above, so the checkin itself is already durably saved — wrapped in
     # its own try/except so a bug here can never break the checkin
     # response (only rolls back its own uncommitted covisit changes).
@@ -4887,31 +4887,82 @@ def register_lounge_checkin(
         if pending_open_table_rows:
             guest_covisit_rewarded = False
             covisit_venue_title = display_title_from_brand_id(brand_id)
+            # Timestamps in the DB are UTC-naive. Use the same UTC+3
+            # convention as repeat visits so the monthly cap and event key
+            # roll over at the start of a Moscow calendar month.
+            covisit_now_msk = datetime.utcnow() + timedelta(hours=3)
+            covisit_month = covisit_now_msk.strftime("%Y%m")
+            covisit_month_start_msk = covisit_now_msk.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            if covisit_month_start_msk.month == 12:
+                covisit_next_month_start_msk = covisit_month_start_msk.replace(
+                    year=covisit_month_start_msk.year + 1, month=1
+                )
+            else:
+                covisit_next_month_start_msk = covisit_month_start_msk.replace(
+                    month=covisit_month_start_msk.month + 1
+                )
+            covisit_month_start_utc = covisit_month_start_msk - timedelta(hours=3)
+            covisit_next_month_start_utc = (
+                covisit_next_month_start_msk - timedelta(hours=3)
+            )
+
+            def covisit_rewards_this_month(user_id: int) -> int:
+                return db.query(UserActivity.id).filter(
+                    UserActivity.user_id == user_id,
+                    UserActivity.event_type.in_(
+                        ("open_table_covisit_host", "open_table_covisit_guest")
+                    ),
+                    UserActivity.created_at >= covisit_month_start_utc,
+                    UserActivity.created_at < covisit_next_month_start_utc,
+                ).count()
+
             for join_row, table_row in pending_open_table_rows:
                 join_row.arrived = True
                 join_row.is_covisit = True
 
+                pair_low_user_id = min(table_row.host_user_id, guest_user.id)
+                pair_high_user_id = max(table_row.host_user_id, guest_user.id)
+                covisit_pair_key = (
+                    f"covisit:{pair_low_user_id}:{pair_high_user_id}:"
+                    f"{brand_id}:{covisit_month}"
+                )
+
                 if table_row.host_user_id != guest_user.id and table_row.host:
-                    record_progress_event(
-                        user=table_row.host,
-                        db=db,
-                        event_type="open_table_covisit_host",
-                        title="Открытый стол — пришёл гость",
-                        description=f"+25 угольков: гость подтянулся в {covisit_venue_title}",
-                        points_delta=25,
-                        rating_delta=0,
-                    )
+                    # Participant-based suffixes, rather than host/guest
+                    # suffixes, also keep the pair idempotent if their roles
+                    # are reversed on a later table in the same month.
+                    if covisit_rewards_this_month(table_row.host_user_id) < 4:
+                        emit_award(
+                            user=table_row.host,
+                            db=db,
+                            event_type="open_table_covisit_host",
+                            title="Открытый стол — пришёл гость",
+                            description=(
+                                f"+40 угольков: гость подтянулся в "
+                                f"{covisit_venue_title}"
+                            ),
+                            points_delta=40,
+                            rating_delta=0,
+                            event_key=f"{covisit_pair_key}:user:{table_row.host_user_id}",
+                        )
 
                 if not guest_covisit_rewarded:
-                    record_progress_event(
-                        user=guest_user,
-                        db=db,
-                        event_type="open_table_covisit_guest",
-                        title="Открытый стол — ты пришёл",
-                        description=f"+25 угольков за совместный визит в {covisit_venue_title}",
-                        points_delta=25,
-                        rating_delta=0,
-                    )
+                    if covisit_rewards_this_month(guest_user.id) < 4:
+                        emit_award(
+                            user=guest_user,
+                            db=db,
+                            event_type="open_table_covisit_guest",
+                            title="Открытый стол — ты пришёл",
+                            description=(
+                                f"+40 угольков за совместный визит в "
+                                f"{covisit_venue_title}"
+                            ),
+                            points_delta=40,
+                            rating_delta=0,
+                            event_key=f"{covisit_pair_key}:user:{guest_user.id}",
+                        )
                     guest_covisit_rewarded = True
 
             db.commit()
