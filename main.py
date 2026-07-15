@@ -3330,31 +3330,34 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     db.flush()
     track_daily_login(user, db)
 
-    # ON-8: Referral reward — 200 ugolki to the referrer on successful signup.
+    # TOK-6 phase 1: a referral-code installation gives the invited user a
+    # small one-time bonus. The referrer is rewarded only after a verified
+    # co-visit (see the Open Table hook below).
     # Юзер: «garden_lounge_korolev приглашал других и код вставлял» но БД
-    # показывала 0 referral_reward. ReferralView в iOS формирует код как
+    # показывала 0 реферальных наград. ReferralView в iOS формирует код как
     # «HOOKA3-USERNAME», юзер вставлял его целиком → backend искал по
     # точному username → ничего не находил → silent skip.
-    # Нормализуем: lowercase + strip префикс «HOOKA3-» если есть.
+    # Нормализуем через normalize_referrer_code() + lowercase compare (см.
+    # #92: тот же helper переиспользуется в /users/me/apply-referral —
+    # единственная точка редактирования правил парсинга кода).
     if payload.referrer_code:
-        normalized_code = payload.referrer_code.strip()
-        if normalized_code.upper().startswith("HOOKA3-"):
-            normalized_code = normalized_code[7:]
+        normalized_code = normalize_referrer_code(payload.referrer_code)
         referrer = (
             db.query(User)
             .filter(func.lower(User.username) == normalized_code.lower())
             .first()
         )
-        if referrer and referrer.id != user.id:
+        if referrer and normalized_code and referrer.id != user.id:
             try:
-                record_progress_event(
-                    user=referrer,
+                emit_award(
+                    user=user,
                     db=db,
-                    event_type="referral_reward",
-                    title="Реферал",
-                    description=f"{user.username or user.email} зарегистрировался по твоей ссылке",
-                    points_delta=200,
+                    event_type="referral_bonus",
+                    title="Бонус за приглашение",
+                    description=f"Зарегистрировался по коду {referrer.username or referrer.email}",
+                    points_delta=50,
                     rating_delta=0,
+                    event_key=f"referral_install:{user.id}",
                 )
                 # Юзер: «не пришёл push что по моей ссылке создали аккаунт».
                 # Шлём push реферреру синхронно — внутри try/except чтобы
@@ -4949,8 +4952,9 @@ def register_lounge_checkin(
                         )
 
                 if not guest_covisit_rewarded:
+                    guest_covisit_activity = None
                     if covisit_rewards_this_month(guest_user.id) < 4:
-                        emit_award(
+                        guest_covisit_activity = emit_award(
                             user=guest_user,
                             db=db,
                             event_type="open_table_covisit_guest",
@@ -4963,6 +4967,66 @@ def register_lounge_checkin(
                             rating_delta=0,
                             event_key=f"{covisit_pair_key}:user:{guest_user.id}",
                         )
+
+                    # TOK-6 phase 2: a referrer is paid only after the
+                    # invited user actually received their first verified
+                    # co-visit reward. The referral keys are pair-wide and
+                    # deliberately have no month, so this can happen once
+                    # for the pair forever.
+                    if guest_covisit_activity and guest_user.referred_by_user_id:
+                        referrer = db.query(User).filter(
+                            User.id == guest_user.referred_by_user_id
+                        ).first()
+                        if referrer and referrer.id != guest_user.id:
+                            referral_pair_key = (
+                                f"refpaid:{referrer.id}:{guest_user.id}"
+                            )
+                            referrer_reward_key = f"{referral_pair_key}:referrer"
+                            invited_bonus_key = f"{referral_pair_key}:invited"
+                            referral_pair_already_paid = db.query(UserActivity.id).filter(
+                                UserActivity.event_key == referrer_reward_key
+                            ).first()
+                            referral_rewards_this_month = db.query(UserActivity.id).filter(
+                                UserActivity.user_id == referrer.id,
+                                UserActivity.event_type == "referral_covisit_reward",
+                                UserActivity.created_at >= covisit_month_start_utc,
+                                UserActivity.created_at < covisit_next_month_start_utc,
+                            ).count()
+
+                            # The co-visit reward above is intentionally
+                            # independent: exhausting this cap only blocks
+                            # referral rewards, never the TOK-4 +40s.
+                            if (
+                                not referral_pair_already_paid
+                                and referral_rewards_this_month < 5
+                            ):
+                                referrer_reward_activity = emit_award(
+                                    user=referrer,
+                                    db=db,
+                                    event_type="referral_covisit_reward",
+                                    title="Реферал пришёл в заведение",
+                                    description=(
+                                        f"+200 угольков: {guest_user.username or guest_user.email} "
+                                        f"пришёл в {covisit_venue_title}"
+                                    ),
+                                    points_delta=200,
+                                    rating_delta=0,
+                                    event_key=referrer_reward_key,
+                                )
+                                if referrer_reward_activity:
+                                    emit_award(
+                                        user=guest_user,
+                                        db=db,
+                                        event_type="referral_covisit_bonus",
+                                        title="Бонус за совместный визит",
+                                        description=(
+                                            "+100 угольков: первый совместный визит "
+                                            "по реферальному приглашению"
+                                        ),
+                                        points_delta=100,
+                                        rating_delta=0,
+                                        event_key=invited_bonus_key,
+                                    )
                     guest_covisit_rewarded = True
 
             db.commit()
@@ -6119,9 +6183,8 @@ def generate_mix_from_brief(
 # MARK: Mix Wizard — GET /users/me/mixes with status filter (S2026-04-29)
 # MARK: Referrals — counter for ReferralView.
 # Юзер: «не отображается сколько друзей позвал». Считаем по
-# user_activities.event_type='referral_reward' — туда пишем при signup
-# с referrer_code (см. ~line 2347). Каждая строка = 1 успешный реферал
-# + 200 угольков начислено.
+# Historical signup rewards used referral_reward; TOK-6 records new verified
+# referrals as referral_covisit_reward. Both remain visible in the counter.
 @app.get("/users/me/referrals")
 def get_my_referrals(
     db: Session = Depends(get_db),
@@ -6132,7 +6195,9 @@ def get_my_referrals(
         db.query(UserActivity)
         .filter(
             UserActivity.user_id == current.id,
-            UserActivity.event_type == "referral_reward"
+            UserActivity.event_type.in_(
+                ("referral_reward", "referral_covisit_reward")
+            )
         )
         .order_by(UserActivity.created_at.desc())
         .limit(50)
