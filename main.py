@@ -4796,7 +4796,7 @@ def register_lounge_checkin(
             title=f"Первый визит в {display_title_from_brand_id(brand_id)}",
             description="+50 угольков за знакомство с новым заведением",
             points_delta=50,
-            rating_delta=0,
+            rating_delta=25,
             event_key=f"first_visit:{guest_user.id}:{brand_id}",
         )
     else:
@@ -4861,7 +4861,7 @@ def register_lounge_checkin(
                     title=f"Повторный визит в {display_title_from_brand_id(brand_id)}",
                     description="+25 огоньков за повторный визит",
                     points_delta=25,
-                    rating_delta=0,
+                    rating_delta=8,
                     event_key=repeat_visit_key,
                 )
                 db.commit()
@@ -4950,7 +4950,7 @@ def register_lounge_checkin(
                                 f"{covisit_venue_title}"
                             ),
                             points_delta=40,
-                            rating_delta=0,
+                            rating_delta=15,
                             event_key=f"{covisit_pair_key}:user:{table_row.host_user_id}",
                         )
 
@@ -4967,7 +4967,7 @@ def register_lounge_checkin(
                                 f"{covisit_venue_title}"
                             ),
                             points_delta=40,
-                            rating_delta=0,
+                            rating_delta=15,
                             event_key=f"{covisit_pair_key}:user:{guest_user.id}",
                         )
 

@@ -96,7 +96,7 @@ REWARD_RULES = {
         "title": "Микс сохранили",
         "points": 4,
         "rating": 3,
-        "daily_limit": 30,
+        "daily_limit": 5,
     },
     "comment_created": {
         "title": "Комментарий отправлен",
