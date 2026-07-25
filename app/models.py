@@ -912,6 +912,31 @@ class BonusRedemption(Base):
     owner = relationship("User", foreign_keys=[owner_user_id])
 
 
+# MARK: - Prize redemptions (2026-07-25, wave "Призы" PRZ-3)
+# Огоньковый redeem материальных призов заведений: start (гость резервирует
+# код) → confirm (менеджер сканит, списывает огоньки). НЕ путать с
+# BonusRedemption выше — это рублёвая per-lounge валюта, отдельный пласт.
+
+class PrizeRedemption(Base):
+    __tablename__ = "prize_redemptions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    brand_id = Column(String(255), nullable=False, index=True)
+    prize_id = Column(String(64), nullable=False)
+    nonce = Column(String(64), nullable=False, unique=True, index=True)
+    status = Column(String(16), nullable=False, default="pending")  # pending|confirmed|expired
+    cost_points = Column(Integer, nullable=False)
+    cost_rub = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime, nullable=False)
+    confirmed_at = Column(DateTime, nullable=True)
+    confirmed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    confirmed_by = relationship("User", foreign_keys=[confirmed_by_user_id])
+
+
 # MARK: - Lounge Promoted Slots (2026-05-26)
 
 class LoungePromotedSlot(Base):

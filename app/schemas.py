@@ -535,6 +535,41 @@ class ShopPurchaseOut(BaseModel):
     new_ugolki_balance: int
 
 
+# MARK: - Prize catalog / redeem (wave "Призы" PRZ-2/PRZ-3, 2026-07-25)
+
+class PrizeCatalogItemOut(BaseModel):
+    id: str
+    title: str
+    description: str
+    cost: int
+    category: str
+
+
+class PrizeRedeemStartIn(BaseModel):
+    prize_id: str
+    brand_id: str
+
+
+class PrizeRedeemStartOut(BaseModel):
+    code: str
+    prize_id: str
+    cost: int
+    ttl_seconds: int
+    expires_at: datetime
+
+
+class PrizeRedeemConfirmIn(BaseModel):
+    code: str
+
+
+class PrizeRedeemConfirmOut(BaseModel):
+    status: str
+    prize_id: str
+    guest_user_id: int
+    prize_title: str
+    new_balance: int
+
+
 
 class DuelCreateIn(BaseModel):
     brand_id: str

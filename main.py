@@ -1,4 +1,5 @@
 import re
+import secrets
 import uuid
 import random
 import string
@@ -19,7 +20,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError
@@ -38,6 +39,7 @@ from app.core.config import (
     DEFAULT_UNLIMITED_MIX_USERNAMES,
     MAX_BOWL_HEAT_ATTEMPTS,
     MIX_SLOT_RULES,
+    PRIZE_ITEMS,
     RATING_LEVELS,
     REWARD_RULES,
     SECRET_KEY,
@@ -100,6 +102,7 @@ from app.models import (
     MonthlyVote,
     OpenTable,
     OpenTableJoin,
+    PrizeRedemption,
     User,
     UserActivity,
     UserFollow,
@@ -289,6 +292,11 @@ from app.schemas import (
     OpenTableEligibilityOut,
     OpenTableJoinOut,
     OpenTableOut,
+    PrizeCatalogItemOut,
+    PrizeRedeemStartIn,
+    PrizeRedeemStartOut,
+    PrizeRedeemConfirmIn,
+    PrizeRedeemConfirmOut,
 )
 from app.services.subscriptions import check_event_limit, check_guest_limit, check_push_limit, get_active_tier, require_tier
 
@@ -755,6 +763,11 @@ def emit_award(
     return activity
 
 
+def _msk_day_suffix() -> str:
+    """MSK calendar-day suffix (UTC+3, no DST) for daily-resettable event keys."""
+    return (datetime.utcnow() + timedelta(hours=3)).strftime("%Y%m%d")
+
+
 def award_event(
     user: Optional[User],
     event_type: str,
@@ -1064,8 +1077,15 @@ def can_manage_brand(user: Optional[User], brand_id: str, db: Optional[Session] 
     if username in allowed or email in allowed:
         return True
 
-    # Convention: lounge owner username equals brand_id slug
-    if username and username == normalize_key(brand_id):
+    # Convention: lounge owner username equals brand_id slug.
+    # Сравнение ТОЧНОЕ (не через normalize_key): username уникален
+    # регистрозависимо (signup + UNIQUE в Postgres), поэтому сравнение по
+    # lower() отдавало права менеджера регистровому двойнику — аккаунт
+    # «Garden_Lounge_Korolev» при живом «garden_lounge_korolev» проходил гейт
+    # и получал доступ к чужой CRM, списанию бонусов гостей и подтверждению
+    # призов. Легитимных владельцев не задевает: ensure_lounge_owner создаёт
+    # username = brand_id символ в символ (lowercase slug).
+    if user.username and user.username == brand_id:
         return True
 
     # DB check: lounge_owner_credentials row links this user to this brand
@@ -2499,6 +2519,37 @@ def startup():
                 _event_key_migration_exc,
             )
 
+    # MARK: prize_redemptions — wave "Призы" PRZ-3 redeem (start/confirm) ledger
+    # (2026-07-25). Table is also covered by Base.metadata.create_all() above
+    # for a fresh DB (incl. sqlite tests); this ALTER-free CREATE IF NOT
+    # EXISTS handles existing prod Postgres. Same benign-race pattern as TOK-2.
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS prize_redemptions (
+                        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, brand_id VARCHAR(255) NOT NULL,
+                        prize_id VARCHAR(64) NOT NULL, nonce VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                        cost_points INTEGER NOT NULL, cost_rub INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT NOW(), expires_at TIMESTAMP NOT NULL,
+                        confirmed_at TIMESTAMP NULL, confirmed_by_user_id INTEGER NULL
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_prize_redemptions_nonce
+                    ON prize_redemptions(nonce)
+                    """
+                )
+        except Exception as _prize_redemptions_migration_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "prize_redemptions migration skipped (likely race with another worker): %s",
+                _prize_redemptions_migration_exc,
+            )
+
     # MARK: lounge_guest_loyalty.bonus_balance — per-lounge bonus wallet (2026-05-26)
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
@@ -3316,7 +3367,13 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
         raise HTTPException(400, "Этот email уже зарегистрирован. Войди или восстанови пароль.")
 
     if username_norm:
-        existing_username = db.query(User).filter(User.username == username_norm).first()
+        # Регистронезависимо: иначе регистровый двойник существующего username
+        # проходит и проверку, и UNIQUE-индекс, а места, которые сверяют
+        # username по lower() (права менеджера заведения, списки админов),
+        # принимают его за оригинал.
+        existing_username = db.query(User).filter(
+            func.lower(User.username) == username_norm.lower()
+        ).first()
         if existing_username:
             raise HTTPException(400, f"Username «{username_norm}» уже занят. Выбери другой.")
 
@@ -7747,6 +7804,25 @@ def shop_catalog():
     ]
 
 
+@app.get("/prizes/catalog", response_model=List[PrizeCatalogItemOut], tags=["prizes"])
+def prizes_catalog():
+    """Public catalog of material lounge prizes redeemable for ugolki.
+
+    cost_rub (внутренняя себестоимость заведению для CRM-сверки) намеренно
+    НЕ отдаётся в публичный ответ.
+    """
+    return [
+        PrizeCatalogItemOut(
+            id=item_id,
+            title=item["title"],
+            description=item["description"],
+            cost=item["cost"],
+            category=item["category"],
+        )
+        for item_id, item in PRIZE_ITEMS.items()
+    ]
+
+
 @app.post("/shop/purchase", response_model=ShopPurchaseOut)
 def shop_purchase(
     payload: ShopPurchaseIn,
@@ -7757,7 +7833,14 @@ def shop_purchase(
     if not item:
         raise HTTPException(404, "Неизвестный товар магазина.")
 
-    event_key = f"shop:{user.id}:{payload.item_id}"
+    if item.get("daily"):
+        # Daily-resettable consumables (e.g. streak_freeze_1d) get a fresh
+        # event_key each MSK calendar day, so the same item can be purchased
+        # again on the next day. Old undated keys from before this change
+        # stay in the ledger and simply never collide with the new format.
+        event_key = f"shop:{user.id}:{payload.item_id}:{_msk_day_suffix()}"
+    else:
+        event_key = f"shop:{user.id}:{payload.item_id}"
 
     # Lock the balance row before checking either balance or ownership. In
     # PostgreSQL this serializes concurrent purchases for this user; checking
@@ -10656,6 +10739,156 @@ def get_guest_bonus_balance(
         total_earned=stats["total_earned"],
         total_redeemed=stats["total_redeemed"],
         last_visit_at=stats["last_visit_at"],
+    )
+
+
+@app.post(
+    "/prizes/redeem/start",
+    response_model=PrizeRedeemStartOut,
+    tags=["prizes"],
+)
+def prize_redeem_start(
+    payload: PrizeRedeemStartIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Guest reserves a redeem code for a material prize. Ugolki are NOT
+    deducted here — only on /prizes/redeem/confirm after a manager scan."""
+    # get_current_user отдаёт None на отсутствующем/битом токене (HTTPBearer
+    # с auto_error=False) — без явной проверки ниже падало бы AttributeError
+    # → 500 вместо честного 401.
+    if user is None:
+        raise HTTPException(401, "Нужна авторизация.")
+
+    prize = PRIZE_ITEMS.get(payload.prize_id)
+    if not prize:
+        raise HTTPException(404, "Неизвестный приз.")
+
+    # brand_id приходит от клиента и служит ключом авторизации в confirm
+    # (can_manage_brand). Нормализуем к канону — иначе регистровый вариант
+    # создаёт код, который настоящий владелец подтвердить не сможет.
+    brand_id = normalize_key(payload.brand_id)
+    if not brand_id:
+        raise HTTPException(400, "brand_id обязателен.")
+
+    cost = prize["cost"]
+
+    # Порядок блокировок здесь обязан совпадать с confirm (сначала
+    # prize_redemptions, затем user_progress) — иначе гость, спамящий start в
+    # момент подтверждения, детерминированно ловит deadlock у менеджера.
+    db.query(PrizeRedemption).filter(
+        PrizeRedemption.user_id == user.id,
+        PrizeRedemption.status == "pending",
+    ).update({"status": "expired"}, synchronize_session=False)
+
+    # Lock the balance row before checking it, same pattern as /shop/purchase.
+    progress = db.query(UserProgress).filter(
+        UserProgress.user_id == user.id
+    ).with_for_update().first()
+    if progress is None:
+        progress = ensure_user_progress(user, db)
+        db.flush()
+
+    if progress.points < cost:
+        # Flat body per contract (not nested under FastAPI's default
+        # {"detail": ...} envelope) — JSONResponse bypasses HTTPException's
+        # auto-wrapping so the client sees needed/balance as siblings of detail.
+        return JSONResponse(
+            status_code=402,
+            content={"detail": "not_enough_ugolki", "needed": cost, "balance": progress.points},
+        )
+
+    nonce = secrets.token_urlsafe(16)
+    now = datetime.utcnow()
+    expires_at = now + timedelta(seconds=120)
+
+    redemption = PrizeRedemption(
+        user_id=user.id,
+        brand_id=brand_id,
+        prize_id=payload.prize_id,
+        nonce=nonce,
+        status="pending",
+        cost_points=cost,
+        cost_rub=prize.get("cost_rub", 0),
+        expires_at=expires_at,
+    )
+    db.add(redemption)
+    db.commit()
+
+    return PrizeRedeemStartOut(
+        code=nonce,
+        prize_id=payload.prize_id,
+        cost=cost,
+        ttl_seconds=120,
+        expires_at=expires_at,
+    )
+
+
+@app.post(
+    "/prizes/redeem/confirm",
+    response_model=PrizeRedeemConfirmOut,
+    tags=["prizes"],
+)
+def prize_redeem_confirm(
+    payload: PrizeRedeemConfirmIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manager scans the guest's redeem code and confirms the prize hand-off.
+    Ugolki are deducted here, atomically, guarded by row locks + unique
+    nonce + unique event_key + a status gate."""
+    red = db.query(PrizeRedemption).filter(
+        PrizeRedemption.nonce == payload.code
+    ).with_for_update().first()
+    if red is None:
+        raise HTTPException(404, "invalid_code")
+
+    if not can_manage_brand(current_user, red.brand_id, db):
+        raise HTTPException(403, "Нет доступа к этому лаунжу")
+
+    if red.status != "pending":
+        raise HTTPException(409, "already_used")
+
+    if datetime.utcnow() > red.expires_at:
+        red.status = "expired"
+        db.commit()
+        raise HTTPException(410, "expired")
+
+    prog = db.query(UserProgress).filter(
+        UserProgress.user_id == red.user_id
+    ).with_for_update().first()
+    if prog is None or prog.points < red.cost_points:
+        raise HTTPException(402, "not_enough_ugolki")
+
+    guest = db.query(User).filter(User.id == red.user_id).first()
+    prize = PRIZE_ITEMS.get(red.prize_id, {})
+    prize_title = prize.get("title", red.prize_id)
+
+    activity = emit_award(
+        user=guest,
+        db=db,
+        event_type="prize_redeem",
+        title=prize_title,
+        description=red.brand_id,
+        points_delta=-red.cost_points,
+        rating_delta=0,
+        event_key=f"redeem:{red.user_id}:{red.prize_id}:{red.nonce}",
+    )
+    if activity is None:
+        raise HTTPException(409, "already_used")
+
+    red.status = "confirmed"
+    red.confirmed_at = datetime.utcnow()
+    red.confirmed_by_user_id = current_user.id
+    db.commit()
+    db.refresh(prog)
+
+    return PrizeRedeemConfirmOut(
+        status="confirmed",
+        prize_id=red.prize_id,
+        guest_user_id=red.user_id,
+        prize_title=prize_title,
+        new_balance=prog.points,
     )
 
 

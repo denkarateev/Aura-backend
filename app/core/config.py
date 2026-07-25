@@ -76,7 +76,20 @@ SHOP_ITEMS: dict[str, dict] = {
     "frame_neon": {"title": "Неоновая рамка", "cost": 250, "category": "Стиль"},
     "theme_citrus": {"title": "Лаймовая тема", "cost": 250, "category": "Стиль"},
     "bg_smoke": {"title": "Дымовой фон", "cost": 400, "category": "Стиль"},
-    "streak_freeze_1d": {"title": "Заморозка стрика", "cost": 250, "category": "Бусты"},
+    "streak_freeze_1d": {"title": "Заморозка стрика", "cost": 250, "category": "Бусты", "daily": True},
+}
+
+# Каталог материальных призов заведений (огоньки → приз у менеджера, redeem
+# через /prizes/redeem/start + /prizes/redeem/confirm). cost — огоньки
+# (UserProgress.points), cost_rub — себестоимость заведению для CRM-сверки;
+# cost_rub НИКОГДА не отдаётся в публичный /prizes/catalog.
+PRIZE_ITEMS: dict[str, dict] = {
+    "bron_priority": {"title": "Приоритетная бронь", "description": "Skip-line в пт/сб и лучший стол в заведении-партнёре.", "cost": 250, "cost_rub": 0, "category": "reservation"},
+    "compliment":    {"title": "Комплимент на стол", "description": "Чай или фруктовая тарелка за счёт заведения.", "cost": 200, "cost_rub": 150, "category": "food"},
+    "discount10":    {"title": "Скидка 10% на счёт", "description": "Минус 10% от счёта, до 500 ₽.", "cost": 300, "cost_rub": 300, "category": "discount"},
+    "vip_table":     {"title": "VIP-стол на вечер", "description": "Лучшее место, зарезервировано на весь вечер.", "cost": 400, "cost_rub": 0, "category": "reservation"},
+    "free_bowl":     {"title": "Бесплатная чаша", "description": "Замена основной чаши за счёт заведения.", "cost": 600, "cost_rub": 250, "category": "hookah"},
+    "merch":         {"title": "Фирменный аксессуар", "description": "Мундштук или мерч-набор бренда.", "cost": 900, "cost_rub": 400, "category": "merch"},
 }
 
 REWARD_RULES = {
